@@ -57,6 +57,8 @@ All models compared: [models](docs/models/index.md).
 
 ## Documentation
 
+- [WSL2 deployment notes](docs/wsl2.md): this fork's setup, native model storage, locked memory and Codex.
+
 - **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
   [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
   [diagnostics](docs/configuration/diagnostics.md), [basalt-probe](docs/probe.md), [platforms](docs/platforms.md).
