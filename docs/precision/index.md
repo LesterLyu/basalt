@@ -8,6 +8,10 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
 
 ## Summary
 
+Changing the resident complement's registration cuts preserves expert bytes and arithmetic. Each registered chunk
+uses its own GPU alias. If more experts become available to the existing PCIe share, their CPU/GPU placement can
+change rounding as documented for that share below; fixed-tier greedy checks isolate the address-management change.
+
 - **MTP does not change output** (unless `--relaxed-drafting` is set: [details](features.md#relaxed-drafting)). With the expert tiers pinned, 275 of 275 greedy prompts produced identical tokens on
   both packs tested, and every full-vocabulary fp32 logit row (62,271 and 60,878) was bit-identical between `--spec 0`
   and `--spec 7`.

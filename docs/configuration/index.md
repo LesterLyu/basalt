@@ -155,6 +155,9 @@ The model's experts live in VRAM (the expert cache), in RAM, or in the file. The
 | `peer-adapt-swaps` | engine | integer | the value of `adapt-swaps` | Most experts one round swaps into the peer card. Only with a peer card. |
 | `adapt-decay` | engine | number | 0.85 on a server, 0.7 with a layer split | The factor the routing counts are multiplied by after each round; lower forgets sooner. [Adaptive tier](adaptive.md). |
 
+When every expert has a RAM or GPU copy, serving releases its expert file view after loading. PLE can keep reading
+its embedded table directly; copy fallbacks use a bounded direct-read buffer, and pointer fallbacks restore the view.
+
 ### The adaptive tier
 
 The engine moves the experts the conversation routes to most into VRAM, in rounds beside decode. What the four

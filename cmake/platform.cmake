@@ -34,5 +34,5 @@ target_include_directories(platform PUBLIC ${BASALT_CMAKE_ROOT}/include)
 # dlopen (DynLib) lives in libdl before glibc 2.34
 target_link_libraries(platform PUBLIC warnings ${CMAKE_DL_LIBS})
 if(WIN32)
-  target_link_libraries(platform PUBLIC advapi32)   # the processor name in the registry
+  target_link_libraries(platform PUBLIC advapi32 dxgi)
 endif()

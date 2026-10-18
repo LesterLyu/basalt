@@ -82,6 +82,8 @@ def extract_tokenizer(mf: ModelFile) -> Path:
 def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
     """The vision sidecar's config (the projector alone without `sidecar`); ValueError names what is missing."""
     side = Path(engine_bin).resolve().parent / VISION_EXE
+    if not side.is_file() and side.with_suffix(".exe").is_file():
+        side = side.with_suffix(".exe")
     if "vision/mmproj" not in mf.sections:
         raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
     if sidecar and not side.is_file():

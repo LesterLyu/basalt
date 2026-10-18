@@ -192,6 +192,8 @@ int Runtime::capture_windows() {
         return 1;
     }
     ple_table.rearm_keepalive();   // a long load must not lapse the SSD keep-alive window before the first request
+    if (srcp == &src && src.complement_ready() && tier_file_bytes == 0 && src.detach_file_mapping())
+        basalt::log::info("basalt generate", "expert file view closed; all live experts have RAM or GPU copies");
     // the tiers' placement at READY, which PROBE adapt puts back
     res_at_start = host_res;
     peer_at_start = peer.valid() ? peer.residency() : std::vector<int32_t>();

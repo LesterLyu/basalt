@@ -89,10 +89,21 @@ int run() {
     // the experts the copy holds, and what they read now
     std::vector<std::pair<int64_t, int64_t>> probe = {{0, held}, {0, experts - 1}, {1, held + 7}, {1, experts - 1}};
     std::vector<std::vector<uint8_t>> bytes;
+    bool host_addresses = true;
     for (const auto& [l, e] : probe) {
         require(src.has_resident(l, e) && registered(src.blob(l, e)), "a resident expert is registered after the load");
-        require(src.device_alias(l, e) == src.blob(l, e), "the device alias is the host address");
+        host_addresses = host_addresses && src.device_alias(l, e) == src.blob(l, e);
         bytes.emplace_back(src.blob(l, e), src.blob(l, e) + blob);
+    }
+    if (!host_addresses) {
+        require(!src.unpin_complement(err) && !err.empty(), "unpin refuses mappings with distinct device addresses");
+        require(!src.complement_unpinned(), "refused unpin leaves the registration in place");
+        for (size_t k = 0; k < probe.size(); ++k) {
+            const auto& [l, e] = probe[k];
+            require(registered(src.blob(l, e)) && src.pinned(l, e), "the refused copy remains registered");
+            require(std::memcmp(src.blob(l, e), bytes[k].data(), (size_t) blob) == 0, "the refused copy keeps its bytes");
+        }
+        return 0;
     }
     for (int cycle = 0; cycle < 2; ++cycle) {
         require(src.unpin_complement(err), "unpin: " + err);
