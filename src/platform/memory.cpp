@@ -300,7 +300,8 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
 }
 #else
 namespace {
-constexpr uint64_t kAdviseStep = 128ull << 10;
+// Coarse hints allow adjacent file reads to merge before they reach the device.
+constexpr uint64_t kAdviseStep = 4ull << 20;
 }
 
 bool read_ahead_enabled() { return true; }
@@ -343,10 +344,10 @@ void free_aligned(void* p) {
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes) {
     if (base == nullptr || bytes == 0) return true;
 #if defined(_WIN32)
-    // A view of a file mapping has no per-range release. Its pages are clean, so the manager takes them back on
-    // pressure by itself, and nothing here claims they were freed.
-    (void) view_bytes; (void) off;
-    return true;
+    if (off > view_bytes || bytes > view_bytes - off) return false;
+    // Unlocked file pages leave the working set; the mapping and its clean bytes remain valid.
+    if (VirtualUnlock((uint8_t*) base + (size_t) off, (SIZE_T) bytes)) return true;
+    return GetLastError() == ERROR_NOT_LOCKED;
 #else
     // Only whole pages can be given back: a page the range shares with a neighbour still holds bytes the caller may
     // read. So the range is widened to the page boundaries and then clipped to the view.
@@ -634,6 +635,23 @@ void free_region(void* p, uint64_t bytes) {
 
 bool pin_budget(uint64_t&, std::string&) { return false; }   // no OS-side budget below the driver's own limit
 #endif
+
+uint64_t system_page_size() {
+#if defined(_WIN32)
+    return (uint64_t) page_bytes();
+#else
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? (uint64_t) page : 0;
+#endif
+}
+
+bool register_host_after_fill() {
+#if defined(_WIN32)
+    return true;
+#else
+    return false;   // untouched pages remain eligible for bounded driver registration
+#endif
+}
 
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
                    uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {

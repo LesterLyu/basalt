@@ -31,9 +31,8 @@ void free_aligned(void* p);
 
 /// Asks the OS to give back what it holds for [off, off + bytes) of a mapped file view that starts at `base` and is
 /// `view_bytes` long: the range widened to whole pages, because those are what can be given back, and clipped to the
-/// view. False when the OS refused. Windows has no per-range release for a view of a file mapping - its pages are
-/// clean, since the view is read-only, so the manager takes them back on pressure by itself - and reports success
-/// without claiming anything.
+/// view. False when the OS refused. Windows trims the read-only pages from the working set with VirtualUnlock;
+/// ERROR_NOT_LOCKED means the unlocked pages were trimmed, not that the mapping was lost.
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes);
 
 /// What backs a host region from `alloc_region`.
@@ -56,6 +55,12 @@ void free_region(void* mapping_base, uint64_t mapping_bytes);
 /// beneath the driver's own refusal (`why` names where the figure comes from); false when it does not, and the driver's
 /// refusal is the limit.
 bool pin_budget(uint64_t& limit, std::string& why);
+
+/// The host page size in bytes, or 0 when the OS cannot name it.
+uint64_t system_page_size();
+
+/// Whether resident host memory should be filled before driver registration, allowing page faults to overlap I/O.
+bool register_host_after_fill();
 
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
