@@ -74,6 +74,8 @@ How a request names a video, and the limits: [video](docs/running.md#video).
 
 ## Documentation
 
+- [WSL2 deployment notes](docs/wsl2.md): this fork's setup, native model storage, locked memory and Codex.
+
 - **Run:** [running](docs/running.md), [configuration](docs/configuration/index.md), [models and the router](docs/configuration/models.md),
   [sampling](docs/configuration/sampling.md), [image sources](docs/configuration/image-sources.md),
   [documents](docs/configuration/documents.md),
