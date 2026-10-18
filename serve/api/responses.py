@@ -20,9 +20,11 @@ import json
 import time
 import uuid
 
+from serve.api.structured import validated_json
 from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
+CLIENT_TOOL_SEARCH = "tool_search"
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
                 "code_interpreter", "image_generation", "local_shell", "mcp", "tool_search")
 
@@ -182,6 +184,28 @@ def input_messages(req: dict) -> list[dict]:
             messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
             open_turn = None
             thinking.clear()
+        elif kind == "tool_search_call":
+            # Codex's tool discovery, sent back with the rest of the conversation: the model made it as the plain
+            # function `tool_search`, so it goes back as one
+            if item.get("execution") not in (None, "client"):
+                raise ResponsesError("only the client can run tool_search", param + ".execution")
+            target = open_turn if open_turn is not None and not thinking else turn()
+            target.setdefault("tool_calls", []).append({
+                "function": {"name": CLIENT_TOOL_SEARCH,
+                             "arguments": _arguments(item.get("arguments"), param + ".arguments")},
+                "_call_id": item.get("call_id")})
+        elif kind == "tool_search_output":
+            # what the search found: the tools, as the tool message a function_call_output becomes
+            if item.get("execution") not in (None, "client"):
+                raise ResponsesError("only the client can run tool_search", param + ".execution")
+            found = item.get("tools")
+            messages.append({"role": "tool", "content": json.dumps(found if isinstance(found, list) else [],
+                                                                   ensure_ascii=False),
+                             "_call_id": item.get("call_id")})
+            open_turn = None
+            thinking.clear()
+        elif kind == "additional_tools":
+            continue                                 # declarations are handled by request_tools
         elif kind == "item_reference":
             raise ResponsesError("item references need stored responses, and this server keeps none: send the items "
                                  "themselves", param, "unsupported_parameter")
@@ -226,16 +250,23 @@ def request_tools(req: dict):
     if not isinstance(given, list):
         raise ResponsesError("tools must be an array", "tools")
 
+    extra = [t for item in (req.get("input") if isinstance(req.get("input"), list) else [])
+             if isinstance(item, dict) and item.get("type") in ("additional_tools", "tool_search_output")
+             and isinstance(item.get("tools"), list) for t in item["tools"]]
+    given = list(given) + extra
+
     def add(tool, param, namespace=None, ns_description=""):
         kind = tool.get("type")
         name = tool.get("name")
+        if kind == "tool_search":
+            name = CLIENT_TOOL_SEARCH
         if not isinstance(name, str) or not name:
             raise ResponsesError("a tool needs a name", param + ".name")
         flat = f"{namespace}.{name}" if namespace else name
         description = tool.get("description") or ""
         if ns_description:
             description = ns_description + ("\n\n" + description if description else "")
-        if kind == "function":
+        if kind in ("function", "tool_search"):
             params = tool.get("parameters")
             if params is not None and not isinstance(params, dict):
                 raise ResponsesError(f'tool "{name}": "parameters" must be an object (its JSON schema)',
@@ -249,6 +280,8 @@ def request_tools(req: dict):
                       "required": ["input"]}
         tools.append({"name": flat, "description": description, "parameters": params})
         names[flat] = (namespace, name, kind)
+        if namespace:
+            names.setdefault(f"{namespace}__{name}", (namespace, name, kind))
 
     for i, tool in enumerate(given):
         param = f"tools[{i}]"
@@ -257,6 +290,11 @@ def request_tools(req: dict):
         kind = tool.get("type")
         if kind in ("function", "custom"):
             add(tool, param)
+        elif kind == "tool_search":
+            if tool.get("execution") not in (None, "client"):
+                skipped.append(kind)
+            elif CLIENT_TOOL_SEARCH not in names:
+                add(tool, param)
         elif kind == "namespace":
             for j, member in enumerate(tool.get("tools") or []):
                 if not isinstance(member, dict) or member.get("type", "function") not in ("function", "custom"):
@@ -267,6 +305,13 @@ def request_tools(req: dict):
             skipped.append(kind)                     # the model cannot run OpenAI's hosted tools: left out
         else:
             raise ResponsesError("a tool needs a type", param + ".type")
+    short_names = {}
+    for tool in tools:
+        target = names[tool["name"]]
+        short_names.setdefault(target[1], set()).add(target)
+    for name, targets in short_names.items():
+        if len(targets) == 1:                         # a model may omit an unambiguous namespace
+            names.setdefault(name, next(iter(targets)))
     choice = req.get("tool_choice")
     if choice == "none":
         return None, names, skipped
@@ -330,7 +375,8 @@ def template_kwargs(req: dict) -> dict:
 class Assembler:
     """Builds one response's output items and typed events from Service.run's events."""
 
-    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool):
+    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool, validator=None):
+        self.validator, self.json_text = validator, []
         self.names, self.encrypted = names, encrypted
         self.prompt_tokens = prompt_tokens
         self.seq = 0
@@ -385,6 +431,10 @@ class Assembler:
         item, self.item = self.item, None
         if item is None:
             return []
+        if item["type"] == "tool_search_call":
+            text = item.pop("_arguments_text", "")
+            if text:
+                item["arguments"] = _arguments(text, "tool_search_call.arguments")
         at, out = self.response["output"].index(item), []
         item["status"] = status
         if item["type"] == "message":
@@ -425,6 +475,9 @@ class Assembler:
         elif kind == "content":
             if not ev.text:
                 return out
+            if self.validator is not None:
+                self.json_text.append(ev.text)
+                return out
             if self.item is None or self.item["type"] != "message":
                 out += self.close()
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
@@ -443,6 +496,8 @@ class Assembler:
                 item["arguments"] += ev.text
                 out.append(self.event("response.function_call_arguments.delta", item_id=item["id"],
                                       output_index=self.index, delta=ev.text))
+            elif item["type"] == "tool_search_call":
+                item["_arguments_text"] = item.get("_arguments_text", "") + ev.text
         elif kind == "tool_call":
             item = self.item
             if item is None or item.get("call_id") != ev.call.id:     # a call that was not announced while written
@@ -458,6 +513,8 @@ class Assembler:
                 item["input"] = value if isinstance(value, str) else json.dumps(ev.call.arguments, ensure_ascii=False)
                 out.append(self.event("response.custom_tool_call_input.delta", item_id=item["id"],
                                       output_index=self.index, delta=item["input"]))
+            elif item["type"] == "tool_search_call" and not item.get("_arguments_text") and isinstance(ev.call.arguments, dict):
+                item["arguments"] = ev.call.arguments
             out += self.close()
         return out
 
@@ -466,6 +523,9 @@ class Assembler:
         if kind == "custom":
             item = {"id": new_id("ctc"), "type": "custom_tool_call", "status": "in_progress", "call_id": ev.call.id,
                     "name": name, "input": ""}
+        elif kind == "tool_search":
+            item = {"id": new_id("tsc"), "type": "tool_search_call", "status": "in_progress", "call_id": ev.call.id,
+                    "execution": "client", "arguments": {}}
         else:
             item = {"id": new_id("fc"), "type": "function_call", "status": "in_progress", "call_id": ev.call.id,
                     "name": name, "arguments": ""}
@@ -477,8 +537,19 @@ class Assembler:
         """Close open items, then response.completed (or .incomplete on length)."""
         length = done.get("finish") == "length"
         # an open call was cut off: incomplete whatever the finish
-        unfinished = self.item is not None and self.item["type"] in ("function_call", "custom_tool_call")
+        unfinished = self.item is not None and self.item["type"] in (
+            "function_call", "custom_tool_call", "tool_search_call")
         out = self.close("incomplete" if length or unfinished else "completed")
+        has_calls = any(item["type"] in ("function_call", "custom_tool_call", "tool_search_call")
+                        for item in self.response["output"])
+        if self.validator is not None and not has_calls:
+            text = validated_json("".join(self.json_text), self.validator, done.get("finish"))
+            out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant",
+                               "content": []})
+            self.item["content"][0]["text"] = text
+            out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
+                                  content_index=0, delta=text, logprobs=[]))
+            out += self.close()
         n = done.get("completion_tokens", 0)
         prompt = done.get("prompt_tokens", self.prompt_tokens)
         self.response["usage"] = {

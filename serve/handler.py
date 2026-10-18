@@ -24,7 +24,7 @@ from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
-from serve.api.structured import anthropic_format, check_format
+from serve.api.structured import StructuredOutputError, anthropic_format, check_format, prepare_tool_format
 from serve.util.text import stop_strings
 
 
@@ -593,6 +593,9 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 try:
                     result = responses_api.collect(items)
+                except StructuredOutputError as e:
+                    return self._json(502, responses_error_body(str(e), "server_error",
+                                                                code="structured_output_failed"))
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -624,6 +627,8 @@ def make_handler(svc: Service):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+            except StructuredOutputError as e:
+                self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # engine ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
@@ -644,19 +649,16 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
+            validator = None
             try:
-                structured = check_format(responses_api.text_format(req))
+                fmt = responses_api.text_format(req)
+                structured = check_format(fmt)
+                svc.require_grammar(fmt)
+                if structured and tools:
+                    messages, validator = prepare_tool_format(fmt, messages)
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            if structured and tools:
-                raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
-                                     "unsupported_parameter")
-            try:
-                svc.require_grammar(responses_api.text_format(req))
-            except ValueError as e:
-                raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               responses_api.text_format(req))
+            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), fmt)
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
@@ -680,7 +682,7 @@ def make_handler(svc: Service):
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model, len(ids), names,
-                                          "reasoning.encrypted_content" in include)
+                                          "reasoning.encrypted_content" in include, validator)
             return ids, thinking, tools, max_new, asm, req, force
 
         def _count_tokens(self, req):
