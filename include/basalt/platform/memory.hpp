@@ -61,6 +61,12 @@ void free_region(void* mapping_base, uint64_t mapping_bytes);
 /// refusal is the limit.
 bool pin_budget(uint64_t& limit, std::string& why);
 
+/// The host page size in bytes, or 0 when the OS cannot name it.
+uint64_t system_page_size();
+
+/// Whether resident host memory should be filled before driver registration, allowing page faults to overlap I/O.
+bool register_host_after_fill();
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 

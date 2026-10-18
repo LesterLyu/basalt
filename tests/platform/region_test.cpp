@@ -7,6 +7,12 @@
 #include <cstring>
 #include <string>
 
+#if defined(_WIN32)
+#include "basalt/platform/win.hpp"
+#else
+#include <unistd.h>
+#endif
+
 namespace {
 int failures = 0;
 void check(bool ok, const std::string& what) {
@@ -17,6 +23,18 @@ void check(bool ok, const std::string& what) {
 
 int main() {
     using namespace basalt::platform;
+    const uint64_t page = system_page_size();
+#if defined(_WIN32)
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    check(page == info.dwPageSize, "the registration page size matches the OS");
+    check(register_host_after_fill(), "registration follows the resident fill");
+#else
+    const long native_page = sysconf(_SC_PAGESIZE);
+    check(native_page > 0 && page == (uint64_t) native_page, "the registration page size matches the OS");
+    check(!register_host_after_fill(), "registration precedes the resident fill");
+#endif
+    check(page > 0 && (page & (page - 1)) == 0, "registration boundaries are powers of two");
     const uint64_t bytes = 6ull << 20;   // not a multiple of the 2 MiB page the OS may back it with
     RegionBacking backing = RegionBacking::NormalPages;
     std::string note;

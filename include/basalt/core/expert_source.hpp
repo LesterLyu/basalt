@@ -453,6 +453,8 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
     void close();
 
+    /// Drop clean mapped pages after the GPU fill, before sizing the resident copy.
+    void release_mapped_cache() const;
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
