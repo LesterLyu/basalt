@@ -55,6 +55,7 @@ profile ships with the engine ([data/profiles](data/profiles)).
 
 ## Docs
 
+- [WSL2 deployment notes](docs/wsl2.md): this fork's setup, native model storage, locked memory and Codex.
 - [Configuration](docs/configuration/index.md): every setting.
 - [Running](docs/running.md): parallel requests, prompt chunks, memory floors, image input.
 - [basalt-probe](docs/probe.md): measures the machine, the cold decode speed, and suggests values.
