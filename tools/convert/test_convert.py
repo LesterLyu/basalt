@@ -97,6 +97,7 @@ class ConvertTest(unittest.TestCase):
     # ---------------------------------------------------------------- sections
     def test_sections(self):
         convert.convert(self.args())
+        self.gguf.unlink()   # the output is self-contained and the input mapping is closed
         m = self.model()
         self.assertFalse((self.t / "out.basalt.partial").exists())
         want = {"hc8", "vision/mmproj", "profile", "dense", "dense.index", "experts", "experts.layout", "gguf", "meta"}
@@ -253,6 +254,7 @@ class ConvertTest(unittest.TestCase):
         self.assertIn("requires BF16", str(cm.exception))
         self.assertFalse((self.t / "out.basalt").exists())
         self.assertFalse((self.t / "out.basalt.partial").exists())
+        path.unlink()   # exception tracebacks must not leave the source file locked
 
     def test_draft_vocab_needs_the_drafter(self):
         (self.t / "dv.bin").write_bytes(np.array([0, 1], dtype="<i4").tobytes())
