@@ -118,6 +118,18 @@ class Parsing(unittest.TestCase):
         self.assertEqual(skipped, ["web_search"])
         self.assertIsNone(request_tools({"tools": TOOLS, "tool_choice": "none"})[0])
 
+    def test_unqualified_names_resolve_only_unambiguous_namespace_tools(self):
+        def namespace(name, kind="custom"):
+            return {"type": "namespace", "name": name, "tools": [{"type": kind, "name": "apply_patch"}]}
+
+        _, names, _ = request_tools({"tools": [namespace("functions")]})
+        self.assertEqual(names["apply_patch"], ("functions", "apply_patch", "custom"))
+        _, names, _ = request_tools({"tools": [namespace("first"), namespace("second")]})
+        self.assertNotIn("apply_patch", names)
+        for tools in ([namespace("functions"), {"type": "function", "name": "apply_patch"}],
+                      [{"type": "function", "name": "apply_patch"}, namespace("functions")]):
+            self.assertEqual(request_tools({"tools": tools})[1]["apply_patch"], (None, "apply_patch", "function"))
+
     def test_a_function_schema_that_is_not_an_object_is_refused(self):
         for bad in ("x", ["a"], 5, True):
             with self.assertRaises(ResponsesError) as e:
@@ -452,6 +464,36 @@ class ToolRoundTrip(Server):
                                           "output": "2"}]})
         self.assertEqual([c["function"]["name"] for c in msgs[1]["tool_calls"]],
                          ["multi_agent_v1.spawn_agent", "apply_patch"])
+
+    def test_unqualified_namespaced_patch_preserves_custom_payload_and_replay(self):
+        patch = "*** Begin Patch\n*** Add File: test.txt\n+hello\n*** End Patch"
+        script = ("</think>\n\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n" + patch +
+                  "\n</parameter>\n</function>\n</tool_call><|im_end|>")
+        tool = {"type": "namespace", "name": "functions", "tools": [
+            {"type": "custom", "name": "apply_patch", "description": "Edit files."}]}
+        for lite, stream in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(lite=lite, stream=stream):
+                self.engine.scripts = [self.tok.encode(script, parse_special=True)]
+                self.engine.script = self.engine.scripts[0]
+                request = {"model": "qwen3.8-flash-next", "input": [{"role": "user", "content": "edit"}], "stream": stream}
+                if lite:
+                    request["input"].append({"type": "additional_tools", "tools": [tool]})
+                else:
+                    request["tools"] = [tool]
+                code, result = self.post(request)
+                self.assertEqual(code, 200, result)
+                response = result[-1]["response"] if stream else result
+                custom = response["output"][-1]
+                self.assertEqual((custom["type"], custom["namespace"], custom["name"], custom["input"]),
+                                 ("custom_tool_call", "functions", "apply_patch", patch))
+                if stream:
+                    deltas = [e["delta"] for e in result if e["type"] == "response.custom_tool_call_input.delta"]
+                    self.assertEqual("".join(deltas), patch)
+                    self.assertFalse(any("function_call_arguments" in e["type"] for e in result))
+                messages = input_messages({"input": [{"role": "user", "content": "edit"}, custom,
+                    {"type": "custom_tool_call_output", "call_id": custom["call_id"], "output": "ok"}]})
+                self.assertEqual(messages[1]["tool_calls"][0]["function"],
+                                 {"name": "functions.apply_patch", "arguments": {"input": patch}})
 
 
 if __name__ == "__main__":

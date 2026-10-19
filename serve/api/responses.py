@@ -305,6 +305,13 @@ def request_tools(req: dict):
             skipped.append(kind)                     # the model cannot run OpenAI's hosted tools: left out
         else:
             raise ResponsesError("a tool needs a type", param + ".type")
+    short_names = {}
+    for tool in tools:
+        target = names[tool["name"]]
+        short_names.setdefault(target[1], set()).add(target)
+    for name, targets in short_names.items():
+        if len(targets) == 1:                         # a model may omit an unambiguous namespace
+            names.setdefault(name, next(iter(targets)))
     choice = req.get("tool_choice")
     if choice == "none":
         return None, names, skipped
