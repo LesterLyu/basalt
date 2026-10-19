@@ -55,6 +55,14 @@ and handles MCP namespace aliases. With a compatible client, tools can be loaded
 placing all MCP definitions in the initial context. The catalog flag alone is insufficient if the server
 drops these calls. Restart the server after Python API changes.
 
+Responses requests may combine `text.format` JSON output with tools, including client-side discovery.
+The schema applies to the final answer after tool results, not to tool-call arguments or interim commentary.
+With tools present, final JSON is buffered and validated before delivery; malformed or truncated answers
+fail with `structured_output_failed`. Install `jsonschema` for schema validation; without it only the JSON
+object shape is checked, with a server warning. Tool arguments use the engine's tool grammar, and JSON
+requests without tools use its JSON grammar. This covers Codex automatic approval requests without changing
+the approval policy or the reviewer's decision.
+
 `web_search = "disabled"` removes unsupported hosted Responses web search. Separately connected Apps/MCP
 search tools can still work according to the client's connections and account. Basalt itself does not
 provide a hosted search service.

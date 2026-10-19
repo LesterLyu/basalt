@@ -84,8 +84,18 @@ class ClientSearchHttp(Server):
     script = ('Search.</think>\n<tool_call>\n<function=tool_search>\n'
               '<parameter=query>\ndocs\n</parameter>\n</function>\n</tool_call>')
 
+    def test_search_can_precede_a_structured_final_answer(self):
+        code, events = self.post({"model": "qwen3.8-flash-next", "input": "Find tools", "tools": [SEARCH], "stream": True,
+                                 "text": {"format": {"type": "json_object"}}})
+        self.assertEqual(code, 200, events)
+        self.assertEqual(events[-1]["type"], "response.completed")
+        response = events[-1]["response"]
+        self.assertEqual(response["output"][-1]["type"], "tool_search_call")
+        self.assertEqual(response["output"][-1]["arguments"], {"query": "docs"})
+        self.assertNotIn("response.output_text.delta", [event["type"] for event in events])
+
     def test_search_stream_and_replay_loaded_tool(self):
-        code, events = self.post({"model": "m", "input": "Find tools", "tools": [SEARCH], "stream": True})
+        code, events = self.post({"model": "qwen3.8-flash-next", "input": "Find tools", "tools": [SEARCH], "stream": True})
         self.assertEqual(code, 200)
         response = events[-1]["response"]
         call = next(item for item in response["output"] if item["type"] == "tool_search_call")
@@ -93,7 +103,7 @@ class ClientSearchHttp(Server):
         self.engine.script = self.tok.encode(
             '</think>\n<tool_call>\n<function=mcp__docs__search>\n'
             '<parameter=query>\nprofiles\n</parameter>\n</function>\n</tool_call>')
-        code, response = self.post({"model": "m", "tools": [SEARCH], "input": [
+        code, response = self.post({"model": "qwen3.8-flash-next", "tools": [SEARCH], "input": [
             {"role": "user", "content": "Find tools"}, call,
             {"type": "tool_search_output", "execution": "client", "call_id": call["call_id"], "tools": [FOUND]}]})
         self.assertEqual(code, 200)

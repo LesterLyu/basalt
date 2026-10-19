@@ -1,5 +1,6 @@
-"""JSON response formats: the request is checked here; the engine enforces the schema with a grammar."""
+"""JSON formats use engine grammar; final answers with tools are buffered and validated separately."""
 import json
+import threading
 
 
 def check_format(response_format) -> bool:
@@ -57,3 +58,112 @@ def anthropic_format(req: dict):
     except ValueError as e:
         raise ValueError(str(e).replace("response_format.json_schema", where).replace("response_format", where)) from None
     return response_format
+
+
+class StructuredOutputError(RuntimeError):
+    pass
+
+
+class _ObjectOnly:
+    """The validator for json_object, and for json_schema without jsonschema: one JSON object."""
+
+    def iter_errors(self, value):
+        if not isinstance(value, dict):
+            yield _ObjectError()
+
+
+class _ObjectError:
+    absolute_path = ()
+    message = "the answer is not a JSON object"
+
+
+_jsonschema = None                     # (validators, SchemaError, Registry, NoSuchResource), False when not installed
+_jsonschema_lock = threading.Lock()
+
+
+def jsonschema_modules():
+    """jsonschema, imported on first use; None when it is not installed (said once, in the server window)."""
+    global _jsonschema
+    with _jsonschema_lock:
+        if _jsonschema is None:
+            try:
+                from jsonschema import validators
+                from jsonschema.exceptions import SchemaError
+                from referencing import Registry
+                from referencing.exceptions import NoSuchResource
+                _jsonschema = (validators, SchemaError, Registry, NoSuchResource)
+            except ImportError:
+                _jsonschema = False
+                print('[server] warning: jsonschema not installed, json_schema only checks for one JSON object '
+                      '(pip install "jsonschema>=4.23,<5")',
+                      flush=True)
+        return _jsonschema or None
+
+
+def prepare_tool_format(response_format, messages):
+    """Tool grammar is lazy: constrain the final answer separately from tool arguments."""
+    check_format(response_format)
+    if response_format["type"] == "json_object":
+        schema, modules = {"type": "object"}, None
+    else:
+        schema, modules = response_format["json_schema"]["schema"], jsonschema_modules()
+    if modules is None:
+        validator = _ObjectOnly()
+    else:
+        validators, SchemaError, Registry, NoSuchResource = modules
+
+        def no_remote(uri):
+            raise NoSuchResource(ref=uri)
+
+        try:
+            cls = validators.validator_for(schema)
+            cls.check_schema(schema)
+            validator = cls(schema, registry=Registry(retrieve=no_remote))
+        except SchemaError as exc:
+            raise ValueError(f"invalid response_format schema: {exc.message}") from exc
+    directive = ("OUTPUT FORMAT REQUIREMENT: Your final answer must be exactly one JSON object matching the JSON Schema below. "
+                 "No Markdown, headings, code fences, commentary, or text outside the JSON. "
+                 "Use every required field, correct types, and only allowed fields. "
+                 "Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n" +
+                 json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+    directive += ("\nYou may call the available tools before your final answer, using their declared arguments. "
+                  "This JSON Schema applies only to the final answer, not to tool calls or their arguments.")
+    messages = [dict(message) for message in messages]
+    if messages and messages[0].get("role") == "system":
+        content = messages[0].get("content") or ""
+        if isinstance(content, list):
+            messages[0]["content"] = content + [{"type": "text", "text": directive}]
+        else:
+            messages[0]["content"] = content + "\n\n" + directive
+    else:
+        messages.insert(0, {"role": "system", "content": directive})
+    return messages, validator
+
+
+def validated_json(text, validator, finish):
+    def pairs(items):
+        obj = {}
+        for key, value in items:
+            if key in obj:
+                raise ValueError(f"duplicate JSON key: {key}")
+            obj[key] = value
+        return obj
+
+    def constant(value):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    if finish != "stop":
+        raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
+    try:
+        value = json.loads(text or "", object_pairs_hook=pairs, parse_constant=constant)
+        canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except (ValueError, TypeError) as exc:
+        raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc
+    try:
+        error = next(validator.iter_errors(value), None)
+    except Exception as exc:
+        raise StructuredOutputError(f"could not validate structured output: {exc}") from exc
+    if error is not None:
+        path = "/" + "/".join(str(part) for part in error.absolute_path)
+        raise StructuredOutputError(f"model output failed the JSON Schema at {path}: {error.message}")
+    return canonical

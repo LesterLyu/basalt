@@ -20,6 +20,7 @@ import json
 import time
 import uuid
 
+from serve.api.structured import validated_json
 from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
@@ -367,7 +368,8 @@ def template_kwargs(req: dict) -> dict:
 class Assembler:
     """Builds one response's output items and typed events from Service.run's events."""
 
-    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool):
+    def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool, validator=None):
+        self.validator, self.json_text = validator, []
         self.names, self.encrypted = names, encrypted
         self.prompt_tokens = prompt_tokens
         self.seq = 0
@@ -466,6 +468,9 @@ class Assembler:
         elif kind == "content":
             if not ev.text:
                 return out
+            if self.validator is not None:
+                self.json_text.append(ev.text)
+                return out
             if self.item is None or self.item["type"] != "message":
                 out += self.close()
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
@@ -528,6 +533,16 @@ class Assembler:
         unfinished = self.item is not None and self.item["type"] in (
             "function_call", "custom_tool_call", "tool_search_call")
         out = self.close("incomplete" if length or unfinished else "completed")
+        has_calls = any(item["type"] in ("function_call", "custom_tool_call", "tool_search_call")
+                        for item in self.response["output"])
+        if self.validator is not None and not has_calls:
+            text = validated_json("".join(self.json_text), self.validator, done.get("finish"))
+            out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant",
+                               "content": []})
+            self.item["content"][0]["text"] = text
+            out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
+                                  content_index=0, delta=text, logprobs=[]))
+            out += self.close()
         n = done.get("completion_tokens", 0)
         prompt = done.get("prompt_tokens", self.prompt_tokens)
         self.response["usage"] = {
