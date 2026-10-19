@@ -131,6 +131,12 @@ class SourceModel:
         a = g.data_start + t.offset
         return self._maps[p][a:a + t.expected_bytes()]
 
+    def close(self) -> None:
+        """Release the shard mappings even when an exception still retains a tensor view."""
+        for mapping in self._maps.values():
+            mapping._mmap.close()
+        self._maps.clear()
+
     def abs_range(self, name: str):
         """(shard path, absolute offset, size) of a tensor's bytes."""
         g, t, p = self.where[name]

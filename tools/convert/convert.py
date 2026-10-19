@@ -62,6 +62,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -183,6 +184,11 @@ def source_paths(given) -> list[Path]:
 
 
 def convert(a) -> None:
+    with ExitStack() as resources:
+        _convert(a, resources)
+
+
+def _convert(a, resources: ExitStack) -> None:
     out = Path(a.out)
     partial = Path(str(out) + ".partial")
     if out.exists() and not a.force:
@@ -212,6 +218,7 @@ def convert(a) -> None:
     try:
         print("reading the source GGUFs ...", flush=True)
         model = S.SourceModel(source_paths(a.gguf))
+        resources.callback(model.close)
         kv, tensors = source_tensors(model)
         dense = S.Dense(model, a.compat_bf16)
         experts = S.Experts(model)
