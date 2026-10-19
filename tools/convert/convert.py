@@ -68,6 +68,7 @@ import struct
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -296,6 +297,11 @@ def source_paths(given) -> list[Path]:
 
 
 def convert(a) -> None:
+    with ExitStack() as resources:
+        _convert(a, resources)
+
+
+def _convert(a, resources: ExitStack) -> None:
     out = Path(a.out)
     partial = Path(str(out) + ".partial")
     if out.exists() and not a.force:
@@ -347,6 +353,7 @@ def convert(a) -> None:
     try:
         print("reading the source GGUFs ...", flush=True)
         model = S.SourceModel(paths, frozenset(arch.own_sections) if base is not None else frozenset())
+        resources.callback(model.close)
         kv, tensors = source_tensors(model, arch.own_sections)
         own = {n: model.where[n][1] for n in arch.own_sections if n in model.where}
         if not arch.side_sections:
