@@ -2,6 +2,14 @@
 
 The decode-path precision tables are in [index.md](index.md); the quality method is in [quality.md](quality.md). This page covers the NVFP4 dense projections, the two-stage verify head, logit bias, speculative decoding and relaxed drafting.
 
+## NVFP4 CPU expert rows
+
+The AVX-512 expert path uses paired 256-bit sub-block lanes for one- and two-token batches. Weight decoding,
+activation quantization and the per-lane fused accumulation are unchanged. The accumulators are restored to the
+full-width lane order before the same final reduction, preserving the output bits across batch widths and row splits.
+`nvfp4_cpu_rows_test` checks the single-token ggml dot, a dequantized double-precision reference, batch widths 1–8,
+and uneven row boundaries at the model's gate/up and down geometry.
+
 ## 6-bit dense projections (NVIDIA NVFP4 pack)
 
 The official NVIDIA NVFP4 pack stores its dense projections as Q6_K where the Q8_0 variant stores them as Q8_0. This is
