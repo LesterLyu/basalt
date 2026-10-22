@@ -24,12 +24,24 @@ arena. Descriptors use `NO_BUFFERING | OVERLAPPED`; each positional read has its
 and completion event. Buffers, offsets and byte counts retain a 4 KiB alignment contract.
 A file system that refuses unbuffered reads, or a short read, retains the mapped-copy fallback.
 
-The resident arena is registered after its reads complete. Registration is capped by the
-shared-memory budget. If the driver refuses that range, the loader retries smaller prefixes
+The resident arena is registered after its reads complete. Registration queries each visible
+adapter's current DXGI non-local budget and usage, leaving the larger of 1 GiB and 5% of its
+budget for later allocations. The adapter contexts are initialized before registration so
+later context creation does not inherit a large mapping. The smallest remaining allowance bounds the portable mapping;
+it is not divided by the number of devices. With several visible devices, the target is also
+bounded by DXGI's available plus existing reservation allowance. This is a conservative working-set
+target, not a promise that the driver accepts every registration up to it. If the driver refuses that range, the loader retries smaller prefixes
 ending at both a whole expert and an OS page. The registered prefix supports DMA and mapped
 GPU reads; only the remaining tail is locked with a working-set minimum plus chunked
 `VirtualLock`. CUDA-registered pages are not locked again. Startup reports CUDA-mapped and
 resident sizes separately and reports any working-set quota failure.
+
+The full expert arena registers before loading its bytes, using the same budget query and
+whole-layer registration slices. A driver refusal stops the slice probe; unregistered bytes
+remain in the resident tail. The registration target leaves the reserve before probing;
+it does not rely on recovering a context after driver exhaustion. Startup reports the budget and prefix.
+The remaining bytes stay resident through the working-set lock; the complete RAM copy is retained.
+If the OS cannot report a budget, registration falls back to the driver's result.
 
 Before sizing the resident copy, the loader drops the clean expert view left by the GPU fill.
 Each copied layer drops its view again. `VirtualUnlock` trims unlocked file pages without

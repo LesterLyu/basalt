@@ -1207,8 +1207,9 @@ bool FileExpertSource::pin_cache_complement(
             }
         std::sort(boundaries.begin(), boundaries.end());
         uint64_t limit = bytes;
+        uint64_t allowance = 0;
         std::string why;
-        if (basalt::platform::pin_budget(limit, why)) limit = std::min(limit, bytes);
+        if (host_pin_budget(allowance, why)) limit = std::min(allowance, bytes);
         const size_t padded = ((size_t) bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
         cudaError_t last = cudaSuccess;
         for (uint64_t target = limit; target > 0;) {
