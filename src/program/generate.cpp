@@ -174,7 +174,7 @@ private:
 
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
 // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
-constexpr int kVramStallMib = 256;
+constexpr int kVramStallMib = 200;
 // A round that found at least kSatRatio times --adapt-swaps misses to swap (the pipeline is saturated) lets the next
 // round swap kSatBoost times --adapt-swaps into the main card; the free RAM places are sized for it.  Fewer misses than
 // that are not worth the extra copies.
@@ -346,6 +346,7 @@ struct Options {
     /// The pool's core layout; the start-up pick unless given
     basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
+    bool full_resident_experts = false; ///< explicitly retain every expert in the resident arena
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM resident mode): `--resident-cpu-experts` with the copy
@@ -730,7 +731,7 @@ void usage() {
                  "                       GPU.  Default auto on packs with an expert profile.  auto = as many as fit in the VRAM\n"
                  "                       left after the weights, the session and --vram-reserve-mib\n"
                  "  --vram-reserve-mib N  VRAM left free on the primary GPU for graphs, scratch and the head when\n"
-                 "                       --expert-cache auto sizes the tier (default 700; at least 256)\n"
+                 "                       --expert-cache auto sizes the tier (default 700; at least 200)\n"
                  "  --expert-cache-device1 N|auto  fill CUDA1 with N experts or as many as fit\n"
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
@@ -785,6 +786,9 @@ void usage() {
                  "                       When some experts stay in the file, the copy leaves a RAM floor free for\n"
                  "                       the OS file cache (the RAM margin + the larger of 3.5 GiB + two layers'\n"
                  "                       experts and 4 GiB).\n"
+                 "  --full-resident-experts  keep every expert in the resident RAM arena, including GPU copies.\n"
+                 "                       Overrides the automatic low-RAM default; cannot be combined with mmap\n"
+                 "                       or the complement modes. The full arena's RAM guard still applies.\n"
                  "  --resident-budget-gib N  the resident mode with at most N GiB of experts in RAM (hottest first;\n"
                  "                       auto when not set: what fits);\n"
                  "                       a budget that would leave less than the RAM floor free is refused, naming\n"
@@ -1438,6 +1442,7 @@ int main(int argc, char** argv) {
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--full-resident-experts") o.full_resident_experts = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
@@ -1605,7 +1610,12 @@ int main(int argc, char** argv) {
         o.prefill_auto_max = 32768;
         o.prefill_chunk = o.prefill_auto_max;
     }
-    if (!o.mmap_experts && !o.resident_cpu_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
+    if (o.full_resident_experts && (o.mmap_experts || o.resident_cpu_experts)) {
+        std::fprintf(stderr, "basalt generate: --full-resident-experts cannot be combined with mmap or complement modes\n");
+        return 2;
+    }
+    if (!o.full_resident_experts && !o.mmap_experts && !o.resident_cpu_experts &&
+        o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
         !multi_gpu && o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
         o.resident_headroom = 0;
