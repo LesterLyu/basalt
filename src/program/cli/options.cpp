@@ -22,7 +22,12 @@ std::optional<int> resolve_model_options(Options& o, bool multi_gpu) {
         o.prefill_auto_max = 32768;
         o.prefill_chunk = o.prefill_auto_max;
     }
-    if (!o.mmap_experts && !o.resident_cpu_experts && o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
+    if (o.full_resident_experts && (o.mmap_experts || o.resident_cpu_experts)) {
+        basalt::log::error("basalt generate", "--full-resident-experts cannot be combined with mmap or complement modes");
+        return 2;
+    }
+    if (!o.full_resident_experts && !o.mmap_experts && !o.resident_cpu_experts &&
+        o.shared_expert_arena.empty() && !o.expert_profile.empty() &&
         o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
         o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
         o.resident_headroom = 0;

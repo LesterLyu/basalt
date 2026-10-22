@@ -163,9 +163,11 @@ PPL is 2.9581 against 2.9547 with the lower cutoff, a paired per-token NLL diffe
 access the cutoff stays at 2,560 (4,096 with `--peer-exclusive`).
 
 **Prompt chunk size.** A bare `--prefill auto` reads a prompt in equal chunks of at most 16384 tokens, or 32768 for packs
-whose expert blobs exceed 1.5 MB (NVFP4). A chunk's GEMM tiles set the rounding of its K/V, so a prompt longer than 16384
-tokens on such a pack is chunked differently and its K/V can differ in the last bits; prompts up to 16384 tokens and the
-256-token prompt half of the quality gate chunk as before, so the gate's numbers do not move. With `--parallel` a
+whose expert blobs exceed 1.5 MB (NVFP4). The anonymous full-RAM arena uses the same ceiling as the resident complement;
+the cache's lendable capacity can lower it. A file-backed arena keeps the conservative 8192-token ceiling unless an
+explicit `auto:N` is given. A chunk's GEMM tiles set the rounding of its K/V, so changing the ceiling can change K/V
+rounding for prompts longer than the smaller ceiling (including full-RAM `auto` versus `auto:8192`). The 256-token
+prompt half of the quality gate fits in one chunk with either ceiling. With `--parallel` a
 read that runs alone chunks as the single-stream path does; a read beside decoding slots takes the smaller chunk its
 capped loan allows, so the same prompt's K/V can differ in the last bits between the two. A read beside decoding slots
 that gives way to a shorter request reads its rest later in the same chunks, beside the slots, with no CPU share.

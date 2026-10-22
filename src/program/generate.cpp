@@ -2812,11 +2812,14 @@ int main(int argc, char** argv) {
     int64_t auto_lend_pct = lend_pct_for_share();
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
-    // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
-    // complement to size it from, so it stays at 8192.
+    // fund, and again to the fewest-equal-chunks cap when a prompt is read. An anonymous arena backs every lent slot;
+    // without either RAM copy it stays at 8192.
     const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
-    if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
+    if (o.prefill_auto_fit && !o.resident_cpu_experts) {
+        const bool ram_arena = srcp == &arena_src && o.shared_expert_arena.empty();
+        auto_ceiling = ram_arena ? std::min(auto_ceiling, kMaxAutoChunk) : 8192;
+    }
     // The peer tier's fill.  `exclusive` (--peer-exclusive): done before the RAM complement, which then leaves the
     // peer's experts out, so they are read from the file here and held only on the peer.
     auto open_peer = [&](bool exclusive) -> bool {

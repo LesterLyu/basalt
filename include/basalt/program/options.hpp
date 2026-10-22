@@ -67,6 +67,7 @@ struct Options {
     /// The pool's core layout; the start-up pick unless given
     basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
+    bool full_resident_experts = false; ///< explicitly retain every expert in the resident arena
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM resident mode): `--resident-cpu-experts` with the copy

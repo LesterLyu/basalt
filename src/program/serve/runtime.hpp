@@ -24,7 +24,7 @@ namespace serve {
 
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
 // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes.
-inline constexpr int kVramStallMib = 256;
+inline constexpr int kVramStallMib = 200;
 
 // All engine objects belong to startup and outlive run(). Callbacks borrow the same objects.
 struct Context {
