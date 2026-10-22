@@ -13,7 +13,7 @@ tests and the quality gate run on a machine with a card.
 | CUDA | 13 | 13 |
 | Build | CMake 3.24+ | CMake 3.24+ and Ninja |
 | Python | 3.10+ | 3.10+ |
-| GPU | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier | NVIDIA Blackwell (sm_120), one GPU |
+| GPU | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier |
 
 ## Platform code
 
@@ -38,7 +38,14 @@ process code page UTF-8 and lifts the path length limit.
 
 ## Windows limitations
 
-- One GPU. The peer and multi-GPU flags stop the engine at start-up.
+- Expert peers work without direct CUDA peer access: decode runs the peer's experts on that
+  device, using portable pinned host activations and result rows. Expert promotions and long
+  prefill stage peer weights through bounded host buffers. Direct P2P is selected when available.
+  Set `--peer-device 1` to enable it (`engine.peer-device: 1` in a server config). The Windows
+  server keeps its single-expert-device default. Use `--resident-experts --peer-exclusive`
+  to omit the peer's experts from the RAM copy.
+  This saves expert RAM; it does not promise unchanged prefill speed. Driver allocations and
+  prefill/KV mirrors remain additional memory costs.
 - Pinned memory is capped by the driver under WDDM. Registration uses the visible adapters'
   current DXGI non-local budgets, minus usage and room for later allocations. A driver refusal
   stops the slice probe; startup reports the actual registered range. See [runtime details](windows-runtime.md).

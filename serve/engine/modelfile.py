@@ -16,10 +16,9 @@ from model_file import ModelFile  # noqa: E402
 VISION_EXE = "basalt-vision"
 
 
-def peer_tier_supported() -> bool:
-    """Whether the engine on this platform takes a peer expert tier. It refuses `--peer-device` where a process is
-    given no GPU-to-GPU access between its devices, so offering that flag as a default there would stop the server
-    from starting on a machine that merely has two cards in it."""
+def auto_peer_enabled() -> bool:
+    """Keep the server's single-expert-device default where driver allocations need a separate RAM budget.
+    An explicit --peer-device still enables the tier."""
     return os.name != "nt"
 
 
@@ -119,7 +118,7 @@ def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bo
     path = os.path.abspath(path)
     words = list(engine_words or [])
     args = ["--model", path]   # settings come from the engine defaults and the server
-    if peer_tier_supported() and "--peer-device" not in words and (gpu_count() if gpus is None else gpus) > 1:
+    if auto_peer_enabled() and "--peer-device" not in words and (gpu_count() if gpus is None else gpus) > 1:
         args += ["--peer-device", "1"]
     args += words
     cdir = cache_dir(mf)

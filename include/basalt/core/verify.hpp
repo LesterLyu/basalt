@@ -127,8 +127,8 @@ public:
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
     /// the device plan's words while a window is stalled - the ring CUDA0 last published and its tiers, and on the peer
-    /// card the ring it was rung for, the ring it finished and whether its kernel still runs.  Empty without the
-    /// device plan.
+    /// card the ring it was rung for and the ring it finished. Reads only mapped host words, without CUDA calls,
+    /// so it is safe before releasing a stalled window. Empty without the device plan.
     std::string dm_note() const;
 
     /// raise every flag the window's spin kernels wait on past any ring (UINT32_MAX), so a window the GPU cannot finish
@@ -306,6 +306,7 @@ public:
     GpuPlanSink* plan_sink() { return &sink_; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    double ms_stage_inputs = 0, ms_stage_residency = 0, ms_stage_peer = 0, ms_stage_ple = 0;
     double ms_launch = 0;   ///< host time inside the window graph's launch
     int64_t windows = 0;
     /// --profile: GPU stage times of the windows since the last call (ms per window), as one line; empty when off.

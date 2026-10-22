@@ -84,15 +84,23 @@ class Derivation(Tmp):
 
 
 class Peer(Tmp):
+    def test_explicit_peer_on_windows(self):
+        path = self.build()
+        with mock.patch.object(modelfile, "auto_peer_enabled", return_value=False):
+            cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2,
+                                        engine_words=["--peer-device", "1", "--resident-experts", "--peer-exclusive"])
+        self.assertEqual(cfg["args"], ["--model", path, "--peer-device", "1", "--resident-experts", "--peer-exclusive"])
+        self.assertEqual(gpus_in_play(cfg, cfg["args"]), [0, 1])
+
     def test_second_gpu_becomes_the_peer(self):
         path = self.build()
-        cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2)
-        if not modelfile.peer_tier_supported():      # the engine refuses a peer tier here, so nothing is offered
-            self.assertNotIn("--peer-device", cfg["args"])
-            return
-        self.assertEqual(cfg["args"][-2:], ["--peer-device", "1"])
-        self.assertEqual(gpus_in_play(cfg, cfg["args"]), [0, 1])
-        self.assertNotIn("--peer-device", modelfile.model_config(path, str(self.engine_bin), gpus=1)["args"])
+        for enabled in (False, True):
+            with self.subTest(auto_peer=enabled), mock.patch.object(modelfile, "auto_peer_enabled", return_value=enabled):
+                cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2)
+                peer = ["--peer-device", "1"] if enabled else []
+                self.assertEqual(cfg["args"], ["--model", path] + peer)
+                self.assertEqual(gpus_in_play(cfg, cfg["args"]), [0, 1] if enabled else [0])
+                self.assertNotIn("--peer-device", modelfile.model_config(path, str(self.engine_bin), gpus=1)["args"])
 
     def test_vision_tells_the_engine(self):
         path = self.build(vision=True)
@@ -122,7 +130,7 @@ class Peer(Tmp):
     def test_engine_args_in_an_old_pack_are_ignored(self):
         path = self.build(meta={**META, "engine_args": ["--spec", "7", "--peer-device", "-1"]})
         cfg = modelfile.model_config(path, str(self.engine_bin), gpus=2)
-        peer = ["--peer-device", "1"] if modelfile.peer_tier_supported() else []
+        peer = ["--peer-device", "1"] if modelfile.auto_peer_enabled() else []
         self.assertEqual(cfg["args"], ["--model", path] + peer)
         self.assertEqual(cfg["sampling"], META["sampling"])
 
@@ -138,7 +146,7 @@ class Peer(Tmp):
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run", return_value=out):
             self.assertEqual(modelfile.gpu_count(), 2)
             path = self.build()
-            peer = ["--peer-device", "1"] if modelfile.peer_tier_supported() else []
+            peer = ["--peer-device", "1"] if modelfile.auto_peer_enabled() else []
             self.assertEqual(modelfile.model_config(path, str(self.engine_bin))["args"], ["--model", path] + peer)
         with mock.patch.dict(os.environ, env, clear=True), mock.patch("subprocess.run", side_effect=OSError):
             self.assertEqual(modelfile.gpu_count(), 0)
