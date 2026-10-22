@@ -190,6 +190,7 @@ void Runtime::rank_swaps(std::vector<Swap>& swaps, bool across) {
         }
         for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
             if (r[e] < 0) {
+                if (peer.valid() && peer.incoming(l, e)) continue;
                 const bool on_peer = peer.valid() && peer.has(l, e);
                 if (u[e] >= 2.0f && !(remote_opt && remote_opt->owns(l, e)))
                     cand.emplace_back(on_peer ? u[e] - margin : u[e], e);
@@ -451,6 +452,9 @@ bool Runtime::xq_advance(bool wait) {
                 for (size_t k = 0; k < ord.size(); ++k) {
                     const XSwap& x = xq[ord[k]];
                     const uint8_t* b = srcp->blob(x.layer, x.in);
+                    basalt::core::progress_at(srcp->pinned(x.layer, x.in)
+                        ? "adaptive upload: pinned host copy" : "adaptive upload: pageable host copy",
+                        (int64_t) x.layer * g.n_expert + x.in);
                     if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
                                                         cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
                         basalt::log::warn("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",

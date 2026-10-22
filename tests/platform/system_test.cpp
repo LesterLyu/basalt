@@ -35,6 +35,9 @@ int main() {
         check(self_cgroup_path().empty() && cgroup_root().empty(), "no accounting file means no cgroup paths either");
     }
     check(available_memory() > 0, "available_memory reads");
+    uint64_t device_free = 1;
+    check(!gpu_physical_free("not-a-pci-bus-id", device_free) && device_free == 0,
+          "invalid GPU memory query fails without a stale budget");
 
     const ProcessMemory pm = process_memory();
     if (!mi.empty()) check(pm.rss_mib > 0 && pm.avail_mib > 0, "process_memory reads this process's resident set");
@@ -58,7 +61,6 @@ int main() {
               "and the OS reports execution speed as never lowered");
 #endif
 
-    (void) gpu_peer_access();
     const DynLib nvml = DynLib::open_nvml();
     if (nvml) {
         check(nvml.sym<void*>("nvmlInit_v2") != nullptr, "the management library, when present, exports nvmlInit_v2");

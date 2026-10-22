@@ -43,7 +43,7 @@ std::optional<int> select_gpus(Options& o, std::vector<GpuCard>& chosen_cards, i
     }
     bp::RoleInputs ri;
     for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
-    ri.peer_access = basalt::platform::gpu_peer_access();
+    ri.peer_access = true;   // Portable host transport covers devices without direct peer access.
     ri.max_expert_tiers = max_expert_tiers;   // the device-planned tail's peer windows
     const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
     std::string line;

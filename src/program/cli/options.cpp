@@ -165,7 +165,7 @@ std::optional<int> validate_generation_options(const Options& o, bool multi_gpu,
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
     // part (and a second copy of the same experts) on it
     if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
-        basalt::log::error("basalt generate", "--peer-device cannot be combined with %s",
+        basalt::log::error("basalt generate", "the expert tier cannot be combined with %s",
                      !o.layer_split.empty() ? "--layer-split (use one or the other)"
                                             : "--expert-cache-device1..3 (the peer tier already caches experts there)");
         return 2;

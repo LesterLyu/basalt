@@ -33,9 +33,9 @@ void prefer_oom_victim();
 /// such knob.
 bool keep_full_speed();
 
-/// Whether a process is given direct GPU-to-GPU access between its devices, which a second GPU holding an expert tier
-/// needs. False where the platform withholds it.
-bool gpu_peer_access();
+/// Unallocated physical device memory from the management driver, addressed by PCI bus id. False with bytes=0
+/// when the driver cannot answer. Independent of the caller's CUDA allocation budget.
+bool gpu_physical_free(const std::string& pci_bus_id, uint64_t& bytes);
 
 /// Puts the three standard streams in binary mode where the C runtime defaults them to text, which would turn each
 /// "\n" the serve protocol writes into "\r\n" and fold a "\r\n" in a request to "\n". For a process whose standard

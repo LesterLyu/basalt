@@ -44,6 +44,11 @@ it does not rely on recovering a context after driver exhaustion. Startup report
 The remaining bytes stay resident through the working-set lock; the complete RAM copy is retained.
 If the OS cannot report a budget, registration falls back to the driver's result.
 
+Automatic peer sizing takes the smaller of CUDA's allocation allowance and the management
+driver's physical free memory, after accounting for its scratch allocations. The query uses
+the device's PCI bus ID; an unavailable management driver retains CUDA's budget. This startup
+snapshot bounds the expert tier but does not reserve memory against later allocations by other apps.
+
 Before sizing the resident copy, the loader drops the clean expert view left by the GPU fill.
 Each copied layer drops its view again. `VirtualUnlock` trims unlocked file pages without
 unmapping the view; `ERROR_NOT_LOCKED` is the documented success condition for that trim.
@@ -54,6 +59,14 @@ The platform memory test queries page residency around an unaligned one-byte tri
 reads the original bytes again. See the
 [VirtualUnlock contract](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualunlock)
 and the [direct-read API](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile).
+
+## Peer window launch
+
+A persistent host thread keeps the expert peer's CUDA context current and enqueues its windows.
+The main thread remains on the primary device while the peer waits for its first doorbell. This
+avoids switching contexts after starting a kernel that depends on work the caller has not launched.
+Stall diagnostics and timeout messages read mapped host words without querying the peer stream,
+so reporting a stall cannot block on the same driver context lock before releasing GPU waits.
 
 ## Tensor-map transport
 

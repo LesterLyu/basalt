@@ -2164,7 +2164,6 @@ int main(int argc, char** argv) {
     // keeps its weights and the cache just sized, the peer card its free memory less its buffers and reserve, and the
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
-    // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
     // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
     // expert tier is filled, when the GDN mixer split is taken; without it the head's peer rows fit in what the tier
     // leaves free
@@ -2836,6 +2835,8 @@ int main(int argc, char** argv) {
                                  "%lld that is %lld of %lld on the GPUs", o.peer_device, (long long) peer.resident(), peer.gib(),
                          std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                          (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+            basalt::log::info("basalt generate", "peer transport: %s",
+                              peer.direct_access() ? "direct P2P" : "portable pinned host staging");
             return true;
         }
         // several tiers: every card's buffers first, then the pairs the primary does not hold dealt out by room and
@@ -2860,7 +2861,10 @@ int main(int argc, char** argv) {
             const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);
             const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
-            rooms[i].bytes = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
+            uint64_t available = fb;
+            for (size_t j = 0; j < np; ++j)
+                if (o.peer_devices[j] == dev) available = std::min(available, tier(j).available_bytes());
+            rooms[i].bytes = available > reserve ? (available - reserve) / share : 0;
             rooms[i].gbps = o.peer_gbps[i];
         }
         std::vector<std::pair<int32_t, int32_t>> ranked;

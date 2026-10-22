@@ -8,6 +8,7 @@
 #include "basalt/core/gdn_head_split.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
+#include "basalt/platform/cpu.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -53,7 +54,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -70,6 +73,75 @@
 #include "basalt/log.hpp"
 
 namespace basalt::core {
+
+// Keep the peer context on its own thread: switching away after launching a host-waiting kernel can block
+// the caller in the driver before it launches the primary window that supplies the peer's doorbells.
+class PeerWindowLauncher {
+public:
+    ~PeerWindowLauncher() {
+        if (!worker_.joinable()) return;
+        { std::lock_guard<std::mutex> lk(mu_); stop_ = true; }
+        cv_.notify_one();
+        worker_.join();
+    }
+    bool open(int device, std::string& err) {
+        try {
+            worker_ = std::thread([this, device] {
+                const cudaError_t e = cudaSetDevice(device);
+                ok_ = e == cudaSuccess;
+                if (!ok_) error_ = cudaGetErrorString(e);
+                ready_.store(true, std::memory_order_release);
+                std::unique_lock<std::mutex> lk(mu_);
+                for (;;) {
+                    cv_.wait(lk, [this] { return pending_ || stop_; });
+                    if (stop_) return;
+                    pending_ = false;
+                    lk.unlock();
+                    const bool clear = basalt::kernels::dec_moe_zero_words(args_.arrive, 16, stream_);
+                    ok_ = clear &&
+                          basalt::kernels::dec_moe_peer_launch(args_, blocks_, stream_, q2_);
+                    if (!ok_) error_ = clear ? "peer launch failed" : cudaGetErrorString(cudaGetLastError());
+                    done_.store(true, std::memory_order_release);
+                    lk.lock();
+                }
+            });
+        } catch (const std::exception& e) {
+            err = std::string("verify: peer launcher thread: ") + e.what();
+            return false;
+        }
+        wait(ready_);
+        if (!ok_) err = "verify: peer launcher context: " + error_;
+        return ok_;
+    }
+    bool launch(const basalt::kernels::DmPeerArgs& args, int blocks, cudaStream_t stream, bool q2, std::string& err) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            args_ = args; blocks_ = blocks; stream_ = stream; q2_ = q2;
+            done_.store(false, std::memory_order_relaxed);
+            pending_ = true;
+        }
+        cv_.notify_one();
+        wait(done_);
+        if (!ok_) err = "verify: " + error_;
+        return ok_;
+    }
+private:
+    static void wait(const std::atomic<bool>& flag) {
+        for (unsigned spins = 0; !flag.load(std::memory_order_acquire); ++spins) {
+            if (spins < 20000) basalt::platform::cpu_relax();
+            else std::this_thread::yield();
+        }
+    }
+    std::thread worker_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::atomic<bool> ready_{false}, done_{true};
+    bool pending_ = false, stop_ = false, ok_ = false, q2_ = false;
+    int blocks_ = 0;
+    cudaStream_t stream_ = nullptr;
+    basalt::kernels::DmPeerArgs args_{};
+    std::string error_;
+};
 
 // The CPU tier's cache warm-up.  After layer l's doorbell the parked pool workers score layer l + 1's router on layer
 // l's FFN input (the ring's q8_1 rows; the router in 4-bit with one scale per 32 values, a prediction only: half the
@@ -134,6 +206,7 @@ struct DecMoe {
     // the peer card
     int pdev = -1;
     cudaStream_t ps = nullptr;
+    std::unique_ptr<PeerWindowLauncher> launcher;
     unsigned long long* ptab = nullptr;      ///< [n_layers * n_expert] blob address or 0
     basalt::kernels::NativeExpertLayout* lay = nullptr;
     void* pscr = nullptr;
@@ -150,6 +223,7 @@ struct DecMoe {
         PeerExperts* peer = nullptr;
         int dev = -1;
         cudaStream_t ps = nullptr;
+        std::unique_ptr<PeerWindowLauncher> launcher;
         int32_t* res = nullptr;                  ///< CUDA0: [n_layers * n_expert] its slot or -1
         std::vector<int32_t> shadow;             ///< what res holds
         unsigned long long* ptab = nullptr;      ///< its card: blob address or 0
@@ -518,12 +592,7 @@ std::string Verifier::dm_note() const {
     s += ", host flag " + std::to_string(rd(h_flag_));
     if (d->pdev >= 0) {
         const uint32_t w = rd(d->h_w + 0), done = rd(d->h_w + 16);
-        std::string st = "not launched";
-        if (d->peer_live) {
-            const OnDevice on(d->pdev);
-            const cudaError_t q = cudaStreamQuery(d->ps);
-            st = q == cudaErrorNotReady ? "running" : q == cudaSuccess ? "finished" : cudaGetErrorString(q);
-        }
+        const char* st = d->peer_live ? "launched (stream not queried)" : "not launched";
         s += "; peer card: rung for ring " + std::to_string(w & 0xffffu) + ((w >> 28) & 1u ? " (with entries)" : "") +
              ", finished ring " + std::to_string(done) + ", its kernel " + st;
         const std::string ab = basalt::kernels::dec_moe_peer_diag(d->h_w + 32);
@@ -723,11 +792,17 @@ bool Verifier::dm_init(std::string& err) {
             }
             x.shadow.assign((size_t) LE, INT32_MIN);
             if (!ok) { err = "verify: device-planned MoE buffers of a further peer"; return false; }
+            x.launcher = std::make_unique<PeerWindowLauncher>();
+            if (!x.launcher->open(x.dev, err)) return false;
         }
     }
     if (d->pdev >= 0) {
         hs_init();
         gs_init();
+    }
+    if (d->pdev >= 0) {
+        d->launcher = std::make_unique<PeerWindowLauncher>();
+        if (!d->launcher->open(d->pdev, err)) return false;
     }
     if (cpu_warm && codes_ok) {
         CpuWarm* w = new CpuWarm;
@@ -1446,6 +1521,7 @@ bool Verifier::gs_move(bool to_peer, std::string& err) {
 void Verifier::dm_free() {
     DecMoe* d = dm_;
     if (d == nullptr) return;
+    d->launcher.reset();
     hs_free();
     gs_free();
     if (d->warm != nullptr) {
@@ -1459,6 +1535,7 @@ void Verifier::dm_free() {
             if (p) cudaFree(p);
     }
     for (DecMoe::XPeer& x : d->xp) {
+        x.launcher.reset();
         {
             const OnDevice on(x.dev);
             if (x.ps) { cudaStreamSynchronize(x.ps); cudaStreamDestroy(x.ps); }
@@ -3682,7 +3759,9 @@ void Verifier::collect_profile() {
 
 // The device-planned tail's window start: residency tables, the flag words, and the peer card's persistent window.
 bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
+    const Clock::time_point ts = Clock::now();
     if (!dm_sync(err)) return false;
+    ms_stage_residency += ms_since(ts);
     decode_events().stamp(4);
     if (gm) gm->mark(13);
     *(volatile uint32_t*) (dm_->h_w + 0) = 0;
@@ -3698,8 +3777,8 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         dm_->tag_dirty = false;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    const Clock::time_point tp = Clock::now();
     if (dm_->pdev >= 0) {
-        const OnDevice on(dm_->pdev);
         basalt::kernels::DmPeerArgs pa;
         pa.rings_m = dm_->h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
         pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
@@ -3712,17 +3791,12 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
             pa.mxq_m = gs_h_xq_; pa.mxq = gs_pxq_;
             pa.mx_m = gs_h_x_; pa.mixl = gs_mixl_; pa.part_m = gs_h_part_;
         }
-        if (!basalt::kernels::dec_moe_zero_words(dm_->parr, 16, dm_->ps) ||
-            !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
-            err = "verify: the peer window did not launch";
-            return false;
-        }
+        if (!dm_->launcher->launch(pa, dm_->pblocks, dm_->ps, dm_->pq2, err)) return false;
         dm_->peer_live = true;
     }
     for (DecMoe::XPeer& x : dm_->xp) {   // further peers: the same window on their own ring
         for (int w : {0, 16, 32}) *(volatile uint32_t*) (x.h_w + w) = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        const OnDevice on(x.dev);
         basalt::kernels::DmPeerArgs pa;
         pa.rings_m = x.h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
         pa.seq_m = x.h_w + 0; pa.done_m = x.h_w + 16; pa.rows_m = dm_->h_rows;
@@ -3730,13 +3804,10 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = x.pscr; pa.arrive = x.parr; pa.diag_m = x.h_w + 32;
         pa.rq = x.rq; pa.rs = x.rs;
-        if (!basalt::kernels::dec_moe_zero_words(x.parr, 16, x.ps) ||
-            !basalt::kernels::dec_moe_peer_launch(pa, x.pblocks, x.ps, dm_->pq2)) {
-            err = "verify: a further peer's window did not launch";
-            return false;
-        }
+        if (!x.launcher->launch(pa, x.pblocks, x.ps, dm_->pq2, err)) return false;
         x.live = true;
     }
+    ms_stage_peer += ms_since(tp);
     if (gm) gm->mark(14);
     return true;
 }
@@ -3814,6 +3885,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     gm.mark(12);
     gs_split_ = dm_ != nullptr && gs_mixl_ != nullptr;
     if (gs_split_ && !gs_live_ && !gs_move(true, err)) return false;
+    ms_stage_inputs += ms_since(t0);
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_begin(err, &gm)) return false;
     }
@@ -3873,7 +3945,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
             _mm_sfence();
             *flag = 1;
             *(volatile uint32_t*) (h_flag_ + 8) = 1;
-            ms_host += ms_since(tp);
+            const double elapsed = ms_since(tp);
+            ms_host += elapsed;
+            ms_stage_ple += elapsed;
         } else {
             *flag = 1;
             *(volatile uint32_t*) (h_flag_ + 8) = 1;
@@ -3887,7 +3961,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *(volatile uint32_t*) (h_flag_ + 8) = 1;
-        ms_host += ms_since(tp);
+        const double elapsed = ms_since(tp);
+        ms_host += elapsed;
+        ms_stage_ple += elapsed;
     }
     fl_.ple_early = ple_early;
     }
@@ -3986,7 +4062,9 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return -1;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
-            ms_host += ms_since(tp);
+            const double elapsed = ms_since(tp);
+            ms_host += elapsed;
+            ms_stage_ple += elapsed;
         }
         *flag = want;
         if (dm_ != nullptr && dm_->warm != nullptr && l + 1 < le_) {   // the next layer's warm-up
