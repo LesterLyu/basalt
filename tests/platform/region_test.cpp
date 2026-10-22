@@ -62,9 +62,15 @@ int main() {
     void* r = alloc_region(bytes, backing, note2, "region_test_no_such_dir/arena", 0, b2, n2);
     check(r == nullptr && b2 == nullptr && n2 == 0 && !note2.empty(), "a shared arena without a hash is refused");
 
-    uint64_t limit = 0;
-    std::string why;
+    uint64_t limit = 123;
+    std::string why = "stale reading";
     const bool budgeted = pin_budget(limit, why);
-    check(!budgeted || !why.empty(), "a pin budget names where it comes from");
+    check(!budgeted && limit == 0 && why.empty(), "an unidentified adapter has no fabricated budget");
+    char missing[8];
+    std::memset(missing, 0xff, sizeof missing);
+    limit = 123;
+    why = "stale reading";
+    check(!pin_budget(limit, why, missing, 1) && limit == 0 && why.empty(),
+          "an unknown adapter clears a stale budget reading");
     return failures ? 1 : 0;
 }
