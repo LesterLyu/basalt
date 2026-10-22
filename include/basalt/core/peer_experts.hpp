@@ -17,6 +17,7 @@
 
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/expert_source.hpp"
+#include "basalt/core/peer_copy.hpp"
 
 #include <cuda_runtime.h>
 
@@ -27,7 +28,7 @@
 
 namespace basalt::core {
 
-/// multi-GPU: set once at startup when a peer device is configured (--peer-device N).  The mapped host buffers
+/// multi-GPU: set once at startup when a peer device is configured. The mapped host buffers
 /// the peer card writes into are then allocated with cudaHostAllocPortable; without a peer the flag stays off.
 void set_peer_portable(bool on);
 bool peer_portable();
@@ -57,9 +58,13 @@ public:
     static uint64_t device_overhead_bytes();
     bool valid() const { return device_ >= 0; }
     int device() const { return device_; }
+    bool direct_access() const { return p2p_; }
+    uint64_t available_bytes() const { return available_bytes_; }
 
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
+    /// An incoming copy owns the expert until it lands; another tier must not promote it meanwhile.
+    bool incoming(int64_t layer, int64_t expert) const { return incoming_[(size_t) (layer * n_expert_ + expert)] != 0; }
 
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
@@ -115,6 +120,8 @@ public:
 
 private:
     int device_ = -1;
+    bool p2p_ = false;
+    uint64_t available_bytes_ = 0;
     int64_t n_layers_ = 0, n_expert_ = 0;
     ExpertCache cache_;
     ExpertSource* src_ = nullptr;
@@ -122,6 +129,7 @@ private:
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
     FileExpertSource* fsrc_ = nullptr;                ///< set with --peer-exclusive
     std::vector<uint8_t> hold_;                       ///< [n_layers * n_expert]: not to be evicted
+    std::vector<uint8_t> incoming_;                   ///< reserved by an in-flight refill or reassignment
     /// `off` is the RAM place the victim is copied to, or `kHasPlace` when the victim already has one
     static constexpr uint64_t kHasPlace = ~0ull;
     struct Evict { int32_t layer, in, out, slot; uint64_t off; };
@@ -130,6 +138,7 @@ private:
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
+    PeerCopy promotion_copy_;
     float* h_x_ = nullptr;   float* d_x_ = nullptr;   // n_tok x n_embd
     float* h_out_ = nullptr; float* d_out_ = nullptr; // compact rows
     void* h_meta_ = nullptr; void* d_meta_ = nullptr; // groups: ptr | start | dst | tok | count

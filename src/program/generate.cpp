@@ -1533,7 +1533,7 @@ int main(int argc, char** argv) {
         }
         bp::RoleInputs ri;
         for (int i : choice.cards) ri.cards.push_back((size_t) i < visible.size() ? visible[(size_t) i] : bp::GpuCard{});
-        ri.peer_access = basalt::platform::gpu_peer_access();
+        ri.peer_access = true;   // Portable host transport covers devices without direct peer access.
         ri.max_expert_tiers = basalt::kernels::kDmMaxX + 1;   // the device-planned tail's peer windows
         const std::vector<bp::GpuRole> roles = bp::choose_roles(ri);
         std::string line;
@@ -1907,7 +1907,7 @@ int main(int argc, char** argv) {
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
     // part (and a second copy of the same experts) on it
     if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
-        basalt::log::error("basalt generate", "--peer-device cannot be combined with %s",
+        basalt::log::error("basalt generate", "the expert tier cannot be combined with %s",
                      !o.layer_split.empty() ? "--layer-split (use one or the other)"
                                             : "--expert-cache-device1..3 (the peer tier already caches experts there)");
         return 2;
@@ -3548,7 +3548,6 @@ int main(int argc, char** argv) {
     // keeps its weights and the cache just sized, the peer card its free memory less its buffers and reserve, and the
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
-    // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
     // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
     // expert tier is filled, when the GDN mixer split is taken; without it the head's peer rows fit in what the tier
     // leaves free
@@ -4584,6 +4583,8 @@ int main(int argc, char** argv) {
                                  "%lld that is %lld of %lld on the GPUs", o.peer_device, (long long) peer.resident(), peer.gib(),
                          std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                          (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+            basalt::log::info("basalt generate", "peer transport: %s",
+                              peer.direct_access() ? "direct P2P" : "portable pinned host staging");
             return true;
         }
         // several tiers: every card's buffers first, then the pairs the primary does not hold dealt out by room and
@@ -4608,7 +4609,10 @@ int main(int argc, char** argv) {
             const uint64_t reserve = ((uint64_t) std::max(o.peer_reserve_mib, 128) << 20) +
                                      (dev == o.peer_device ? (uint64_t) peer_split_bytes(d0) + peer_prompt_bytes() : 0);
             const uint64_t share = (uint64_t) std::count(o.peer_devices.begin(), o.peer_devices.end(), dev);
-            rooms[i].bytes = fb > reserve ? ((uint64_t) fb - reserve) / share : 0;
+            uint64_t available = fb;
+            for (size_t j = 0; j < np; ++j)
+                if (o.peer_devices[j] == dev) available = std::min(available, tier(j).available_bytes());
+            rooms[i].bytes = available > reserve ? (available - reserve) / share : 0;
             rooms[i].gbps = o.peer_gbps[i];
         }
         std::vector<std::pair<int32_t, int32_t>> ranked;
@@ -5847,6 +5851,7 @@ int main(int argc, char** argv) {
                 }
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) {
+                        if (peer.valid() && peer.incoming(l, e)) continue;
                         const bool on_peer = peer.valid() && peer.has(l, e);
                         if (u[e] >= 2.0f && !(remote_opt && remote_opt->owns(l, e)))
                             cand.emplace_back(on_peer ? u[e] - margin : u[e], e);
@@ -6141,6 +6146,9 @@ int main(int argc, char** argv) {
                         for (size_t k = 0; k < ord.size(); ++k) {
                             const XSwap& x = xq[ord[k]];
                             const uint8_t* b = srcp->blob(x.layer, x.in);
+                            basalt::core::progress_at(srcp->pinned(x.layer, x.in)
+                                ? "adaptive upload: pinned host copy" : "adaptive upload: pageable host copy",
+                                (int64_t) x.layer * g.n_expert + x.in);
                             if (b == nullptr || cudaMemcpyAsync(xcache.device_slot(x.slot), b, (size_t) lay2.blob_bytes(x.layer),
                                                                 cudaMemcpyHostToDevice, adapt_stream) != cudaSuccess)
                                 basalt::log::warn("basalt serve", "adaptive swap copy failed (layer %d, slot %d): %s",
@@ -9090,6 +9098,7 @@ int main(int argc, char** argv) {
                                drive.d.peer_entries};
             };
             const DecSnap ds0 = dec_snap();
+            const double stage0[] = {ver.ms_stage_inputs, ver.ms_stage_residency, ver.ms_stage_peer, ver.ms_stage_ple};
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
@@ -9624,6 +9633,12 @@ int main(int argc, char** argv) {
                                                              " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                              " ms/window for it)").c_str());
                 const std::string evr = basalt::core::decode_events().report();
+                basalt::log::info("basalt decode stage", "ms/window: inputs+PLE prefetch %.3f, residency upload %.3f, "
+                                  "peer launch %.3f, PLE collect %.3f",
+                                  (ver.ms_stage_inputs - stage0[0]) / w, (ver.ms_stage_residency - stage0[1]) / w,
+                                  (ver.ms_stage_peer - stage0[2]) / w, (ver.ms_stage_ple - stage0[3]) / w);
+                const std::string pio = ple_table.io_report();
+                if (!pio.empty()) basalt::log::info("basalt cumulative", "%s", pio.c_str());
                 if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());

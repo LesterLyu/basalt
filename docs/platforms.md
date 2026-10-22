@@ -13,7 +13,7 @@ tests and the quality gate run on a machine with a card.
 | CUDA | 13 | 13 |
 | Build | CMake 3.24+ | CMake 3.24+ and Ninja |
 | Python | 3.10+ | 3.10+ |
-| GPU | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Blackwell (sm_120), one GPU |
+| GPU | NVIDIA Blackwell (sm_120); optional second GPU as a peer expert tier (`gpu 0,1`) | NVIDIA Blackwell (sm_120); optional peer expert tiers (`gpu 0,1`) |
 
 ## Platform code
 
@@ -38,7 +38,10 @@ process code page UTF-8 and lifts the path length limit.
 
 ## Windows limitations
 
-- One GPU. With `gpu` listing more cards, the ones after the main card stay idle and a start-up warning says so.
+- Expert peers work without direct CUDA peer access through portable pinned host buffers.
+  Select the cards with `gpu` (`"gpu": "0,1"` in the server config). Peer expert promotions
+  use direct P2P when available, otherwise bounded host staging. Prompt copies are host-staged.
+  Driver allocations and prefill/KV mirrors remain additional memory costs.
 - Pinned memory is capped by the driver under WDDM. Registration uses the visible adapters'
   current DXGI non-local budgets, minus usage and room for later allocations. A driver refusal
   stops the slice probe; startup reports the actual registered range.
