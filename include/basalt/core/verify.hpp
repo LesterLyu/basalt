@@ -166,6 +166,8 @@ public:
     /// the request's logit_bias; the penalties, the filters and the position's draw are the window's own. `pos0` is the
     /// window's first position. The token is in `token`; the window's other rows are untouched.
     bool resample_row(int t, int64_t pos0, const std::vector<float>& bias, int32_t& token, std::string& err);
+    /// The same for a batch row, with its slot's sampling and absolute position. Batch penalties remain disabled.
+    bool resample_slot_row(int t, const std::vector<float>& bias, int32_t& token, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
     /// slots at that stride (`basalt::kernels::penalty_rows` builds them), most recent token LAST, unused front slots
@@ -354,6 +356,8 @@ private:
     int32_t b_out_[8] = {};
     std::vector<basalt::kernels::SamplerParams> slot_sp_;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
+    bool masked_row(int t, basalt::kernels::SamplerParams sp, const int32_t* history, int history_len,
+                    const std::vector<float>& bias, int32_t& token, std::string& err);
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot

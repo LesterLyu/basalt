@@ -111,6 +111,46 @@ int main() {
         CHECK(g.begin(R"({"kind":"tools","tools":[{"name":"f","parameters":{}}],"tool_choice":"none"})", nullptr, 0, err));
         CHECK(!g.on());
     }
+    {   // interleaved slots share the vocabulary but never the grammar position or mask
+        const std::string empty = R"({"kind":"json_schema","schema":{"type":"object","properties":{},"additionalProperties":false}})";
+        Guard a(pv), b(pv);
+        CHECK(a.begin(jo, nullptr, 0, err));
+        CHECK(b.begin(empty, nullptr, 0, err));
+        const int32_t open[] = {0};
+        CHECK(a.scan(open, 1) == -1 && b.scan(open, 1) == -1);
+        const int32_t key[] = {2, 3};
+        CHECK(a.scan(key, 2) == -1);
+        CHECK(b.scan(key, 2) == 0);
+        std::vector<float> bias;
+        b.mask_bias({}, bias);
+        CHECK(bias[1] == 0.0f && std::isinf(bias[2]));
+        CHECK(b.take(1));
+        a.mask_bias({}, bias);
+        CHECK(bias[4] == 0.0f && std::isinf(bias[1]));
+        const int32_t rest[] = {4, 1, 8};
+        CHECK(a.scan(rest, 3) == -1);
+        CHECK(a.misses() == 0 && b.misses() == 1);
+        CHECK(b.begin(jo, nullptr, 0, err));
+        b.mask_bias({}, bias);
+        CHECK(bias[0] == 0.0f && std::isinf(bias[1]));
+    }
+    {   // a handover replays only this reply, including the end of its initial thinking block
+        Guard g(pv);
+        const int64_t prompt[] = {6, 10, 12, 7, 0, 2, 3};
+        CHECK(g.begin(jo, prompt, 7, err, 5));
+        std::vector<float> bias;
+        g.mask_bias({}, bias);
+        CHECK(bias[4] == 0.0f && std::isinf(bias[1]) && std::isinf(bias[8]));
+        const int32_t rest[] = {4, 1, 8};
+        CHECK(g.scan(rest, 3) == -1);
+        CHECK(g.windows() == 1 && g.misses() == 0);
+        err.clear();
+        CHECK(!g.begin(jo, prompt, 7, err, 8) && !g.on());
+        err.clear();
+        const int64_t bad[] = {6, 7, 0, 12};
+        CHECK(!g.begin(jo, bad, 4, err, 2) && !g.on());
+        err.clear();
+    }
     {
         Guard g(pv);
         CHECK(!g.begin("{", nullptr, 0, err));

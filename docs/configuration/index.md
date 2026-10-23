@@ -134,6 +134,9 @@ A server with `max-context` above 32768 has an elastic KV cache: each session ba
 takes more from the expert cache only when a request needs it. It is off when the model is split over GPUs with
 `layer-split` (a peer card is fine) and with `kv-resident` or `vram-elastic`. See [running](../running.md#concurrent-requests---parallel-n).
 
+Grammar constraints work with `parallel`: each slot holds its own constraint state, including across solo/batch
+handovers. Explicit `strict: true` tools and JSON schemas stay constrained when the default `grammar` option is off.
+
 ## Expert cache and memory
 
 The model's experts live in VRAM (the expert cache), in RAM, or in the file. These settings decide where.

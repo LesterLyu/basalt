@@ -82,21 +82,29 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
     return true;
 }
 
-bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err) {
+bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err,
+                  size_t n_generated) {
     on_ = false;
     windows_ = misses_ = ns_ = 0;
+    if (n_generated > n_prompt) { err = "generated prefix exceeds the prompt"; return false; }
     RequestGrammar rg = grammar_from_request(grammar_json, err);
     if (!err.empty()) return false;
     if (!rg.grammar) return true;
     st_ = GrammarState(rg.grammar, rg.triggers);
     // generation starts inside a thinking block when the prompt's last think tag opens one
     thinking_ = false;
-    for (size_t i = n_prompt, seen = 0; i-- > 0 && seen < 16; ++seen) {
+    for (size_t i = n_prompt - n_generated, seen = 0; i-- > 0 && seen < 16; ++seen) {
         const int64_t t = prompt[i];
         if (t == pv_.think_close) break;
         if (t == pv_.think_open) { thinking_ = true; break; }
     }
     on_ = true;
+    for (size_t i = n_prompt - n_generated; i < n_prompt; ++i)
+        if (!feed((int32_t) prompt[i])) {
+            err = "the generated prefix violates the grammar";
+            on_ = false;
+            return false;
+        }
     return true;
 }
 

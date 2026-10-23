@@ -814,6 +814,8 @@ class ProcessEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
         keys = self.sampling_keys(sampling or {})
+        if (sampling or {}).get("_grammar"):
+            keys += f" grammar_start={len(ids)}"  # replay this reply's prefix when solo and batch paths hand it over
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)

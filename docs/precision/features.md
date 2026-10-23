@@ -121,6 +121,12 @@ with `--grammar off`, run the unchanged path. The schema grammar is llama.cpp's 
 array sizes and formats are enforced); what llama.cpp does not express (`uniqueItems`, number bounds, a pattern with no
 grammar form) is not enforced.
 
+Continuous-batching slots keep independent grammar states. A rejected row is drawn with that slot's filters, seed
+and absolute position, then its segment ends there; other slots retain their accepted rows. Batch penalties remain
+disabled, as in unconstrained batch sampling. Solo/batch handovers replay only the already-generated reply to restore
+the grammar, including a thinking block or tool call spanning the handover. The verifier logits and draft acceptance
+rule are unchanged; requests without a grammar do not invoke a mask or resample.
+
 ## Speculative decoding does not change output
 
 Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width

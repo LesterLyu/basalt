@@ -35,7 +35,9 @@ public:
     /// Starts a request. `grammar_json` is the request's "grammar" object. `prompt` ends where generation starts: an
     /// open thinking block there defers the grammar until the block is closed. False with `err` on an unusable grammar.
     /// A request whose grammar is null (tool_choice "none") leaves the guard off.
-    bool begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err);
+    /// `n_generated` trailing prompt tokens belong to this reply: replay them when it changes serving paths.
+    bool begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err,
+               size_t n_generated = 0);
     bool on() const { return on_; }
 
     /// Feeds out[0..rows) in order and returns the first row the grammar does not allow, or -1. The state has then

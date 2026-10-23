@@ -477,6 +477,38 @@ class ParallelService(unittest.TestCase):
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
 
+    def test_grammar_boundary_survives_solo_batch_handover(self):
+        self.start(2, slot_cache=True)
+        prompts = [list(b"LONGREPLY please"), list(b"short")]
+        replies, errors = {}, []
+
+        def go(i):
+            try:
+                sampling = {"seed": 101 + i, "_grammar": {"kind": "json_object"}}
+                replies[i] = [t for t in self.engine.generate(prompts[i], 200, sampling, threading.Event())
+                              if t is not None]
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(self.engine, "_send", wraps=self.engine._send) as sent:
+            first = threading.Thread(target=go, args=(0,))
+            first.start()
+            time.sleep(0.05)
+            go(1)
+            first.join(30)
+        self.assertFalse(first.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(replies[0], list(b"ok, " + b"la " * 15 + b"done.") + [257])
+        self.assertEqual(replies[1], list(b"ok, done.") + [257])
+        commands = [c.args[0] for c in sent.call_args_list if c.args[0].startswith(("GEN ", "BGEN ", "SGEN "))]
+        self.assertIn("BGEN", [c.split()[0] for c in commands])
+        self.assertEqual(commands[-1].split()[0], "GEN")
+        for command in commands:
+            keys = dict(word.split("=", 1) for word in command.split() if "=" in word)
+            i = int(keys["seed"]) - 101
+            self.assertEqual(int(keys["grammar_start"]), len(prompts[i]))
+            self.assertEqual(json.loads(keys["grammar"]), {"kind": "json_object"})
+
     def test_next_turn_goes_back_to_its_slot(self):
         self.start(2)
         a = "conversation A, first turn"

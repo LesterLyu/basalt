@@ -6484,8 +6484,17 @@ int main(int argc, char** argv) {
             int64_t since_draft = 0;   ///< windows since the slot last drafted
             int64_t windows = 0;
             int64_t drafts_accepted = 0, drafts_offered = 0;   ///< the request's draft tokens, for BDONE
+            std::unique_ptr<basalt::program::grammar::Guard> grammar;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        std::vector<float> batch_grammar_bias;
+        auto report_slot_grammar = [&](int b) {
+            auto& guard = bs[(size_t) b].grammar;
+            if (!guard) return;
+            std::fprintf(stderr, "basalt grammar: slot %d: %lld windows, %lld masked resamples, %.3f ms\n", b,
+                         (long long) guard->windows(), (long long) guard->misses(), guard->ms());
+            guard.reset();
+        };
         // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
         const bool batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
         const int S_all = S;
@@ -6944,9 +6953,32 @@ int main(int argc, char** argv) {
             // per segment: the drafts the picks confirm, then how far the request goes (stop token, limits) within them
             const char* fin_of[MR] = {};
             for (int sg = 0; sg < S; ++sg) {
-                const BSlot& sl = bs[(size_t) rows[sg]];
+                BSlot& sl = bs[(size_t) rows[sg]];
                 int k = 1;
                 while (k < lens[sg] && outb[r0s[sg] + k - 1] == drafts[sg][(size_t) k - 1]) ++k;
+                if (sl.grammar && sl.grammar->on()) {
+                    // Only emitted tokens advance the grammar: first clip at an end token or the request's limits.
+                    for (int e = 0; e < k; ++e) {
+                        const int32_t y = outb[r0s[sg] + e];
+                        if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end() ||
+                            sl.stop || sl.produced + e + 1 >= sl.max_new || sl.p + e + 2 > slot_cap[(size_t) rows[sg]]) {
+                            k = e + 1;
+                            break;
+                        }
+                    }
+                    const int miss = sl.grammar->scan(outb + r0s[sg], k);
+                    if (miss >= 0) {
+                        sl.grammar->mask_bias({}, batch_grammar_bias);
+                        int32_t token = 0;
+                        if (!ver.resample_slot_row(r0s[sg] + miss, batch_grammar_bias, token, err) ||
+                            !sl.grammar->take(token)) {
+                            std::printf("ERR grammar: %s\n", err.empty() ? "the masked token was refused" : err.c_str());
+                            return false;
+                        }
+                        outb[r0s[sg] + miss] = token;
+                        k = miss + 1;
+                    }
+                }
                 for (int e = 0; e < k; ++e) {
                     const int32_t y = outb[r0s[sg] + e];
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -7013,6 +7045,7 @@ int main(int argc, char** argv) {
                                 (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
                     sl.active = false;
                     sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
+                    report_slot_grammar(b);
                 } else {
                     sl.x = outb[r0s[sg] + k - 1];
                     sl.p += k;
@@ -7152,7 +7185,14 @@ int main(int argc, char** argv) {
                 for (int t = 0; t < GS; ++t) {
                     BSlot& sl = bs[(size_t) (gi * GS + t)];
                     if (!sl.active) continue;
-                    const int32_t y = outb[t];
+                    int32_t y = outb[t];
+                    if (sl.grammar && sl.grammar->on() && sl.grammar->scan(&y, 1) >= 0) {
+                        sl.grammar->mask_bias({}, batch_grammar_bias);
+                        if (!vk.resample_slot_row(t, batch_grammar_bias, y, err) || !sl.grammar->take(y)) {
+                            std::printf("ERR grammar: %s\n", err.empty() ? "the masked token was refused" : err.c_str());
+                            return false;
+                        }
+                    }
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
                     ++bt_rows;
@@ -7165,6 +7205,7 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f 0 0\n", gi * GS + t, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = false;   // the pipeline's pad rows: a pipelined slot is not reused as a cache
+                        report_slot_grammar(gi * GS + t);
                     } else {
                         sl.x = y;
                         sl.p += 1;
@@ -7379,6 +7420,7 @@ int main(int argc, char** argv) {
             std::string req_bias_text;   // logit_bias=id:value,...: added to the verifier's logits (see ver.set_logit_bias)
             bool req_bias_present = false;
             std::string req_grammar_text;   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
+            int64_t req_grammar_start = -1; // the first token of this reply, preserved across solo/batch handovers
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             float req_relax = o.relaxed_drafting;   // relax=P: this request's --relaxed-drafting (0 = exact)
             // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
@@ -7399,6 +7441,7 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
+                    else if (key == "grammar_start") req_grammar_start = std::strtoll(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -7457,10 +7500,11 @@ int main(int argc, char** argv) {
             std::unique_ptr<basalt::program::grammar::Guard> gguard;
             if (!req_grammar_text.empty() && grammar_vocab) {
                 std::string gerr;
-                if (o.batch > 0) gerr = "continuous batching is not supported";
+                if (req_grammar_start < -1 || req_grammar_start > n) gerr = "the reply start is outside the prompt";
                 else {
                     gguard = std::make_unique<basalt::program::grammar::Guard>(*grammar_vocab);
-                    if (!gguard->begin(req_grammar_text, ids.data(), ids.size(), gerr)) gguard.reset();
+                    const size_t generated = req_grammar_start < 0 ? 0 : (size_t) (n - req_grammar_start);
+                    if (!gguard->begin(req_grammar_text, ids.data(), ids.size(), gerr, generated)) gguard.reset();
                     else if (!gguard->on()) gguard.reset();
                 }
                 if (!gerr.empty()) { std::printf("ERR grammar: %s\n", gerr.c_str()); continue; }
@@ -9089,6 +9133,7 @@ int main(int argc, char** argv) {
                     BSlot& sl = bs[(size_t) admit_slot];
                     sl = BSlot{};
                     sl.active = true;
+                    sl.grammar = std::move(gguard);
                     sl.script = std::move(bscript[(size_t) admit_slot].first);
                     sl.rng.seed(bscript[(size_t) admit_slot].second);
                     bscript[(size_t) admit_slot].first.clear();
