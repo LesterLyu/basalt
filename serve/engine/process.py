@@ -274,6 +274,7 @@ class ProcessEngine:
         # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
+        self.slot_keys: list[str | None] = [None] * self.batch
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
         if "ctl" not in self.__dict__:
             self.waiting = 0                            # requests waiting for ctl
@@ -814,6 +815,8 @@ class ProcessEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress = None
         keys = self.sampling_keys(sampling or {})
+        cache_key = (sampling or {}).get("prompt_cache_key")
+        cache_key = cache_key if isinstance(cache_key, str) and cache_key else None
         if (sampling or {}).get("_grammar"):
             keys += f" grammar_start={len(ids)}"  # replay this reply's prefix when solo and batch paths hand it over
         out: list[int] = []
@@ -846,11 +849,12 @@ class ProcessEngine:
                     any_slot = bool(self.info.get("solo_any_slot"))
                     alone = not any(self.slot_busy) and self.waiting == 0 and (any_slot or not self.info.get("slot0_solo"))
                     if alone and left > 1 and any_slot:
-                        solo_slot = self.pick_slot(prompt)       # the slot holding the longest start, else a free one
+                        solo_slot = self.pick_slot(prompt, cache_key)
                         if solo_slot is None:
                             alone = False
                         else:
                             self.slot_busy[solo_slot] = True
+                            self.slot_keys[solo_slot] = cache_key
                             reserved = solo_slot
                 if alone and left > 1:
                     if solo_slot is not None:
@@ -878,9 +882,10 @@ class ProcessEngine:
                                     self._shorter_waiting(len(prompt), 2 if solo_slot is None else 1)):
                                 if solo_slot is None:
                                     with self.slot_cv:      # slot the partial read will wait in
-                                        reserved = self.pick_slot(prompt)
+                                        reserved = self.pick_slot(prompt, cache_key)
                                         if reserved is not None:
                                             self.slot_busy[reserved] = True
+                                            self.slot_keys[reserved] = cache_key
                                 if reserved is not None:    # (a solo run in a slot parks its read in that slot)
                                     self._send(f"BYIELD {reserved}")
                                     yield_sent = True
@@ -909,14 +914,15 @@ class ProcessEngine:
                         prompt = list(ids) + out            # continues in a batch slot
                 while True:
                     if slot is None:
-                        # prefer the slot holding this prompt's start, else the longest unused
+                        # prefer the conversation's slot or its cached prefix, then the longest unused
                         with self.slot_cv:
                             ticket = self.admission.join()
                             try:
                                 while True:
-                                    slot = self.pick_slot(prompt)
+                                    slot = self.pick_slot(prompt, cache_key)
                                     if slot is not None and self.admission.may_go(ticket, self._resumes(slot, prompt)):
                                         self.slot_busy[slot] = True
+                                        self.slot_keys[slot] = cache_key
                                         break
                                     slot = None
                                     if holding:
@@ -1099,12 +1105,16 @@ class ProcessEngine:
         with self.slot_cv:
             return self.waiting + len(self.admission)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
-        """A free slot for `prompt` (caller holds slot_cv): longest held prefix, else an empty one, then the least
-        recently used; None when none is free."""
+    def pick_slot(self, prompt: list[int], cache_key: str | None = None) -> int | None:
+        """A free slot, keeping a keyed conversation in place across prefix changes such as compaction.
+        Otherwise prefer the longest held prefix, an empty slot, then the least recently used. Caller holds slot_cv."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        if cache_key is not None:
+            owned = [b for b in free if self.slot_keys[b] == cache_key]
+            empty = [b for b in free if not self.slot_held[b]]
+            free = owned or empty or free
         def held_prefix(b):
             h = self.slot_held[b]
             return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0

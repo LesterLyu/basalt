@@ -16,6 +16,12 @@ each slot has. `--slot-full-context` (also `"slot-full-context"` in the config's
 the whole `--max-context` instead, at N times the KV cache; the startup line says so. The slots' KV cache, and one
 solo session of the same length, come out of the expert cache.
 
+API clients can send a stable `prompt_cache_key` per conversation. With parallel slots, a request prefers the free
+slot holding its key, even after compaction changes its prefix; a new key prefers an empty slot. Without a key,
+selection uses the cached prefix and then the least recently used slot. The key is a routing hint, not a reserved
+slot: concurrent requests and more conversations than slots can still evict a cache. Image and token content must
+still match before the engine reuses a prefix. This does not allocate another KV cache or a RAM snapshot.
+
 Every chat, messages and responses request must name the served model in `model`: the alias (or the model's name) that `/v1/models` lists, or the model file's name. An unknown or missing name is a 404 in the API's own error shape, and replies always carry the served name.
 
 With `--max-context` above 32768 the KV cache is elastic (not when the model is split over GPUs with `--layer-split`, a peer
