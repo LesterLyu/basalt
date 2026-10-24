@@ -15,6 +15,12 @@ is refused with a 400 that names the length. `--slot-full-context` gives every s
 
 Each slot keeps two checkpoints (end of the system prompt, last turn), so requests that share a long system prompt read it once.
 
+API clients can send a stable `prompt_cache_key` per conversation. With parallel slots, a request prefers the free
+slot holding its key, even after compaction changes its prefix; a new key prefers an empty slot. Without a key,
+selection uses the cached prefix and then the least recently used slot. The key is a routing hint, not a reserved
+slot: concurrent requests and more conversations than slots can still evict a cache. Image and token content must
+still match before the engine reuses a prefix. This does not allocate another KV cache or a RAM snapshot.
+
 ### Prompts beside decoding slots
 
 A prompt of up to 16,384 tokens is read at once, and the slots wait a few seconds. A longer one is read beside them, on its own thread,
