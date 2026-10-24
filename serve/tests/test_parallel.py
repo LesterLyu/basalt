@@ -107,11 +107,12 @@ while True:
             active[b][1] = 0
             stopped.add(b)
         continue
-    if line.startswith(("GEN ", "BGEN ", "SGEN ")):
+    if line.startswith(("GEN ", "BGEN ", "SGEN ", "GENI ", "BGENI ", "SGENI ")):
         f = line.split()
-        slot = int(f[1]) if f[0] in ("BGEN", "SGEN") else None
+        op = f[0].removesuffix("I")
+        slot = int(f[1]) if op in ("BGEN", "SGEN") else None
         max_new = int(f[2] if slot is not None else f[1])
-        bslot = slot if f[0] == "BGEN" else None      # SGEN: a solo run on that slot's own state
+        bslot = slot if op == "BGEN" else None      # SGEN: a solo run on that slot's own state
         ids = f[-1].split(",")
         if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # refused up front, then idle (no DONE)
             print("ERR refused: images are not enabled", flush=True)
@@ -196,6 +197,7 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [False] * n
         e.slot_held = [[] for _ in range(n)]
         e.slot_used = [0.0] * n
+        e.slot_keys = [None] * n
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -211,6 +213,23 @@ class PickSlot(unittest.TestCase):
         self.assertIsNone(e.pick_slot([7, 8]))
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
+
+    def test_a_cache_key_stays_in_its_slot_after_its_prefix_changes(self):
+        e = self.engine(2)
+        e.slot_held = [[1, 2, 3], [4, 5, 6]]
+        e.slot_keys = ["main", "review"]
+        e.slot_used = [1.0, 2.0]
+        self.assertEqual(e.pick_slot([7, 8, 9], "review"), 1)
+        self.assertEqual(e.pick_slot([4, 5, 6, 7], "main"), 0)
+        e.slot_busy[1] = True
+        self.assertEqual(e.pick_slot([7, 8, 9], "review"), 0)   # an active owner does not block another free slot
+
+    def test_a_new_cache_key_uses_an_empty_slot_before_another_conversation(self):
+        e = self.engine(2)
+        e.slot_held[0] = [1, 2, 3]
+        e.slot_keys[0] = "main"
+        self.assertEqual(e.pick_slot([1, 2, 3, 4], "review"), 1)
+        self.assertEqual(e.pick_slot([1, 2, 3, 4]), 0)        # unkeyed clients retain prefix-based routing
 
 
 class ParallelService(unittest.TestCase):
@@ -651,10 +670,12 @@ class ParallelService(unittest.TestCase):
         u = got[0]
         self.assertLessEqual(u["prompt_tokens_details"]["cached_tokens"], u["prompt_tokens"], u)
 
-    def convo(self, msgs, text):
+    def convo(self, msgs, text, cache_key=None):
         """One more turn of the conversation `msgs`: its usage; the reply is added to `msgs`."""
         msgs.append({"role": "user", "content": text})
         body = {"model": "qwen3.8-flash-next", "messages": msgs, "max_tokens": 16, "reasoning_effort": "none"}
+        if cache_key is not None:
+            body["prompt_cache_key"] = cache_key
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=120) as r:
@@ -665,6 +686,62 @@ class ParallelService(unittest.TestCase):
     def kept(self, u, before):
         """Whether a turn reused the previous turn's whole prompt, but for a short tail."""
         return u["prompt_tokens_details"]["cached_tokens"] >= before - 40
+
+    def test_review_compaction_keeps_the_other_conversations_prefix(self):
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True, ready=200000)
+        main = [{"role": "user", "content": "main conversation " + "a" * 2000}]
+        review = [{"role": "user", "content": "review conversation " + "b" * 1000}]
+        before = self.convo(main, "first", cache_key="main")["prompt_tokens"]
+        self.convo(review, "before compaction", cache_key="review")
+        self.convo([{"role": "user", "content": "summarize the review " + "c" * 1000}],
+                   "make a summary", cache_key="review")
+        self.convo([{"role": "user", "content": "compacted review " + "d" * 100}],
+                   "continue", cache_key="review")
+        usage = self.convo(main, "after review compaction", cache_key="main")
+        self.assertTrue(self.kept(usage, before), (usage, before))
+        requests = [line.split() for line in self.log.read_text().splitlines()]
+        self.assertEqual([r[0] for r in requests], ["SGEN"] * 5)
+        self.assertEqual([r[1] for r in requests], ["0", "1", "1", "1", "0"])
+        self.assertEqual(self.engine.slot_keys, ["main", "review"])
+
+    def test_image_requests_keep_their_slot_across_review_compaction(self):
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True)
+
+        def generate(ids, key, image=False):
+            return [t for t in self.engine.generate(ids, 16, {"prompt_cache_key": key}, threading.Event(),
+                                                   embeddings="mock.sve" if image else None) if t is not None]
+
+        prompt = list(b"main image conversation " * 20)
+        reply = generate(prompt, "main", image=True)
+        generate(list(b"review before compaction"), "review")
+        generate(list(b"make a summary"), "review")
+        generate(list(b"compacted review"), "review")
+        generate(prompt + reply[:-1] + list(b" next turn"), "main", image=True)
+        self.assertGreaterEqual(self.engine.last["reused"], len(prompt))
+        requests = [line.split() for line in self.log.read_text().splitlines()]
+        self.assertEqual([r[0] for r in requests], ["SGENI", "SGEN", "SGEN", "SGEN", "SGENI"])
+        self.assertEqual([r[1] for r in requests], ["0", "1", "1", "1", "0"])
+
+    def test_responses_cache_key_keeps_review_requests_in_their_slot(self):
+        self.start(2, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True)
+
+        def response(text, key):
+            body = {"model": "qwen3.8-flash-next", "input": text, "max_output_tokens": 16,
+                    "reasoning": {"effort": "none"}, "prompt_cache_key": key}
+            req = urllib.request.Request(self.base + "/v1/responses", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+
+        prompt = "main conversation " + "a" * 1000
+        response(prompt, "main")
+        response("review before compaction", "review")
+        response("summarize the review", "review")
+        response("compacted review", "review")
+        usage = response(prompt + " next turn", "main")["usage"]
+        self.assertGreater(usage["input_tokens_details"]["cached_tokens"], 1000)
+        requests = [line.split() for line in self.log.read_text().splitlines()]
+        self.assertEqual([r[1] for r in requests], ["0", "1", "1", "1", "0"])
 
     def test_alternating_conversations_each_keep_their_slot_when_slot_0_is_the_solo_session(self):
         self.start(2, reuse=True, slot_cache=True, slot0_solo=True, ready=200000)
