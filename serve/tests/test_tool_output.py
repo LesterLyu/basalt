@@ -45,7 +45,7 @@ class RepairHttp(Server):
     script = ['</think>\n' + BAD, CALL]
 
     def ask(self, stream, **extra):
-        return self.post({"model": "qwen3.8-flash-next", "input": "Read the local fixture.",
+        return self.post({"model": "basalt", "input": "Read the local fixture.",
                           "tools": [TOOL], "max_output_tokens": 2048, "stream": stream, **extra})
 
     def test_repair_returns_a_real_call_in_both_modes(self):
@@ -137,7 +137,7 @@ class RepairHttp(Server):
                     self.engine.turns = 0
                     self.engine.scripts = [self.tok.encode('</think>\n' + BAD) + list(self.svc.stop_ids),
                                            self.tok.encode(BAD if failure else CALL) + list(self.svc.stop_ids)]
-                    body = dict(fields, model='qwen3.8-flash-next', max_tokens=2048, stream=stream)
+                    body = dict(fields, model='basalt', max_tokens=2048, stream=stream)
                     conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
                     try:
                         conn.request('POST', path, json.dumps(body).encode(), {'Content-Type': 'application/json'})
@@ -168,7 +168,7 @@ class Budget(unittest.TestCase):
     def service(self, context):
         tok = ByteTokenizer()
         engine = MockEngine(tok, BAD, max_context=context)
-        svc = Service(engine, tok, ChatTemplate(ROOT / 'serve/chat_template.jinja'))
+        svc = Service(engine, tok, ChatTemplate.from_file(ROOT / 'serve/chat_template.jinja'))
         return svc, tok, engine
 
     def test_repair_does_not_overrun_context_or_output_budget(self):
@@ -204,7 +204,7 @@ class Budget(unittest.TestCase):
         context = len(tok.encode('prompt' + BAD)) + len(overhead) + CTX_SLACK + 12
         engine = TextEngine(tok, BAD, max_context=context)
         engine.limits = []
-        svc = Service(engine, tok, ChatTemplate(ROOT / 'serve/chat_template.jinja'))
+        svc = Service(engine, tok, ChatTemplate.from_file(ROOT / 'serve/chat_template.jinja'))
         events = list(svc.run(PromptText(tok, 'prompt', clip=True), False, [TOOL], 2000, {}, threading.Event()))
         self.assertEqual(events[-1][1]['finish'], 'length')
         self.assertEqual(len(engine.limits), 2)
@@ -234,7 +234,7 @@ class Budget(unittest.TestCase):
             return 0 if 'repair_me' in text and 'no tool was invoked' not in text else 1
 
         engine = MockEngine(tok, [BAD, CALL], max_context=4096, batch=2, delay_s=0.0001, route=route)
-        svc = Service(engine, tok, ChatTemplate(ROOT / 'serve/chat_template.jinja'))
+        svc = Service(engine, tok, ChatTemplate.from_file(ROOT / 'serve/chat_template.jinja'))
 
         def run(text):
             return list(svc.run(tok.encode(text), False, [TOOL], 2000, {}, threading.Event()))

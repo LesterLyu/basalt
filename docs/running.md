@@ -27,6 +27,8 @@ slot by the longest shared prefix, then the least recently used. A session may h
 session and its parallel subagents (Claude Code's `x-claude-code-session-id`, OpenCode's `X-Session-Id` and `x-session-affinity`, which
 name the parent session), and each conversation keeps the slot its K/V is in. A request that continues none of the session's own slots
 takes an unowned one first; with every slot owned, the session's own least recently used one comes before another session's.
+If neither the headers nor `session_id` is present, a stable `prompt_cache_key` also keeps a conversation in its slot
+across compaction. Affinity does not reserve a slot or bypass prefix validation.
 
 ### Prompts beside decoding slots
 
