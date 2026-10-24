@@ -108,7 +108,7 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
 
 
 def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bool | str = False,
-                 engine_words: list[str] | None = None) -> dict:
+                 engine_words: list[str] | None = None, vision_max_tokens: int | None = None) -> dict:
     """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
     later flag win), `vision` (True, "peer"
     or "cpu") adds the sidecar and "dynamic" the in-engine encoder (ValueError if it cannot be set up). A second
@@ -130,6 +130,8 @@ def model_config(path: str, engine_bin: str, gpus: int | None = None, vision: bo
     if v:
         v["mode"] = "on" if vision is True else vision
         v["gpu"] = vision != "cpu"
+        if vision_max_tokens is not None:
+            v["max_tokens"] = vision_max_tokens
         cfg["vision"] = v
         if vision == "dynamic":     # the engine encodes: it reads the projector itself
             args += ["--vision-mmproj", v["mmproj"]]

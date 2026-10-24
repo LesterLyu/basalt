@@ -153,6 +153,11 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
+    if a.vision_max_tokens is not None:
+        if a.vision_max_tokens < 8:
+            raise ValueError("vision-max-tokens must be at least 8")
+        if a.vision == "dynamic":
+            raise ValueError("vision-max-tokens needs vision on, peer or cpu; dynamic uses the engine's limit")
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
         if isinstance(act, argparse._AppendAction) and getattr(a_cli, act.dest) != act.default:
             setattr(a, act.dest, getattr(a_cli, act.dest))
@@ -332,6 +337,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "peer (always on the second GPU), dynamic (inside the engine: it borrows expert-cache slots "
                          "on the main GPU while it reads an image, no standing VRAM) or cpu (no VRAM, slow); a value is "
                          "required")
+    ap.add_argument("--vision-max-tokens", type=int, default=None, metavar="N",
+                    help="maximum visual tokens per image with vision on, peer or cpu (at least 8; default 4096); "
+                         "larger images keep more detail and reserve more encoder memory at startup")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")

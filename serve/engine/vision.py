@@ -30,6 +30,8 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None):
         args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
+        if cfg.get("max_tokens") is not None:
+            args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False
