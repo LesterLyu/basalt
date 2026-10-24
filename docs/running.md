@@ -22,7 +22,8 @@ there. The session is the first of these headers that is set, then the request b
 `x-claude-code-session-id`, `x-session-id`, `x-session-affinity`. A request with none picks a slot by the longest shared prefix, then
 the least recently used. When the session's slot is busy, the request takes that normal pick and the session's slot becomes the new
 one. Claude Code sends one `x-claude-code-session-id` for a session and its parallel subagents, so their overlapping requests spread
-over slots.
+over slots. If neither the headers nor `session_id` is present, a stable `prompt_cache_key` also keeps a conversation in its slot
+across compaction. Affinity does not reserve a slot or bypass prefix validation.
 
 ### Prompts beside decoding slots
 

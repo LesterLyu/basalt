@@ -1008,6 +1008,10 @@ class ProcessEngine:
         self.progress = None
         self._reset_windows()
         keys = self.sampling_keys(sampling or {})
+        if session is None:
+            cache_key = (sampling or {}).get("prompt_cache_key")
+            if isinstance(cache_key, str) and cache_key:
+                session = cache_key
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1108,7 +1112,7 @@ class ProcessEngine:
                         prompt = list(ids) + out            # continues in a batch slot
                 while True:
                     if slot is None:
-                        # prefer the slot holding this prompt's start, else the longest unused
+                        # prefer the conversation's slot or its cached prefix, then the longest unused
                         with self.slot_cv:
                             ticket = self.admission.join()
                             try:
