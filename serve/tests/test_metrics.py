@@ -10,6 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from serve.util import telemetry
 from serve.frontend import ChatTemplate
@@ -23,6 +24,45 @@ from serve.engine.vision import gpus_in_play
 from serve.util.telemetry import GPU_KEYS, Telemetry
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
+
+
+class NvmlLoading(unittest.TestCase):
+    def test_windows_loads_the_system_driver(self):
+        library = object()
+        with mock.patch.object(telemetry.os, "name", "nt"), \
+                mock.patch.object(telemetry.ctypes, "CDLL", return_value=library) as load:
+            self.assertIs(telemetry._load_nvml(), library)
+        load.assert_called_once_with("nvml.dll", winmode=0x800)
+
+    def test_windows_falls_back_to_the_driver_install_directory(self):
+        library = object()
+        root = "C:/Driver Programs"
+        path = os.path.join(root, "NVIDIA Corporation", "NVSMI", "nvml.dll")
+        with mock.patch.object(telemetry.os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"ProgramW6432": root, "ProgramFiles": root}, clear=True), \
+                mock.patch.object(telemetry.ctypes, "CDLL", side_effect=[OSError("missing"), library]) as load:
+            self.assertIs(telemetry._load_nvml(), library)
+        self.assertEqual(load.call_args_list, [mock.call("nvml.dll", winmode=0x800), mock.call(path, winmode=0x900)])
+
+    def test_linux_tries_both_sonames(self):
+        library = object()
+        with mock.patch.object(telemetry.os, "name", "posix"), \
+                mock.patch.object(telemetry.ctypes, "CDLL", side_effect=[OSError("missing"), library]) as load:
+            self.assertIs(telemetry._load_nvml(), library)
+        self.assertEqual(load.call_args_list, [mock.call("libnvidia-ml.so.1"), mock.call("libnvidia-ml.so")])
+
+    def test_missing_driver_does_not_stop_telemetry(self):
+        for system in ("nt", "posix"):
+            with self.subTest(system=system), mock.patch.object(telemetry.os, "name", system), \
+                    mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(telemetry.ctypes, "CDLL", side_effect=OSError("missing")):
+                self.assertFalse(telemetry._Nvml().ok())
+
+    def test_failed_driver_initialization_is_unavailable(self):
+        library = mock.Mock()
+        library.nvmlInit_v2.return_value = 1
+        with mock.patch.object(telemetry, "_load_nvml", return_value=library):
+            self.assertFalse(telemetry._Nvml().ok())
 
 
 class Clocked(MockEngine):

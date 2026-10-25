@@ -6398,6 +6398,14 @@ int main(int argc, char** argv) {
             const int64_t slots_primary = (int64_t) xcache.slots();
             const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
             int64_t slots_all = slots_primary, mib_all = mib_primary;
+            if (peer.valid()) {
+                slots_all += peer.resident();
+                mib_all += (int64_t) (peer.gib() * 1024.0);
+            }
+            for (const auto& extra : xpeers) {
+                slots_all += extra->resident();
+                mib_all += (int64_t) (extra->gib() * 1024.0);
+            }
             for (const auto& st : stages) {
                 slots_all += (int64_t) st->cache.slots();
                 mib_all += (int64_t) (st->cache.bytes() >> 20);
