@@ -9,6 +9,7 @@ cd "$(dirname "$0")/.."
 allow=tools/cu_includes.allow
 declare -A allowed
 while read -r path inc; do
+  inc="${inc%$'\r'}"
   [[ -z "${path}" || "${path}" == \#* ]] && continue
   allowed["${path} ${inc}"]=1
 done < "${allow}"
