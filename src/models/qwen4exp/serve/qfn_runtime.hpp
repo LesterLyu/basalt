@@ -94,6 +94,7 @@ struct Context {
     int& split_stages;
     basalt::program::ExpertSpill& tier_spill;
     std::function<void()> report_expert_tiers;
+    basalt::platform::ThreadPlacement helper_placement;
 };
 
 // Serves until QUIT or stdin closes; returns the process exit code.

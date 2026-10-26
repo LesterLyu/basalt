@@ -194,7 +194,8 @@ inline void iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
         for (int t = 0; t < NT; ++t) acc[t] = zero;
         alignas(64) uint16_t ix[32];
         _mm512_store_si512((void*) ix, idx16);
-        for (int j = 0; j < 4; ++j) {
+        const auto part = [&]<int group>(int runtime = 0) {
+            const int j = group >= 0 ? group : runtime;
             const uint16_t* q = ix + 8 * j;
             const __m512i g = _mm512_set_epi64((long long) iq1s_grid[q[7]], (long long) iq1s_grid[q[6]], (long long) iq1s_grid[q[5]],
                                                (long long) iq1s_grid[q[4]], (long long) iq1s_grid[q[3]], (long long) iq1s_grid[q[2]],
@@ -208,6 +209,14 @@ inline void iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
                 const __m512i ys = _mm512_mask_sub_epi8(yv, gm, zero, yv);
                 acc[t] = _mm512_add_epi32(acc[t], _mm512_madd_epi16(_mm512_maddubs_epi16(ga, ys), lsj));
             }
+        };
+        if constexpr (platform::kUnrollIq1sGroups) {
+            part.template operator()<0>();
+            part.template operator()<1>();
+            part.template operator()<2>();
+            part.template operator()<3>();
+        } else {
+            for (int j = 0; j < 4; ++j) part.template operator()<-1>(j);
         }
         const float dw = h2f(u16(blk));
         for (int t = 0; t < NT; ++t) {

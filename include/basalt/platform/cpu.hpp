@@ -29,6 +29,23 @@ struct CpuTopology {
 /// ordered for `affinity`. `skip_first` takes the first one out of `worker_cores` and names it `host_core`.
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity = CpuAffinity::All);
 
+/// Logical processors available to this process, including SMT siblings.
+std::vector<int> logical_cpus();
+/// An ordered list of CPU IDs and inclusive ranges, or "physical" / "none". Rejects duplicates and unavailable IDs.
+bool parse_cpu_list(const std::string& text, std::vector<int>& cpus, std::string& err);
+
+/// A caller's complete placement: a native affinity mask on Linux, selected CPU Sets on Windows.
+struct ThreadPlacement {
+    std::vector<unsigned long> ids;
+    bool valid = false;
+};
+/// Hard single-CPU placement for a pool-owned thread, which ends with the pool.
+bool set_thread_affinity(int cpu, std::string& err);
+/// Place the caller on a CPU and retain its placement for restoration on the same thread.
+bool pin_current_thread(int cpu, ThreadPlacement& previous, std::string& err);
+/// Also used by helper threads to recover the placement inherited before the host was pinned.
+bool restore_thread_affinity(const ThreadPlacement& previous, std::string& err);
+
 /// What the machine's processor is called and how many physical cores it has, for a benchmark row. `name` is the
 /// vendor string as the OS gives it (empty when it gives none); `physical_cores` counts every core the OS lists,
 /// whether or not this process may run on it (0 when unknown).

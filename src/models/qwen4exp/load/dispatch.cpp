@@ -121,6 +121,7 @@ int dispatch(Context& context) {
         basalt::program::warn_spill(tier_spill, levers);
     };
     if (!o.serve) report_expert_tiers();
+    const auto helper_placement = context.helper_placement;
     if (o.serve) {
         basalt::models::qwen4exp::serve::Context context{
             .o = o,
@@ -192,6 +193,7 @@ int dispatch(Context& context) {
             .split_stages = split_stages,
             .tier_spill = tier_spill,
             .report_expert_tiers = report_expert_tiers,
+            .helper_placement = helper_placement,
         };
         return basalt::models::qwen4exp::serve::run(context);
     }

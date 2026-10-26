@@ -14,6 +14,7 @@ struct Context {
     basalt::core::LoadPlan* reads = nullptr;
     std::vector<std::function<bool(std::string&)>>* after = nullptr;
     basalt::core::Loader* loader = nullptr;   ///< the pass's, prepared before anything is sized
+    basalt::platform::ThreadPlacement helper_placement;
     Options* o = nullptr;
     std::string* ppl_base = nullptr;
     std::string* ppl_out = nullptr;

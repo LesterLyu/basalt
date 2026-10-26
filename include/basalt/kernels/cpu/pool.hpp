@@ -73,11 +73,12 @@ int start_pool_workers(int given, bool affinity_given, PoolAffinity affinity);
 
 class ExpertPool {
 public:
-    /// `n_workers` is the worker count (at least 1); the caller sizes it (see auto_pool_workers).  Workers are not pinned (the OS places them) and each owns one `ExpertScratch`, so nothing in the token path allocates.
+    /// `n_workers` is the worker count (at least 1); the caller sizes it (see auto_pool_workers). An empty CPU list leaves placement to the OS.
+    /// Otherwise the first CPU is the host's and workers cycle through the remainder (or share a singleton list).
     ///
     /// The host thread joins the drain: `run()` claims jobs itself instead of spinning on `done_`, so the pool uses
     /// every core.
-    explicit ExpertPool(int n_workers, PoolAffinity affinity = PoolAffinity::All);
+    explicit ExpertPool(int n_workers, PoolAffinity affinity = PoolAffinity::All, const std::vector<int>& cpus = {});
     /// The watchdog's view of the pool: the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
@@ -85,6 +86,7 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    bool placement_ok() const { return placement_ok_.load(); }
     /// How many of the workers take work.  The rest stay parked and never claim.
     int active_workers() const { return active_.load(std::memory_order_relaxed); }
     /// Change the active worker count live, clamped to 1..workers(); returns the count in effect.  The threads stay as
@@ -231,6 +233,9 @@ private:
     double pend_gu_share_ = 0;
     std::chrono::steady_clock::time_point pend_t0_{};
     std::vector<SplitBufMulti> split_multi_;
+    std::vector<int> cpus_;
+    std::atomic<int> placement_ready_{0};
+    std::atomic<bool> placement_ok_{true};
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };
