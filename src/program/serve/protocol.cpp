@@ -3,6 +3,14 @@
 
 namespace basalt::program::serve {
 
+namespace {
+void restore_helper_placement(const basalt::platform::ThreadPlacement& placement) {
+    std::string error;
+    if (!basalt::platform::restore_thread_affinity(placement, error))
+        basalt::log::warn("cpu pool", "helper placement: %s", error.c_str());
+}
+}
+
 // ---- what the watchdog prints before it stops a stalled engine
 struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard
@@ -124,7 +132,8 @@ int Runtime::init_protocol() {
     in_eof = false;
     // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
     // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-    std::thread([&] {
+    std::thread([&, helper_placement = helper_cpu_placement()] {
+        restore_helper_placement(helper_placement);
         // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
         // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
         // std::exit) would hang in exit(), and the server would wait for it forever
@@ -270,7 +279,8 @@ int Runtime::announce() {
     {
         const int limit = 60;   // one step (a prompt layer, a verify window) takes seconds
         if (limit > 0)
-            std::thread([limit] {
+            std::thread([limit, helper_placement = helper_cpu_placement()] {
+                restore_helper_placement(helper_placement);
                 basalt::core::Progress& p = basalt::core::progress();
                 uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                 auto since = std::chrono::steady_clock::now();

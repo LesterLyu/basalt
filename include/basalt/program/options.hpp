@@ -29,6 +29,8 @@ struct CommonOptions {
     /// The files the source tensors are read from: the model file, which serves them as a GGUF.
     std::vector<std::string> native_shards;
     int pool_workers = 0;         ///< >0 = the user's worker count; otherwise the start-up pick
+    std::string pool_cpus_text = "none";
+    std::vector<int> pool_cpus;
     /// The pool's core layout; the start-up pick unless given
     basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
     /// CS-T `--resident-budget-gib N`: the resident mode with a RAM budget - the N GiB of experts the GPU cache does

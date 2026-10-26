@@ -1440,6 +1440,12 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(pool_placement_test tests/platform/pool_placement_test.cpp)
+  target_include_directories(pool_placement_test PRIVATE src/platform)
+  target_link_libraries(pool_placement_test PRIVATE kernels_cpu platform)
+  basalt_embed_manifest(pool_placement_test)
+  basalt_cpu_test(NAME pool_placement_test COMMAND pool_placement_test)
+  set_tests_properties(pool_placement_test PROPERTIES TIMEOUT 30)
   # Both programs test a Linux-only surface: the cgroup quota files and the Linux affinity backend's headers.
   # Neither exists on Windows, so neither is built or run there.
   if(NOT WIN32)
@@ -1478,6 +1484,7 @@ if(BUILD_TESTING)
   add_executable(pool_native_test tests/kernels/cpu/pool_native_test.cpp)
   target_link_libraries(pool_native_test PRIVATE kernels_cpu platform)
   basalt_cpu_test(NAME pool_native_test COMMAND pool_native_test)
+  basalt_cpu_test(NAME pool_native_pinned_test COMMAND pool_native_test --pool-cpus physical)
   # the AVX2 i-quant rows: the madd build against the AVX-VNNI build (bitwise) and a double reference
   add_executable(iq_avx2_test tests/kernels/cpu/iq_avx2_test.cpp)
   target_link_libraries(iq_avx2_test PRIVATE kernels_cpu platform)

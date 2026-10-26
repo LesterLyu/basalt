@@ -47,4 +47,18 @@ inline int get_thread_affinity(std::vector<unsigned long>& mask, std::vector<int
     }
 }
 
+inline int set_thread_affinity(const std::vector<unsigned long>& mask) {
+    if (mask.empty()) return EINVAL;
+    return pthread_setaffinity_np(pthread_self(), mask.size() * sizeof(unsigned long),
+                                  reinterpret_cast<const cpu_set_t*>(mask.data()));
+}
+
+inline int pin_thread_to_cpu(int cpu) {
+    if (cpu < 0 || cpu == INT_MAX) return EINVAL;
+    LinuxCpuSet target(cpu + 1);
+    if (!target.set) return ENOMEM;
+    CPU_SET_S(cpu, target.bytes, target.set);
+    return pthread_setaffinity_np(pthread_self(), target.bytes, target.set);
+}
+
 }  // namespace basalt::platform::detail

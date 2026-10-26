@@ -51,6 +51,7 @@ std::optional<int> parse_options(int argc, char** argv, CommonOptions& o, const 
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
         else if (a == "--pool-workers") { o.pool_workers = std::atoi(next("--pool-workers")); o.pool_workers_given = true; }
+        else if (a == "--pool-cpus") o.pool_cpus_text = next("--pool-cpus");
         else if (a == "--pool-affinity") {
             const std::string v = next("--pool-affinity");
             o.pool_affinity_given = true;

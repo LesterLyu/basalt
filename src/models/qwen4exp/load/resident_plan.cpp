@@ -67,7 +67,7 @@ int resident_plan(Context& context) {
     int64_t auto_lend_pct = lend_pct_for_share();
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
-    // fund, and again to the fewst-equal-chunks cap when a prompt is read. An anonymous arena backs every lent slot;
+    // fund, and again to the fewest-equal-chunks cap when a prompt is read. An anonymous arena backs every lent slot;
     // without either RAM copy it stays at 8192.
     const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
@@ -225,6 +225,10 @@ int resident_plan(Context& context) {
         in.p_cores = topo.p_cores;
         in.e_cores = topo.e_cores;
         in.hybrid = topo.is_hybrid;
+        if (!o.pool_cpus.empty()) {
+            in.worker_cores = (std::max)(1, (int) o.pool_cpus.size() - 1);
+            in.hybrid = false;
+        }
         in.cpu_quota = cpu::cgroup_cpu_quota();
         const uint64_t lent_bytes =
             (lend_from >= 0 ? (uint64_t) (xcache.slots() - lend_from) * basalt::kernels::cpu::expert_layout().max_blob : 0) +
@@ -278,7 +282,8 @@ int resident_plan(Context& context) {
             if (o.serve) { std::printf("%s\n", line.c_str()); std::fflush(stdout); }
             else basalt::log::info("basalt generate", "%s", line.c_str());
         }
-        auto& pool = pool_store.emplace(plan.pool_workers, affinity);
+        auto& pool = pool_store.emplace(plan.pool_workers, affinity, o.pool_cpus);
+        if (!pool.placement_ok()) return fatal_start_error("CPU pool placement failed");
         if (pool.is_hybrid() && pool.affinity() != cpu::PoolAffinity::All) {
             const char* aff_str = pool.affinity() == cpu::PoolAffinity::PCores ? "p-cores" : "auto";
             basalt::log::info("basalt generate", "hybrid CPU detected (%d P-cores / %d threads, %d E-cores), pool workers: %d, affinity: %s",
@@ -293,6 +298,16 @@ int resident_plan(Context& context) {
         drive.d.pool = &pool;
     }
     auto& pool = *pool_store;
+    struct HostPlacementRestore {
+        basalt::platform::ThreadPlacement previous;
+        ~HostPlacementRestore() { basalt::models::qwen4exp::engine_local::restore_helper_placement(previous); }
+    } host_placement;
+    if (!o.pool_cpus.empty()) {
+        if (!basalt::platform::pin_current_thread(o.pool_cpus.front(), host_placement.previous, err))
+            return fatal_start_error("host CPU placement: " + err);
+        basalt::log::info("cpu pool", "host CPU %d, %zu selected logical CPUs", o.pool_cpus.front(), o.pool_cpus.size());
+    }
+    context.helper_placement = host_placement.previous;
     std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peer holds (--peer-exclusive)
     uint64_t peer_only_bytes = 0;
     if (o.resident_cpu_experts && o.peer_exclusive && o.peer_device >= 1) {

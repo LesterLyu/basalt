@@ -1,3 +1,4 @@
+#include "basalt/platform/cpu.hpp"
 // src/program/serve/state.hpp - the server's state every model shares, and what a model answers.
 #pragma once
 
@@ -79,6 +80,7 @@ public:
             std::optional<basalt::program::grammar::PackVocab>& vocab_tables)
         : o(options), model_file(file), err(error), n_vocab(vocab), grammar_vocab(vocab_tables) {}
     virtual ~Runtime() = default;
+    virtual basalt::platform::ThreadPlacement helper_cpu_placement() const { return {}; }
     int execute();
     Flow dispatch();
     int run_requests();
