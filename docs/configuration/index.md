@@ -75,6 +75,14 @@ wins and is never changed.
 | `pool-affinity` | `auto`. |
 | `pool-workers` | the physical cores minus the host thread; on a hybrid CPU with `auto`, the P-cores minus one plus half the E-cores, with `p-cores` the P-cores minus one; fitted to a container CPU quota. |
 
+`engine.pool-cpus` optionally binds the host and CPU expert workers. Omit it or use `"none"` for OS placement (the
+default). `"physical"` selects one logical processor per available physical core; an explicit ordered list such as
+`"0-15"` or `"0,2,17-20"` accepts logical processors, including SMT siblings. Windows IDs are `group * 64 + index`.
+The first selected CPU is the host's; workers cycle through the remaining CPUs (a single-CPU list is shared).
+Without an explicit `pool-workers`, the count is the list length minus one, at least one and fitted to the CPU quota.
+An explicit list takes precedence over `pool-affinity` for placement and automatic sizing. Unavailable or duplicate
+CPUs fail at startup. For example: `"engine": {"pool-cpus": "physical"}`.
+
 The engine prints one line naming only the picked settings, in the order above, and the server relays it once per start:
 
 ```

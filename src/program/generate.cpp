@@ -563,6 +563,8 @@ int main(int argc, char** argv) {
     }
 
     std::string err;
+    if (!basalt::platform::parse_cpu_list(o.pool_cpus_text, o.pool_cpus, err))
+        return fatal_start_error("--pool-cpus: " + err);
     // Where the experts live.  The model keeps every quantized tensor in its GGUF form, so its experts run in verify
     // windows only (--spec) and its dense projections, head and embedding come from the source tensors.
     {
@@ -2964,6 +2966,10 @@ int main(int argc, char** argv) {
         in.p_cores = topo.p_cores;
         in.e_cores = topo.e_cores;
         in.hybrid = topo.is_hybrid;
+        if (!o.pool_cpus.empty()) {
+            in.worker_cores = (std::max)(1, (int) o.pool_cpus.size() - 1);
+            in.hybrid = false;
+        }
         in.cpu_quota = cpu::cgroup_cpu_quota();
         const uint64_t margin = basalt::platform::ram_margin();
         const uint64_t head = std::max(resident_headroom_base, margin);
@@ -3022,7 +3028,8 @@ int main(int argc, char** argv) {
             if (o.serve) { std::printf("%s\n", line.c_str()); std::fflush(stdout); }
             else basalt::log::info("basalt generate", "%s", line.c_str());
         }
-        auto& pool = pool_store.emplace(plan.pool_workers, affinity);
+        auto& pool = pool_store.emplace(plan.pool_workers, affinity, o.pool_cpus);
+        if (!pool.placement_ok()) return fatal_start_error("CPU pool placement failed");
         if (pool.is_hybrid() && pool.affinity() != cpu::PoolAffinity::All) {
             const char* aff_str = pool.affinity() == cpu::PoolAffinity::PCores ? "p-cores" : "auto";
             basalt::log::info("basalt generate", "hybrid CPU detected (%d P-cores / %d threads, %d E-cores), pool workers: %d, affinity: %s",
@@ -3037,6 +3044,16 @@ int main(int argc, char** argv) {
         drive.d.pool = &pool;
     }
     auto& pool = *pool_store;
+    struct HostPlacementRestore {
+        basalt::platform::ThreadPlacement previous;
+        ~HostPlacementRestore() { basalt::program::engine_local::restore_helper_placement(previous); }
+    } host_placement;
+    if (!o.pool_cpus.empty()) {
+        if (!basalt::platform::pin_current_thread(o.pool_cpus.front(), host_placement.previous, err))
+            return fatal_start_error("host CPU placement: " + err);
+        basalt::log::info("cpu pool", "host CPU %d, %zu selected logical CPUs", o.pool_cpus.front(), o.pool_cpus.size());
+    }
+    const auto helper_placement = host_placement.previous;
     std::vector<std::pair<int32_t, int32_t>> peer_only;   // experts only the peer holds (--peer-exclusive)
     uint64_t peer_only_bytes = 0;
     if (o.resident_cpu_experts && o.peer_exclusive && o.peer_device >= 1) {
@@ -3585,6 +3602,7 @@ int main(int argc, char** argv) {
             .split_stages = split_stages,
             .tier_file_bytes = tier_file_bytes,
             .report_expert_tiers = report_expert_tiers,
+            .helper_placement = helper_placement,
         };
         return basalt::program::serve::run(context);
     }
@@ -3917,7 +3935,10 @@ int main(int argc, char** argv) {
             std::thread adapt_thr;
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                adapt_thr = std::thread([&, helper_placement] {
+                    basalt::program::engine_local::restore_helper_placement(helper_placement);
+                    adapt_ok = adapt();
+                });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 return fatal_start_error(err);

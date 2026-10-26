@@ -64,6 +64,8 @@ struct Options {
     bool graph_only = false;
     bool gpu_only_full = false;   ///< pre + post + head, the true per-token GPU floor
     int pool_workers = 0;         ///< >0 = the user's worker count; otherwise the start-up pick
+    std::string pool_cpus_text = "none";
+    std::vector<int> pool_cpus;
     /// The pool's core layout; the start-up pick unless given
     basalt::kernels::cpu::PoolAffinity pool_affinity = basalt::kernels::cpu::PoolAffinity::Auto;
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping

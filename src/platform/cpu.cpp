@@ -2,6 +2,7 @@
 #include "basalt/platform/cpu.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -12,6 +13,7 @@
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
+#include "affinity_win.hpp"
 #else
 #include <pthread.h>
 #include <sched.h>
@@ -26,6 +28,10 @@ namespace basalt::platform {
 
 CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
     CpuTopology topo;
+    const auto available = logical_cpus();
+    const auto permitted = [&](int cpu) {
+        return available.empty() || std::binary_search(available.begin(), available.end(), cpu);
+    };
     // Ask the OS rather than assuming a layout: hardware_concurrency() counts LOGICAL processors, and on an SMT
     // machine half of them are siblings, so one worker on each of the first N would put two workers on one core.
     DWORD len = 0;
@@ -36,7 +42,10 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
         for (WORD group = 0; group < groups; ++group) {
             const DWORD count = GetActiveProcessorCount(group);
             if (count == 0 || count == (DWORD) -1 || count > 64) continue;
-            for (DWORD i = 0; i < count; ++i) topo.worker_cores.push_back((int) group * 64 + (int) i);
+            for (DWORD i = 0; i < count; ++i) {
+                const int cpu = (int) group * 64 + (int) i;
+                if (permitted(cpu)) topo.worker_cores.push_back(cpu);
+            }
         }
         if (skip_first && !topo.worker_cores.empty()) {
             topo.host_core = topo.worker_cores.front();
@@ -52,7 +61,8 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
         // The size probe succeeded but the read did not (the layout changed underneath, say). Same answer as no
         // topology at all: one worker per logical processor is never wrong, just not always optimal.
         const DWORD n = (DWORD) std::thread::hardware_concurrency();
-        for (DWORD i = 0; i < n; ++i) topo.worker_cores.push_back((int) i);
+        for (DWORD i = 0; i < n; ++i)
+            if (permitted((int) i)) topo.worker_cores.push_back((int) i);
         if (skip_first && !topo.worker_cores.empty()) {
             topo.host_core = topo.worker_cores.front();
             topo.worker_cores.erase(topo.worker_cores.begin());
@@ -76,7 +86,8 @@ CpuTopology detect_cpu_topology(bool skip_first, CpuAffinity affinity) {
             for (WORD g = 0; g < e->Processor.GroupCount; ++g) {
                 const GROUP_AFFINITY& ga = e->Processor.GroupMask[g];
                 for (int bit = 0; bit < 64; ++bit)
-                    if (ga.Mask & (KAFFINITY(1) << bit)) cd.lps.push_back((int) (ga.Group * 64 + bit));
+                    if ((ga.Mask & (KAFFINITY(1) << bit)) && permitted((int) ga.Group * 64 + bit))
+                        cd.lps.push_back((int) ga.Group * 64 + bit);
             }
             if (!cd.lps.empty()) descs.push_back(std::move(cd));
         }
@@ -157,6 +168,58 @@ CpuInfo cpu_info() {
         }
     }
     return info;
+}
+
+std::vector<int> logical_cpus() {
+    std::vector<int> result;
+    DWORD_PTR allowed = 0, system = 0;
+    const bool single_group = GetActiveProcessorGroupCount() == 1;
+    const bool have_mask = single_group && GetProcessAffinityMask(GetCurrentProcess(), &allowed, &system);
+    for (const auto& info : detail::cpu_sets()) {
+        const int bit = info.CpuSet.LogicalProcessorIndex;
+        if (have_mask && !(allowed & (DWORD_PTR(1) << bit))) continue;
+        result.push_back((int) info.CpuSet.Group * 64 + bit);
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+bool set_thread_affinity(int cpu, std::string& err) {
+    if (cpu < 0) { err = "negative CPU ID"; return false; }
+    GROUP_AFFINITY target{};
+    target.Group = (WORD) (cpu / 64);
+    target.Mask = KAFFINITY(1) << (cpu & 63);
+    if (SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr)) return true;
+    err = "SetThreadGroupAffinity failed: " + std::to_string(GetLastError());
+    return false;
+}
+
+bool pin_current_thread(int cpu, ThreadPlacement& previous, std::string& err) {
+    previous = {};
+    ULONG selected = 0;
+    bool found = false;
+    for (const auto& info : detail::cpu_sets())
+        if ((int) info.CpuSet.Group * 64 + info.CpuSet.LogicalProcessorIndex == cpu) {
+            selected = info.CpuSet.Id;
+            found = true;
+            break;
+        }
+    if (!found) { err = "CPU " + std::to_string(cpu) + " is unavailable"; return false; }
+    if (!detail::get_thread_cpu_sets(previous.ids) ||
+        !SetThreadSelectedCpuSets(GetCurrentThread(), &selected, 1)) {
+        err = "host CPU Set selection failed: " + std::to_string(GetLastError());
+        return false;
+    }
+    previous.valid = true;
+    return true;
+}
+
+bool restore_thread_affinity(const ThreadPlacement& previous, std::string& err) {
+    if (!previous.valid) return true;
+    if (SetThreadSelectedCpuSets(GetCurrentThread(), previous.ids.empty() ? nullptr : previous.ids.data(),
+                                 (ULONG) previous.ids.size())) return true;
+    err = "CPU Set restoration failed: " + std::to_string(GetLastError());
+    return false;
 }
 
 #else
@@ -316,6 +379,87 @@ CpuInfo cpu_info() {
     return info;
 }
 
+std::vector<int> logical_cpus() {
+    std::vector<unsigned long> mask;
+    std::vector<int> result;
+    if (detail::get_thread_affinity(mask, &result) != 0) return {};
+    return result;
+}
+
+bool set_thread_affinity(int cpu, std::string& err) {
+    const int error = detail::pin_thread_to_cpu(cpu);
+    if (error == 0) return true;
+    err = "pthread_setaffinity_np failed: " + std::string(std::strerror(error));
+    return false;
+}
+
+bool pin_current_thread(int cpu, ThreadPlacement& previous, std::string& err) {
+    previous = {};
+    const int error = detail::get_thread_affinity(previous.ids);
+    if (error != 0) { err = "pthread_getaffinity_np failed: " + std::string(std::strerror(error)); return false; }
+    if (!set_thread_affinity(cpu, err)) return false;
+    previous.valid = true;
+    return true;
+}
+
+bool restore_thread_affinity(const ThreadPlacement& previous, std::string& err) {
+    if (!previous.valid) return true;
+    const int error = detail::set_thread_affinity(previous.ids);
+    if (error == 0) return true;
+    err = "pthread_setaffinity_np restoration failed: " + std::string(std::strerror(error));
+    return false;
+}
+
 #endif
+
+bool parse_cpu_list(const std::string& text, std::vector<int>& cpus, std::string& err) {
+    cpus.clear();
+    err.clear();
+    if (text == "none") return true;
+    const auto allowed = logical_cpus();
+    if (allowed.empty()) { err = "cannot query available logical CPUs"; return false; }
+    if (text == "physical") {
+        const auto topology = detect_cpu_topology(false, CpuAffinity::All);
+        for (int cpu : topology.worker_cores)
+            if (std::binary_search(allowed.begin(), allowed.end(), cpu)) cpus.push_back(cpu);
+        if (!cpus.empty()) return true;
+        err = "no available physical cores";
+        return false;
+    }
+    std::vector<int> selected;
+    size_t begin = 0;
+    auto number = [](const std::string& value, int& out) {
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), out);
+        return !value.empty() && parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() && out >= 0;
+    };
+    do {
+        const size_t comma = text.find(',', begin);
+        const std::string item = text.substr(begin, comma == std::string::npos ? comma : comma - begin);
+        const size_t dash = item.find('-');
+        int first = 0, last = 0;
+        if (!number(item.substr(0, dash), first) ||
+            (dash != std::string::npos && !number(item.substr(dash + 1), last))) {
+            err = "expected CPU IDs or inclusive ranges, for example 0-15 or 0,2,4-7";
+            return false;
+        }
+        if (dash == std::string::npos) last = first;
+        if (last < first || last > allowed.back()) { err = "CPU range is reversed or unavailable"; return false; }
+        for (int cpu = first; cpu <= last; ++cpu) {
+            if (!std::binary_search(allowed.begin(), allowed.end(), cpu)) {
+                err = "CPU " + std::to_string(cpu) + " is unavailable";
+                return false;
+            }
+            if (std::find(selected.begin(), selected.end(), cpu) != selected.end()) {
+                err = "duplicate CPU " + std::to_string(cpu);
+                return false;
+            }
+            selected.push_back(cpu);
+        }
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
+    } while (begin <= text.size());
+    cpus = std::move(selected);
+    return true;
+}
 
 }  // namespace basalt::platform

@@ -7,7 +7,8 @@ namespace basalt::program::serve {
 
 class Request {
 public:
-    explicit Request(Runtime& runtime) : runtime_(runtime) {}
+    explicit Request(Runtime& runtime)
+        : runtime_(runtime), apply_thr(runtime.helper_placement), adapt_thr(runtime.helper_placement) {}
     Flow execute();
 
 private:

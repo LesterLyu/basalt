@@ -70,6 +70,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
         else if (a == "--pool-workers") { o.pool_workers = std::atoi(next("--pool-workers")); o.pool_workers_given = true; }
+        else if (a == "--pool-cpus") o.pool_cpus_text = next("--pool-cpus");
         else if (a == "--pool-affinity") {
             const std::string v = next("--pool-affinity");
             o.pool_affinity_given = true;

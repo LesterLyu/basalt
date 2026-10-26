@@ -123,7 +123,8 @@ int Runtime::init_protocol() {
     in_eof = false;
     // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
     // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-    std::thread([&] {
+    std::thread([&, helper_placement = helper_placement] {
+        restore_helper_placement(helper_placement);
         // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
         // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
         // std::exit) would hang in exit(), and the server would wait for it forever
@@ -327,7 +328,8 @@ int Runtime::announce() {
     {
         const int limit = 60;   // one step (a prompt layer, a verify window) takes seconds
         if (limit > 0)
-            std::thread([limit] {
+            std::thread([limit, helper_placement = helper_placement] {
+                restore_helper_placement(helper_placement);
                 basalt::core::Progress& p = basalt::core::progress();
                 uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
                 auto since = std::chrono::steady_clock::now();

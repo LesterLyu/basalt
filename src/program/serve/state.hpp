@@ -103,6 +103,7 @@ namespace serve_loans = basalt::program::serve;
 using engine_local::Drive;
 using engine_local::GpuStage;
 using engine_local::JobRunner;
+using engine_local::restore_helper_placement;
 using engine_local::PromptStage;
 using engine_local::SplitDrive;
 using engine_local::biggest_chunk;
@@ -409,7 +410,7 @@ private:
     int64_t ba_h_l{};
     int64_t ba_m_l{};
     double ba_ms{};
-    JobRunner ba_thr{};   // queues the adaptive copies beside the windows
+    JobRunner ba_thr{helper_placement};   // queues the adaptive copies beside the windows
     bool ba_job{};
     double bt_run{};
     double bt_commit{};
