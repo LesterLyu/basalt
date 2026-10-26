@@ -26,6 +26,7 @@ from serve.security import host_allowed, host_names_for, key_matches, origin_all
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import StructuredOutputError, anthropic_format, check_format, prepare_tool_format
 from serve.util.text import stop_strings
+from serve.tool_output import ToolOutputError
 
 
 BODY_MAX = 256 << 20                        # the most a JSON request body may hold (read into memory)
@@ -394,6 +395,13 @@ def make_handler(svc: Service):
                     self._json(e.status, responses_error_body(str(e)))
                 else:
                     self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except ToolOutputError as e:
+                if path == "/v1/responses":
+                    self._json(502, responses_error_body(str(e), "server_error", code="tool_output_invalid"))
+                elif path == "/v1/messages":
+                    self._json(502, {"type": "error", "error": {"type": "api_error", "message": str(e)}})
+                else:
+                    self._json(502, {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
@@ -556,6 +564,9 @@ def make_handler(svc: Service):
             except EngineDied as e:                          # mid-stream
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except ToolOutputError as e:
+                err = {"error": {"type": "server_error", "code": "tool_output_invalid", "message": str(e)}}
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # engine ERR after the stream started: no 400 now
                 err = {"error": {"type": "server_error", "message": str(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
@@ -593,6 +604,8 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 try:
                     result = responses_api.collect(items)
+                except ToolOutputError as e:
+                    return self._json(502, responses_error_body(str(e), "server_error", code="tool_output_invalid"))
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
@@ -629,6 +642,8 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
+            except ToolOutputError as e:
+                self._responses_failed(asm, str(e), "tool_output_invalid", send)
             except ValueError as e:                          # engine ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
@@ -729,6 +744,9 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: an Anthropic error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except ToolOutputError as e:
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # engine ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}

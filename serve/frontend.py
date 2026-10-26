@@ -475,10 +475,10 @@ PARAM_END = "</parameter>"
 FUNC_END = "</function>"
 
 
-def param_end(text: str, final: bool = False) -> int:
+def param_end(text: str, final: bool = False, start: int = 0) -> int:
     """Where a parameter value ends: the first `</parameter>` followed by `<parameter=` or `</function>`, so the
     same text inside a value is kept. -1: none yet; -2: candidate awaiting its follower (`final` accepts it)."""
-    at = text.find(PARAM_END)
+    at = text.find(PARAM_END, start)
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
         if after.startswith(("<parameter=", FUNC_END)):
@@ -678,6 +678,8 @@ class OutputParser:
 
     def _reset_scan(self):
         self.sp = 0                  # consumed part of self.buf (the call body)
+        self.call_search = 0         # new call terminators, including a split suffix
+        self.param_search = 0        # raw values stay buffered, but rejected terminators need not be rescanned
         self.ss = "name"             # name -> between -> str|raw -> ... -> done
         self.scall = None            # the ToolCall being streamed
         self.sfirst = True
@@ -693,7 +695,7 @@ class OutputParser:
             if s:
                 out.append(Event("tool_args", s, call=self.scall))
         while True:
-            rest = self.buf[self.sp:]
+            rest = self.buf[self.sp:] if self.ss != "raw" else ""
             if self.ss == "name":
                 a = rest.find("<function=")
                 b = rest.find(">", a + 10) if a >= 0 else -1
@@ -718,6 +720,7 @@ class OutputParser:
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
+                    self.param_search = self.sp
                     self.spname = pname
                     text, null = _text_kinds(self.sdeclared.get(pname))
                     if text and not null:
@@ -757,16 +760,18 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest)
+                end = param_end(self.buf, start=self.param_search)
                 if end < 0:
+                    self.param_search = self.buf.rfind(PARAM_END, self.param_search) if end == -2 else \
+                        max(self.sp, len(self.buf) - len(PARAM_END) + 1)
                     return out
-                value = rest[:end]
+                value = self.buf[self.sp:end]
                 if value.startswith("\n"):
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
                 args(json.dumps(_decode_param(value, self.sdeclared.get(self.spname)), ensure_ascii=False))
-                self.sp += end + len(PARAM_END)
+                self.sp = end + len(PARAM_END)
                 self.ss = "between"
             else:
                 return out
@@ -870,7 +875,9 @@ class OutputParser:
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
-                i = call_end(self.buf)
+                # A complete call can only appear when a new closing tag arrives.
+                i = call_end(self.buf) if self.buf.find(CALL_END, self.call_search) >= 0 else -1
+                self.call_search = max(0, len(self.buf) - len(CALL_END) + 1)
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body

@@ -17,6 +17,7 @@ from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
+from serve.tool_output import REPAIR_TURN, ToolOutputError, orphaned_tool_tail
 from serve.engine.vision import Vision
 from serve.api.grammar import grammar_spec, unenforced
 from serve.config import GRAMMAR_DEFAULT
@@ -898,9 +899,17 @@ class Service:
         thinking_n = 0                                  # tokens written while thinking
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
+        answer_parts, has_call, complete_call, repaired = [], False, False, False
 
         def cut(evs):
-            """The events with the answer text cut at a stop string."""
+            """Track reply text and calls, cutting answer text at a stop string."""
+            nonlocal has_call, complete_call
+            for ev in evs:
+                if tools and ev.kind == "content":
+                    answer_parts.append(ev.text or "")
+                elif ev.kind in ("tool_start", "tool_call"):
+                    has_call = True
+                    complete_call |= ev.kind == "tool_call"
             if stops is None:
                 return evs
             out = []
@@ -920,6 +929,7 @@ class Service:
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
+            has_call = any(ev.kind in ("tool_start", "tool_call") for ev in opening)
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -993,7 +1003,7 @@ class Service:
                     for ev in opening:
                         yield "event", ev
                     while True:
-                        if isinstance(ids, PromptText) and ids.max_new:
+                        if isinstance(ids, PromptText) and ids.max_new and not repaired:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
@@ -1092,6 +1102,37 @@ class Service:
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
+                        if (not (wrap or opens or ended_thinking) and finish == "stop" and not cancel.is_set()
+                                and not repeated and (stops is None or stops.hit is None)):
+                            for ev in cut(parser.finish()):
+                                yield "event", ev
+                            if stops is not None and stops.hit is not None:
+                                break
+                            if repaired and not complete_call and (has_call or not "".join(answer_parts).strip()):
+                                finish = "error"
+                                raise ToolOutputError("model output is empty or has an incomplete tool call after repair")
+                            if tools and not has_call and orphaned_tool_tail("".join(answer_parts)):
+                                if repaired:
+                                    finish = "error"
+                                    raise ToolOutputError("model output still has orphaned tool-call tags after repair")
+                                extra = self.tok.encode(REPAIR_TURN, parse_special=True)
+                                retry_prompt = prompt + seg + extra
+                                room = self.engine.max_context - CTX_SLACK - len(retry_prompt)
+                                if max_new <= n or room < 1:
+                                    finish = "error"
+                                    raise ToolOutputError("orphaned tool-call tags; no token or context budget for repair")
+                                max_new = min(max_new, n + room)
+                                prompt = retry_prompt
+                                parser = OutputParser(thinking=False, tools=tools, stream_tools=True)
+                                detok = Detokenizer(self.tok)
+                                answer_parts.clear()
+                                repaired, closed_early = True, True
+                                finish = "length"
+                                budget, force, tail, run_tok, run_len = None, None, "", None, 0
+                                with self.status_lock:
+                                    st.update(phase="repairing tool output", max_tokens=max_new)
+                                print("[server] warning: orphaned tool-call tags, retrying once", flush=True)
+                                continue
                         if not (wrap or opens or ended_thinking) or cancel.is_set():
                             break
                         # budget reached or turn ended in thinking: close it and continue; the next prompt extends this

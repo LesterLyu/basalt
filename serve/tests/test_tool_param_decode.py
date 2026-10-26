@@ -88,6 +88,20 @@ class StreamedCall(unittest.TestCase):
         self.check("n", "5", 5)
         self.check("count", "null", None)
 
+    def test_long_values_keep_literal_parameter_tags(self):
+        value = "</parameter> literal text\n" * 256
+        self.check("plain", value.rstrip("\n"), value.rstrip("\n"))
+        self.check("path", value.rstrip("\n"), value.rstrip("\n"))
+        self.check("free", json.dumps([value]), [value])
+
+    def test_raw_parameter_waits_for_a_split_follower(self):
+        text = ("<tool_call><function=write_note><parameter=count>null</parameter>"
+                + " \n" * 32 + "<parameter=n>5</parameter></function></tool_call>")
+        for step in (1, 7, len(text)):
+            streamed, calls = self.run_parser(text, step)
+            self.assertEqual(json.loads(streamed), {"count": None, "n": 5})
+            self.assertEqual([c.arguments for c in calls], [{"count": None, "n": 5}])
+
 
 if __name__ == "__main__":
     unittest.main()
