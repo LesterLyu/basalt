@@ -58,7 +58,8 @@ bool Request::read_part(int64_t a0, int64_t b0, std::string& e) {
         };
         runtime_.sp.should_stop = [&] { return abort_read.load() || (orig_stop && orig_stop()); };
         runtime_.ov_active = true;
-        std::thread th([&] {
+        std::thread th([&, helper_placement = runtime_.helper_placement] {
+            restore_helper_placement(helper_placement);
             const basalt::core::OnDevice on(0);
             ok = runtime_.sp.run(ids.data() + a0, b0 - a0, a0, terr);
             if (ok && runtime_.ov_post) {   // (the checkpoint's copy to the host beside the windows)

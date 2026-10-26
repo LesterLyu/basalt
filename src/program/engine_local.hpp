@@ -21,6 +21,8 @@
 #include "basalt/core/expert_cache.hpp"
 #include "basalt/core/native_head.hpp"
 #include "basalt/platform/compiler.hpp"
+#include "basalt/platform/cpu.hpp"
+#include "basalt/log.hpp"
 #include "basalt/core/native_dense.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/core/session.hpp"
@@ -58,9 +60,15 @@ int64_t biggest_chunk(int64_t ceiling, Ok&& ok) {
 
 // One unit of background work at a time, on a persistent worker thread (starting a thread per job costs more than
 // the job's wake-up).  `join` waits for the job in flight.
+inline void restore_helper_placement(const basalt::platform::ThreadPlacement& placement) {
+    std::string err;
+    if (!basalt::platform::restore_thread_affinity(placement, err))
+        basalt::log::warn("cpu pool", "helper placement: %s", err.c_str());
+}
+
 class JobRunner {
 public:
-    JobRunner() = default;
+    explicit JobRunner(basalt::platform::ThreadPlacement placement = {}) : placement_(std::move(placement)) {}
     JobRunner(const JobRunner&) = delete;
     JobRunner& operator=(const JobRunner&) = delete;
     ~JobRunner() {
@@ -95,6 +103,7 @@ public:
     }
 private:
     void loop() {
+        restore_helper_placement(placement_);
         std::unique_lock<std::mutex> lk(m_);
         for (;;) {
             cv_.wait(lk, [this] { return has_ || stop_; });
@@ -114,6 +123,7 @@ private:
     std::condition_variable cv_;
     std::function<void()> fn_;
     std::thread th_;
+    basalt::platform::ThreadPlacement placement_;
 };
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
 struct Drive {

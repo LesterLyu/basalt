@@ -80,8 +80,8 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
-    : affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity, const std::vector<int>& cpus)
+    : cpus_(cpus), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     n_ = n_workers;
     if (n_ < 1) n_ = 1;
     active_.store(n_);
@@ -98,6 +98,8 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     for (int i = 0; i < n_; ++i) {
         threads_.emplace_back([this, i] { worker(i); });
     }
+    if (!cpus_.empty())
+        while (placement_ready_.load(std::memory_order_acquire) != n_) std::this_thread::yield();
 }
 
 ExpertPool::~ExpertPool() {
@@ -124,6 +126,16 @@ void ExpertPool::publish() {
 }
 
 void ExpertPool::worker(int id) {
+    if (!cpus_.empty()) {
+        const size_t first = cpus_.size() > 1 ? 1 : 0;
+        const int cpu = cpus_[first + (size_t) id % (cpus_.size() - first)];
+        std::string err;
+        if (!platform::set_thread_affinity(cpu, err)) {
+            placement_ok_.store(false);
+            basalt::log::error("cpu pool", "worker %d CPU %d: %s", id, cpu, err.c_str());
+        }
+        placement_ready_.fetch_add(1, std::memory_order_release);
+    }
     uint32_t seen = 0;
     // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction: a
     // `set_active_workers` before the first batch waits for `parked_ == n_` and would otherwise never return.
@@ -503,17 +515,8 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     mode_ = 0;
     const uint32_t e = begin_batch(n);   // done, then head (release), then the epoch: the batch is described first
 
-    // ---- **THE HOST DRAINS TOO, INSTEAD OF SPINNING ON `done_`.**
-    //
-    // Waiting on `done_` would leave the host's core idle for the whole drain.
-    //
-    // The host claims through the SAME `head_` counter, so this is not a second scheduler and nothing about the
-    // ordering changes: `head_` is a single `fetch_add`, every job is the same size, and a thread that arrives late
-    // simply claims nothing.  `done_` is still the completion signal and the host still waits for it - the host
-    // arrives at that wait having done a share of the work.
-    //
-    // The host's `done_.fetch_add` is a release for the same reason a worker's is: `j.out` is read by the device
-    // after `run()` returns, so the write must be published, not merely performed.
+    // The host drains through the same head_ as the workers instead of waiting idle on done_.
+    // Its completion counter uses release ordering so the device sees j.out after run() returns.
     for (;;) {
         const int ci = claim(e);
         if (ci < 0) break;

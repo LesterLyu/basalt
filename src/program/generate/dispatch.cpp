@@ -123,6 +123,7 @@ int dispatch(Context& context) {
                      pct(b_file), (double) b_file / kGiB, levers.c_str());
     };
     if (!o.serve) report_expert_tiers();
+    const auto helper_placement = context.helper_placement;
     if (o.serve) {
         basalt::program::serve::Context context{
             .o = o,
@@ -195,6 +196,7 @@ int dispatch(Context& context) {
             .split_stages = split_stages,
             .tier_file_bytes = tier_file_bytes,
             .report_expert_tiers = report_expert_tiers,
+            .helper_placement = helper_placement,
         };
         return basalt::program::serve::run(context);
     }

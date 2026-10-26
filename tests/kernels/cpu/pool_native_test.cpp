@@ -121,7 +121,17 @@ double now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
+    bool bench = false;
+    std::vector<int> pinned_cpus;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--bench") { bench = true; continue; }
+        std::string err;
+        if (std::string(argv[i]) != "--pool-cpus" || i + 1 == argc ||
+            !basalt::platform::parse_cpu_list(argv[++i], pinned_cpus, err)) {
+            std::printf("pool_native_test: invalid arguments: %s\n", err.c_str());
+            return 2;
+        }
+    }
     if (!cpu::cpu_avx2_ok()) {
         std::printf("pool_native_test SKIPPED: this CPU lacks AVX2\n");
         return 0;
@@ -156,7 +166,8 @@ int main(int argc, char** argv) {
 
     const int hw = (int) std::thread::hardware_concurrency();
     const int W = std::max(3, std::min(15, hw - 1));
-    cpu::ExpertPool pool(W);
+    cpu::ExpertPool pool(W, cpu::PoolAffinity::All, pinned_cpus);
+    if (!pool.placement_ok()) return 1;
     const float kSentinel = -1.2345e30f;
     const int ns[] = {1, 2, 3, 7, 15, 16, 33, 64, 96, 97, 130};
     int checked = 0, bad = 0;

@@ -7,6 +7,7 @@ namespace basalt::program::generate {
 // Startup phases keep their resources on the stack until the following phases return.
 // This view borrows those resources without changing their construction or destruction order.
 struct Context {
+    basalt::platform::ThreadPlacement helper_placement;
     Options* o = nullptr;
     std::string* ppl_base = nullptr;
     std::string* ppl_out = nullptr;

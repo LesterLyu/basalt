@@ -28,7 +28,7 @@ behind one declaration, and a test in `tests/platform/` that runs on both.
 | unbuffered reads | `direct_file.hpp` | asynchronous unbuffered file reads (the n-gram table) |
 | file views | `mapped_file.hpp` | mapped files, prefetch and release hints, locking |
 | memory | `memory.hpp` | RAM probes, page locking, aligned and huge-page allocation |
-| CPU | `cpu.hpp` | topology |
+| CPU | `cpu.hpp` | topology, optional logical CPU placement and restoration |
 | processes | `process.hpp` | spawn, wait, terminate, pipes, signals |
 | system | `system.hpp`, `dynlib.hpp` | process memory, disk queries, full speed in the background, the NVML loader |
 | compiler | `compiler.hpp`, `format_check.hpp` | CPUID, bit scan, spin hint, fp16 rounding, printf-format checking |

@@ -218,6 +218,8 @@ int run(int argc, char** argv) {
     }
 
     std::string err;
+    if (!basalt::platform::parse_cpu_list(o.pool_cpus_text, o.pool_cpus, err))
+        return fatal_start_error("--pool-cpus: " + err);
     // Where the experts live.  The model keeps every quantized tensor in its GGUF form, so its experts run in verify
     // windows only (--spec) and its dense projections, head and embedding come from the source tensors.
     {

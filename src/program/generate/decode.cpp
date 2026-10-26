@@ -46,6 +46,7 @@ int decode(Context& context) {
     auto& ms_sample = *context.ms_sample;
     auto& phase_tokens = *context.phase_tokens;
     auto& pool = *context.pool;
+    const auto helper_placement = context.helper_placement;
     auto& spec_pos = *context.spec_pos;
 
     // ================================ SPECULATIVE DECODING ================================
@@ -269,7 +270,10 @@ int decode(Context& context) {
             std::thread adapt_thr;
             bool adapt_ok = true;
             if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                adapt_thr = std::thread([&, helper_placement] {
+                    basalt::program::engine_local::restore_helper_placement(helper_placement);
+                    adapt_ok = adapt();
+                });
             if (!ver.commit(a + 1, err)) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 return fatal_start_error(err);
