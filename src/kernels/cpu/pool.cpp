@@ -80,8 +80,8 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
-    : affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity, const std::vector<int>& cpus)
+    : cpus_(cpus), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     n_ = n_workers;
     if (n_ < 1) n_ = 1;
     active_.store(n_);
@@ -96,6 +96,8 @@ ExpertPool::ExpertPool(int n_workers, PoolAffinity affinity)
     for (int i = 0; i < n_; ++i) {
         threads_.emplace_back([this, i] { worker(i); });
     }
+    if (!cpus_.empty())
+        while (placement_ready_.load(std::memory_order_acquire) != n_) std::this_thread::yield();
 }
 
 ExpertPool::~ExpertPool() {
@@ -122,6 +124,16 @@ void ExpertPool::publish() {
 }
 
 void ExpertPool::worker(int id) {
+    if (!cpus_.empty()) {
+        const size_t first = cpus_.size() > 1 ? 1 : 0;
+        const int cpu = cpus_[first + (size_t) id % (cpus_.size() - first)];
+        std::string err;
+        if (!platform::set_thread_affinity(cpu, err)) {
+            placement_ok_.store(false);
+            basalt::log::error("cpu pool", "worker %d CPU %d: %s", id, cpu, err.c_str());
+        }
+        placement_ready_.fetch_add(1, std::memory_order_release);
+    }
     uint32_t seen = 0;
     // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction: a
     // `set_active_workers` before the first batch waits for `parked_ == n_` and would otherwise never return.

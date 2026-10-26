@@ -1,3 +1,4 @@
+#include "basalt/platform/cpu.hpp"
 // src/program/serve/state.hpp - the server's state every model shares, and what a model answers.
 #pragma once
 
@@ -84,6 +85,7 @@ public:
         reader_stop_.store(true);
         if (reader_.joinable()) reader_.join();
     }
+    virtual basalt::platform::ThreadPlacement helper_cpu_placement() const { return {}; }
     int execute();
     Flow dispatch();
     int run_requests();

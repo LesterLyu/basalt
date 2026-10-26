@@ -32,6 +32,13 @@ inline constexpr bool kPreferMemberwiseVectorAssignment = true;
 inline constexpr bool kPreferMemberwiseVectorAssignment = false;
 #endif
 
+// MSVC leaves IQ1_S grid indices on the stack when the four offsets are dynamic.
+#if defined(_MSC_VER) && !defined(__clang__)
+inline constexpr bool kUnrollIq1sGroups = true;
+#else
+inline constexpr bool kUnrollIq1sGroups = false;
+#endif
+
 /// CPUID leaf `leaf`, subleaf `sub`: r[0..3] = EAX, EBX, ECX, EDX.
 inline void cpuid(unsigned leaf, unsigned sub, unsigned (&r)[4]) {
 #if defined(_MSC_VER)

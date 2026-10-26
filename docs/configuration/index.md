@@ -200,3 +200,6 @@ or a prompt split keeps it on every card: each stage applies the vector to the s
 | `control-vector-layer-range` | engine | `A B` | 1 to last layer | Flash-Next only. Layers it applies to, inclusive. |
 | `cvec-mode` | engine | `add`, `project` | `add` | Flash-Next only. `add`: h += s v. `project`: h -= s (h.v) v. |
 | `cvec-dir` | engine | `per-layer`, `single:L` | `per-layer` | Flash-Next only. Each layer's own direction, or layer L's everywhere. |
+
+`pool-cpus` selects `none` (default), `physical`, or an ordered list of allowed CPU IDs/ranges. The first CPU hosts
+the caller; workers use the remainder. Helpers restore the original allowed placement.

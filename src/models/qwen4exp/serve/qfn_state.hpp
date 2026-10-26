@@ -152,6 +152,7 @@ class QfnRuntime final : public Runtime, private Context {
 public:
     explicit QfnRuntime(Context& context)
         : Runtime(context.o, context.model_file, context.err, context.n_vocab, context.grammar_vocab), Context(context) {}
+    basalt::platform::ThreadPlacement helper_cpu_placement() const override { return Context::helper_placement; }
     int init_before_input() override;
     int init_after_input() override;
     void after_input_start() override;
@@ -348,7 +349,7 @@ private:
     int64_t ba_m_l{};
     int64_t ba_noplace{};   // the batch rounds' swaps deferred for want of a free RAM place
     double ba_ms{};
-    JobRunner ba_thr{};   // queues the adaptive copies beside the windows
+    JobRunner ba_thr{Context::helper_placement};   // queues the adaptive copies beside the windows
     bool ba_job{};
     double bt_run{};
     double bt_commit{};

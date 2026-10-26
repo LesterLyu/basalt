@@ -9,7 +9,7 @@ namespace basalt::models::qwen4exp::serve {
 
 class QfnRequest final : public Request {
 public:
-    explicit QfnRequest(QfnRuntime& runtime) : Request(runtime), runtime_(runtime) {}
+    explicit QfnRequest(QfnRuntime& runtime) : Request(runtime), runtime_(runtime), apply_thr(runtime.helper_cpu_placement()), adapt_thr(runtime.helper_cpu_placement()) {}
 
     static constexpr bool kSpeculates = true;
     // ---- the window loop's calls; defined in the one file that instantiates it
