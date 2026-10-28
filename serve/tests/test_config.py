@@ -66,6 +66,14 @@ def engine_parser_flags() -> dict:
 
 
 class ConfigFile(unittest.TestCase):
+    def test_single_request_staging_switch(self):
+        known = engine_parser_flags()
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                _, _, engine, _ = parse([], {"engine": {"single-request-staging": enabled}})
+                self.assertEqual(engine, ["--single-request-staging"] if enabled else [])
+                check_engine_flags(engine, known, "staging config")
+
     def test_server_and_engine_sections(self):
         ap = build_parser()
         argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": 2, "lazy": False,

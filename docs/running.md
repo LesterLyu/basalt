@@ -62,8 +62,12 @@ is read. A prompt that arrives while no other slot is decoding is read as in the
 
 On one card, a batch window's layer with enough CPU misses sends a share of them over PCIe: CUDA0 copies them from
 their RAM copies into VRAM staging and computes them while the CPU pool computes the rest, both reading RAM at once.
-The startup line `batch windows: a layer with N+ CPU misses sends a share of them over PCIe to CUDA0` gives the
-threshold. A request decoding alone runs the single-stream path and is not affected.
+The startup line `staged share: ... windows, a layer with N+ CPU misses ...` gives the threshold and scope.
+`--single-request-staging` (engine config: `"single-request-staging": true`) extends this policy to single-request
+windows. It is off by default; omitting it or setting the config value to false preserves the single-request path.
+Batch staging is independent of this switch. Only experts with mapped RAM copies can be staged, and the policy
+does not replace the long-term expert cache or its adaptive swaps. Changing CPU/GPU placement can change rounding;
+see [precision](precision/index.md).
 
 At startup the server prints one `[server] kv` line per device with all the session state placed there, for
 example `12.5GiB cuda2 solo=262144 slots=2x262144 draft=0.5GiB`. With elastic KV (the default for a server whose

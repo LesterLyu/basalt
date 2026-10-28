@@ -127,6 +127,8 @@ public:
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
     void set_cpu_warm(basalt::kernels::cpu::ExpertPool* pool, ExpertSource* src) { warm_pool_ = pool; warm_src_ = src; }
+    /// Before init: extend the batch window's PCIe staged share to single-request windows.
+    void set_single_request_staging(bool enabled) { single_request_staging_ = enabled; }
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -369,6 +371,7 @@ private:
     std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;
+    bool single_request_staging_ = false;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
     // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does

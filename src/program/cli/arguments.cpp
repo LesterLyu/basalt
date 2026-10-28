@@ -91,6 +91,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         }
         else if (a == "--gpu") o.gpu = next("--gpu");
         else if (a == "--gpu-plan") o.gpu_plan = true;
+        else if (a == "--single-request-staging") o.single_request_staging = true;
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--prefill") {
             const std::string v = next("--prefill");

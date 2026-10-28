@@ -127,6 +127,7 @@ int Runtime::init_verify() {
     for (const auto& xpe : xpeers)
         if (xpe->valid()) ver.add_peer(xpe.get());
     ver.set_cpu_warm(drive.d.pool, drive.d.src);
+    ver.set_single_request_staging(o.single_request_staging);
     if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
         (mtp_on && !mtp.bind(wt, multi_gpu ? &mtp_head : &native_head, ver.final_R_all(), err))) {
         basalt::log::error("basalt serve", "%s", err.c_str());
@@ -199,6 +200,7 @@ int Runtime::capture_windows() {
     peer_at_start = peer.valid() ? peer.residency() : std::vector<int32_t>();
     prof_rank_start = prof_rank;
     std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
+    std::printf("INFO single_request_staging=%d\n", o.single_request_staging ? 1 : 0);
     std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
     std::fflush(stdout);
 

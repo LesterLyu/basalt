@@ -160,6 +160,8 @@ void usage() {
                  "                       server without a layer split, a round after one that found twice as many\n"
                  "                       misses swaps four times as many, and the RAM copy keeps 4 N free places\n"
                  "  --peer-adapt-swaps N  peer cache swaps per adaptation step (default: --adapt-swaps)\n"
+                 "  --single-request-staging  opt in to PCIe staging for single-request decode on one GPU\n"
+                 "                       (default off; batch staging is unchanged)\n"
                  "  --peer-prefill-rows N  prompt rows per layer the peer computes (default half of chunk x top-k;\n"
                  "                       0 = the prompt path stays on the primary)\n"
                  "  --pool-workers N     CPU expert pool worker count.  Auto when not set: every physical core\n"

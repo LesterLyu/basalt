@@ -814,9 +814,9 @@ bool Verifier::dm_init(std::string& err) {
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
-    // The staged share: on one card, a batch window's layer with enough CPU misses sends some of them to CUDA0, copied
+    // The staged share: on one card, a window's layer with enough CPU misses sends some of them to CUDA0, copied
     // over PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy
-    // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
+    // is never staged; the addresses are read again before a window when the source's places moved (a swap).
     // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
     // memory at once.
     bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
@@ -850,11 +850,15 @@ bool Verifier::dm_init(std::string& err) {
                    cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
         if (!sok) { err = "verify: the staged share's buffers"; return false; }
         std::memset(d->stage_host, 0, (size_t) LE * 8);
-        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
+        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first window
         d->stage_stride = stride;
         d->stage_blocks = 8;
         d->stage_min = 1;
         while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
+        basalt::log::info("basalt verify", "staged share: %s windows, a layer with %d+ CPU misses sends a share over "
+                         "PCIe to CUDA0 (%d slots, %lld bytes each)",
+                         single_request_staging_ ? "single-request and batch" : "batch",
+                         d->stage_min, stage_slots, (long long) stride);
     }
     std::string served;
     if (d->pdev >= 0) {
@@ -2136,6 +2140,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     bool ring_fork = false;   // the group's ring stream is joined in post
     int mid_ord = 0;   // the mid chain's launches so far in this graph
     bool glue_on = false;   // post's gate/up launch plans the group's VRAM share
+    bool staged = false;   // pre split off CPU misses whose staged rows post computes
     bool sh_read = false;   // the FFN read gave the shared expert its gate and q8_1 rows; post's combine gates it
     DmRouteArgs glue_ring;   // the ring's work for post's gate/up launch
     auto pre = [&](int64_t l) -> bool {
@@ -2770,6 +2775,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         ring_fork = pk_ring;
         // the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
         glue_on = false;
+        staged = false;
         if (pk_ring && dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
             const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
             glue_on = dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff));
@@ -2851,7 +2857,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             ra.stats = dm_->wstat;
             ra.peer_cap = 0;
             ra.rows = dm_->rq != nullptr || dm_->warm != nullptr;
-            if (dm_->stage_src != nullptr && batch_rec_) {   // batch windows: many rows, many misses
+            staged = dm_->stage_src != nullptr && (batch_rec_ || single_request_staging_);
+            if (staged) {
                 ra.stage_src = dm_->stage_src + l * g.n_expert;
                 ra.stage_k = dm_->stage_k;
             }
@@ -3033,7 +3040,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                       nat_xq_, hit_scratch_, parts_out, cs);
             }
-            if (dm_->stage_src != nullptr && batch_rec_) {   // the staged share, once its copy is in staging
+            if (staged) {   // the staged share, once its copy is in staging
                 cudaStreamWaitEvent(cs, dm_->st_join, 0);
                 PdlScope pst(false);
                 native_expert_grouped(L, P->sptr, P->sstart, P->scounts, P->sdst, P->stok, cap, cap, nat_xq_,
@@ -3888,6 +3895,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     ms_stage_inputs += ms_since(t0);
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_begin(err, &gm)) return false;
+        if (single_request_staging_ && !dm_stage_places(err)) return false;
     }
     ms_host += ms_since(t0);
     if (prof_on_) decode_gaps().verify_end = 0;   // set again only by a collected window
@@ -4838,15 +4846,19 @@ bool Verifier::dm_stage_places(std::string& err) {
     if (gen == d->stage_gen) return true;
     const ModelGeometry& g = *g_;
     const int64_t LE = g.n_layers * g.n_expert;
-    bool changed = false;
+    int64_t first = LE, end = 0;
     for (int64_t i = 0; i < LE; ++i) {
         const unsigned long long p = (unsigned long long) warm_src_->device_alias(i / g.n_expert, i % g.n_expert);
         const unsigned long long v = (p & 15ull) == 0 ? p : 0ull;
-        changed = changed || d->stage_host[i] != v;
+        if (d->stage_host[i] != v) {
+            first = std::min(first, i);
+            end = i + 1;
+        }
         d->stage_host[i] = v;
     }
     d->stage_gen = gen;
-    if (changed && cudaMemcpyAsync(d->stage_src, d->stage_host, (size_t) LE * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+    if (first < end && copy_small(d->stage_src + first, d->stage_host + first,
+                                 (size_t) (end - first) * sizeof(*d->stage_src), cs_) != cudaSuccess) {
         err = std::string("verify: the staged share's addresses: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
