@@ -142,6 +142,13 @@ int home_region_find(const std::vector<HomeRegion>& regions, uint64_t off, uint6
 /// Whether any expert's place lies in the region.
 bool home_region_used(const HomeRegion& r, const std::vector<uint64_t>& offsets);
 
+/// Registration cuts at aligned expert starts, with the final cut at the permitted whole-expert end.
+std::vector<uint64_t> complement_pin_slices(std::vector<uint64_t> starts, uint64_t end, uint64_t align,
+                                            uint64_t target_bytes);
+/// The registered slice's own device address plus the offset within it.
+const uint8_t* complement_pin_alias(const std::vector<uint64_t>& starts,
+                                   const std::vector<const uint8_t*>& devices, uint64_t off);
+
 }  // namespace detail
 
 
@@ -453,6 +460,8 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
     void close();
 
+    /// Drop clean mapped pages after the GPU fill, before sizing the resident copy.
+    void release_mapped_cache() const;
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
@@ -598,6 +607,8 @@ private:
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
     uint64_t complement_pin_limit_ = 0;
+    std::vector<uint64_t> complement_slice_at_;
+    std::vector<const uint8_t*> complement_slice_dev_;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
