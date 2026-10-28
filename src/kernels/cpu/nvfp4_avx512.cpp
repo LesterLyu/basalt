@@ -98,7 +98,7 @@ inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* cons
     for (int ib = 0; ib < nb; ++ib) {
         Blk b[R];
         for (int k = 0; k < R; ++k) {
-            if constexpr (platform::kMemberwiseVectorCopy) {
+            if constexpr (platform::kPreferMemberwiseVectorAssignment) {
                 const Blk decoded = decode(w[k] + ib);
                 b[k].aw = decoded.aw;
                 b[k].m = decoded.m;
