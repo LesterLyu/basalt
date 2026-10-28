@@ -434,8 +434,8 @@ public:
     /// The size check is not a formality: a short file would fault at the END of a long sequence, and an over-long one
     /// means the file is not the one the geometry came from.  Refuses with the two numbers.
     bool open(const FileRange& experts, int64_t n_layers, int64_t n_expert, std::string& err);
-    /// Pin a compact host mirror of experts absent from a fully filled static GPU cache. The mmap remains open as a
-    /// fallback for later cache reloads. This is opt-in because the complement may still be a large allocation.
+    /// Pin a compact host mirror of experts absent from a fully filled static GPU cache. The file view can be
+    /// released after the live tiers cover every expert; pointer fallbacks restore it when needed.
     ///
     /// The resident RAM mode (`--resident-experts`, `--resident-cpu-experts`):
     ///   - `pin`: page-locked and mapped (`cudaHostAlloc`), so the prompt path copies it by DMA and the verify window
@@ -462,6 +462,8 @@ public:
 
     /// Drop clean mapped pages after the GPU fill, before sizing the resident copy.
     void release_mapped_cache() const;
+    /// Between requests, release the file view once the live experts have RAM or GPU copies.
+    bool detach_file_mapping();
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
@@ -570,7 +572,8 @@ public:
 private:
     struct AdviseWorker;
     mutable std::unique_ptr<AdviseWorker> advise_worker_;
-    mutable std::once_flag advise_once_;
+    mutable std::mutex advise_mu_;
+    bool blob_range(int64_t layer, int64_t expert, uint64_t& offset, uint64_t& bytes) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
@@ -578,8 +581,11 @@ private:
     std::atomic<uint64_t> file_us_{0};
     std::atomic<int64_t> ram_reads_{0};
     std::atomic<uint64_t> file_read_bytes_{0};
-    platform::MappedFile view_;               ///< the mapped experts; base_ is its first byte
-    const uint8_t* base_ = nullptr;
+    mutable std::mutex file_mu_;
+    mutable platform::MappedFile view_;       ///< the mapped experts; base_ is its first byte
+    mutable const uint8_t* base_ = nullptr;
+    std::string file_path_;
+    bool file_detached_ = false;
     uint64_t file_off_ = 0;                   ///< where the experts start in the mapped file
     int64_t blobs_ = 0;
     int64_t n_layers_ = 0;
@@ -628,7 +634,7 @@ private:
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   // (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
-    int fd_ = -1;
+    mutable int fd_ = -1;
 };
 
 // ================================ THE RESIDENT ARENA ================================

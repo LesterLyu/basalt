@@ -6627,6 +6627,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         ple_table.rearm_keepalive();   // a long load must not lapse the SSD keep-alive window before the first request
+        if (srcp == &src && src.complement_ready() && tier_file_bytes == 0 && src.detach_file_mapping())
+            basalt::log::info("basalt generate", "expert file view closed; all live experts have RAM or GPU copies");
         std::printf("INFO file_experts_bytes=%llu\n", (unsigned long long) tier_file_bytes);   // experts only the file holds
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
