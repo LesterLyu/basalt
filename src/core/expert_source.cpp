@@ -2394,6 +2394,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;
                 else ++d.offload_entries;   // PCIe or another GPU
+                if (ext && kind[i] == 1 && d.job_of[(size_t) e] == -1) {
+                    d.job_of[(size_t) e] = -2;   // count a staged group once across its token entries
+                    ++d.pcie_experts;
+                }
                 if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU;
