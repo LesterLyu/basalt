@@ -4,9 +4,9 @@ The decode-path precision tables are in [index.md](index.md); the quality method
 
 ## NVFP4 CPU expert rows
 
-The AVX-512 expert path uses paired 256-bit sub-block lanes for one- and two-token batches. Weight decoding,
-activation quantization and the per-lane fused accumulation are unchanged. The accumulators are restored to the
-full-width lane order before the same final reduction, preserving the output bits across batch widths and row splits.
+The AVX-512 expert path copies decoded weight fields individually so they can stay in registers. Weight decoding,
+activation quantization, the 512-bit fused accumulation and the final reduction are unchanged, preserving the output
+bits across batch widths and row splits.
 `nvfp4_cpu_rows_test` checks the single-token ggml dot, a dequantized double-precision reference, batch widths 1–8,
 and uneven row boundaries at the model's gate/up and down geometry.
 

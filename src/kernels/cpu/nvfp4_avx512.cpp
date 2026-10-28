@@ -86,80 +86,23 @@ inline void token_scales(const block_q8_0* const* y, int nb, float* dv) {
         }
 }
 
-// Paired sub-block lanes avoid cross-lane decode shuffles for narrow token batches.
-struct SmallBlk {
-    __m256i aa, ab, wa, wb;
-    __m256 sa, sb;
-};
-
-inline SmallBlk decode_small(const block_nvfp4* x) {
-    const __m128i v128 = _mm_loadu_si128((const __m128i*) kvalues_fp4);
-    const __m256i values = _mm256_inserti128_si256(_mm256_castsi128_si256(v128), v128, 1);
-    const __m256i mask = _mm256_set1_epi8(0x0f);
-    const __m256i q = _mm256_loadu_si256((const __m256i*) x->qs);
-    const __m256i lo = _mm256_and_si256(q, mask);
-    const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), mask);
-    SmallBlk b;
-    b.wa = _mm256_shuffle_epi8(values, _mm256_unpacklo_epi64(lo, hi));
-    b.wb = _mm256_shuffle_epi8(values, _mm256_unpackhi_epi64(lo, hi));
-    b.aa = _mm256_sign_epi8(b.wa, b.wa);
-    b.ab = _mm256_sign_epi8(b.wb, b.wb);
-    const float s0 = kLut.v[x->d[0] & 0x7F], s1 = kLut.v[x->d[1] & 0x7F],
-                s2 = kLut.v[x->d[2] & 0x7F], s3 = kLut.v[x->d[3] & 0x7F];
-    b.sa = _mm256_setr_ps(s0, s0, s0, s0, s2, s2, s2, s2);
-    b.sb = _mm256_setr_ps(s1, s1, s1, s1, s3, s3, s3, s3);
-    return b;
-}
-
-template <int R, int NT>
-inline void rows_dot_small(const block_nvfp4* const* w, int nb, const block_q8_0* const* y, const float* dv,
-                           float (*res)[kMaxT]) {
-    const __m256i ones = _mm256_set1_epi16(1);
-    __m256 acc1[R][NT], acc2[R][NT];
-    for (int k = 0; k < R; ++k)
-        for (int t = 0; t < NT; ++t) acc1[k][t] = acc2[k][t] = _mm256_setzero_ps();
-    for (int ib = 0; ib < nb; ++ib) {
-        SmallBlk b[R];
-        for (int k = 0; k < R; ++k) b[k] = decode_small(w[k] + ib);
-        for (int t = 0; t < NT; ++t) {
-            const __m256i y0 = _mm256_loadu_si256((const __m256i*) y[t][2 * ib].qs);
-            const __m256i y1 = _mm256_loadu_si256((const __m256i*) y[t][2 * ib + 1].qs);
-            const __m256i ya = _mm256_permute2x128_si256(y0, y1, 0x20);
-            const __m256i yb = _mm256_permute2x128_si256(y0, y1, 0x31);
-            const float* d0 = dv + 16 * ((size_t) t * nb + ib);
-            const __m256 d = _mm256_insertf128_ps(_mm256_castps128_ps256(_mm_load_ps(d0)), _mm_load_ps(d0 + 8), 1);
-            for (int k = 0; k < R; ++k) {
-                const __m256i pa = _mm256_madd_epi16(_mm256_maddubs_epi16(b[k].aa, _mm256_sign_epi8(ya, b[k].wa)), ones);
-                const __m256i pb = _mm256_madd_epi16(_mm256_maddubs_epi16(b[k].ab, _mm256_sign_epi8(yb, b[k].wb)), ones);
-                acc1[k][t] = _mm256_fmadd_ps(_mm256_mul_ps(d, b[k].sa), _mm256_cvtepi32_ps(pa), acc1[k][t]);
-                acc2[k][t] = _mm256_fmadd_ps(_mm256_mul_ps(d, b[k].sb), _mm256_cvtepi32_ps(pb), acc2[k][t]);
-            }
-        }
-    }
-    for (int k = 0; k < R; ++k)
-        for (int t = 0; t < NT; ++t) {
-            // Restore the full-width lane order before the unchanged reduction.
-            const __m512 pair = _mm512_insertf32x8(_mm512_castps256_ps512(acc1[k][t]), acc2[k][t], 1);
-            const __m512 ordered = _mm512_shuffle_f32x4(pair, pair, _MM_SHUFFLE(3, 1, 2, 0));
-            res[k][t] = _mm512_reduce_add_ps(ordered);
-        }
-}
-
 // R rows (each its own block pointer) against NT tokens: res[k][t].
 template <int R, int NT>
 inline void rows_dot(const block_nvfp4* const* w, int nb, const block_q8_0* const* y, const float* dv,
                      float (*res)[kMaxT]) {
-    if constexpr (NT <= 2) {
-        rows_dot_small<R, NT>(w, nb, y, dv, res);
-        return;
-    }
     __m512 acc[R][NT];
     for (int k = 0; k < R; ++k)
         for (int t = 0; t < NT; ++t) acc[k][t] = _mm512_setzero_ps();
     const __m512i zero = _mm512_setzero_si512();
     for (int ib = 0; ib < nb; ++ib) {
         Blk b[R];
-        for (int k = 0; k < R; ++k) b[k] = decode(w[k] + ib);
+        for (int k = 0; k < R; ++k) {
+            const Blk decoded = decode(w[k] + ib);
+            // Copy fields so the decoded values can stay in registers.
+            b[k].aw = decoded.aw;
+            b[k].m = decoded.m;
+            b[k].ws = decoded.ws;
+        }
         for (int t = 0; t < NT; ++t) {
             const __m512i a = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) y[t][2 * ib].qs)),
                                                  _mm256_loadu_si256((const __m256i*) y[t][2 * ib + 1].qs), 1);
