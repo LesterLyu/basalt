@@ -35,6 +35,7 @@ struct Prefill::Impl {
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
     std::vector<void*> owned;
+    uint64_t allocated_bytes = 0;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
     float* grs = nullptr;                    // the hyper-connection read's row scales (T x 4)

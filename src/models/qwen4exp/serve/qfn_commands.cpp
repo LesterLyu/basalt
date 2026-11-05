@@ -162,6 +162,7 @@ void QfnRuntime::between_requests(const std::string& line) {
 void QfnRuntime::after_input_start() { sp.should_stop = [&] { return halted(); }; }
 
 void QfnRuntime::print_info() {
+    std::printf("INFO architecture=qwen4exp\n");
     // what the server's Monitor tab shows (the server skips unknown lines until READY)
     {
         size_t free_b = 0, total_b = 0;
@@ -171,6 +172,10 @@ void QfnRuntime::print_info() {
         const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
         const int64_t slots_all = gpu_slots();
         int64_t mib_all = mib_primary;
+
+        if (peer.valid()) mib_all += (int64_t) (peer.cache().mapped_bytes() >> 20);
+        for (const auto& extra : xpeers)
+            if (extra->valid()) mib_all += (int64_t) (extra->cache().mapped_bytes() >> 20);
         for (const auto& st : stages) mib_all += (int64_t) (st->cache.bytes() >> 20);
         // the pack's quantization label (the last word of its name, without the publisher's prefixes) and the PCI
         // bus ids of the cards this engine computes on, primary first: what a benchmark row records

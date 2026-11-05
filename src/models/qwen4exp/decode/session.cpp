@@ -120,6 +120,9 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // `session_zero`; it survives every token, which is the whole point of a conv history.
     s.ple_hist = (float*) take(ple_hist_bytes());
     s.R = s.block.R;
+    s.device_state_bytes = (uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4 + ple_hist_bytes() +
+        (g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
+    s.device_scratch_bytes = used - s.device_state_bytes;
     return used;
 }
 

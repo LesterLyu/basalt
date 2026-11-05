@@ -1,6 +1,7 @@
 // src/core/expert_tier.cpp - the routed-expert tiers.
 #include "basalt/log.hpp"
 #include "basalt/core/expert_tier.hpp"
+#include "basalt/core/memory_usage.hpp"
 
 #include "basalt/core/device.hpp"
 #include "basalt/core/exact_slots.hpp"
@@ -28,6 +29,21 @@
 #include <vector>
 
 namespace basalt::core {
+
+void ExpertTier::memory_usage(MemoryUsage& usage) const {
+    if (!usage.claim(this)) return;
+    usage.device(main_, "experts", cache_.mapped_bytes() + ext_.mapped_bytes());
+    for (const auto& peer : peers_)
+        usage.device(peer->device(), "expert_helper", peer->cache().mapped_bytes());
+    for (const auto& share : shares_)
+        if (share) share->memory_usage(usage);
+    for (const auto& alloc : ram_allocations_)
+        usage.host["resident_experts"] += alloc.capacity();
+    for (const auto& pin : ram_pins_) {
+        usage.host["pinned_experts"] += pin.registered_bytes;
+        usage.host["locked_experts"] += pin.locked_bytes;
+    }
+}
 namespace {
 
 constexpr size_t kMaxPending = 128;              // copies claimed a window

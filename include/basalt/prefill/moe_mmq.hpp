@@ -76,6 +76,7 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
+    size_t allocated_bytes() const;
 
 private:
     void* ctx_ = nullptr;

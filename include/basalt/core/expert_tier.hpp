@@ -99,6 +99,8 @@ struct ExpertTierSpec {
     float route_prior = 0.0f;
 };
 
+struct MemoryUsage;
+
 class ExpertTier {
 public:
     static constexpr int kMaxK = 128;     ///< distinct experts one lookup holds (a window of up to 8 rows, 16 each)
@@ -270,6 +272,7 @@ public:
     /// n_embd zeros on the main card: the output row of a dropped entry.
     const float* zero_row() const { return zero_row_; }
 
+    void memory_usage(MemoryUsage& usage) const;
     void report(const char* tag) const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
     int64_t hits() const { return hits_; }

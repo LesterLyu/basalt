@@ -1,5 +1,6 @@
 // src/models/deepseek41/prefill_ffn.hpp - the routed and shared experts over a chunk of prompt tokens.
 #pragma once
+#include "basalt/core/memory_usage.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -34,6 +35,7 @@ void weighted_sum_tokens(const float* rows, const int32_t* map, const float* w, 
 class PrefillFfn {
 public:
     virtual ~PrefillFfn() = default;
+    virtual void memory_usage(core::MemoryUsage&) const {}
     /// out[t] = sum_k weights[t][k] * expert(ids[t][k])(x[t]) for T tokens (x, out: [T][n_embd] device; ids, weights:
     /// [T][k] device). Each expert the chunk routes to is staged once, from the ops' expert tier when it has one.
     virtual bool routed(int layer, int n_tokens, const float* x, const int32_t* ids, const float* weights, float* out,

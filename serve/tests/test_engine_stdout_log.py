@@ -51,7 +51,7 @@ class UnparsedStdout(unittest.TestCase):
 
     def test_the_helper_skips_protocol_and_blank_lines_and_a_missing_log(self):
         buf = io.StringIO()
-        for line in ("T 5\n", "DONE 1 2 3 4 stop\n", "ERR x\n", "BT 0 1\n", "auto flags: a 1\n", "\n", "  \n"):
+        for line in ("T 5\n", "DONE 1 2 3 4 stop\n", "ERR x\n", "BT 0 1\n", "MEMORY {}\n", "auto flags: a 1\n", "\n", "  \n"):
             log_unparsed(line, buf)
         self.assertEqual(buf.getvalue(), "")
         log_unparsed("trap", buf)

@@ -13,6 +13,8 @@
 #include "basalt/program/grammar/reply_form.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
+#include "basalt/core/memory_usage.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -256,6 +258,7 @@ public:
     }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
+    virtual void memory_usage(core::MemoryUsage&) const {}
     /// An elastic KV's ceiling (core/elastic_kv.hpp): the positions the session can back before the expert cache would go below
     /// the slots a prompt chunk needs; -1 without an elastic KV.
     virtual int64_t kv_ceiling() { return -1; }
@@ -299,6 +302,7 @@ public:
     /// Once every queued byte has landed: the model connects what the reads filled (prompt stages, copies made from the
     /// weights, checks of what was placed) and makes its sessions if plan() did not; they are then ready to run.
     virtual Result attach(const LoadRequest& req, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
+    virtual void memory_usage(core::MemoryUsage&) const {}
 };
 
 /// A started model and its sessions.

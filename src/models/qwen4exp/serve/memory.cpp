@@ -1,10 +1,73 @@
 // src/models/qwen4exp/serve/memory.cpp - memory operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_state.hpp"
+#include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
 #include "basalt/core/host_plan.hpp"
 
 namespace basalt::models::qwen4exp::serve {
+
+void QfnRuntime::memory_usage(basalt::core::MemoryUsage& usage) const {
+    const auto session = [&](const basalt::core::SessionState& s, int dev) {
+        if (!usage.claim(s.gdn_state)) return;
+        uint64_t mapped = 0;
+        for (int64_t j = 0; s.qsa_states && j < s.qsa_alloc; ++j)
+            if (auto* a = s.qsa_states[s.qsa_ord0 + j].kv_arena; a && usage.claim(a)) mapped += a->mapped_bytes();
+        usage.device(dev, "kv_state", s.device_state_bytes + mapped);
+        usage.device(dev, "scratch", s.device_scratch_bytes);
+    };
+    const auto weights = [&](const basalt::core::WeightTable& w, int dev) {
+        usage.device(dev, "weights", w.report().arena_bytes + w.native_weight_bytes());
+        usage.device(dev, "scratch", w.native_scratch_bytes());
+    };
+    const auto cache = [&](const basalt::core::ExpertCache& c, int dev, const char* kind) {
+        uint64_t loan = 0;
+        for (const auto& p : pf_parts)
+            if (p.cache == &c && !p.lent.empty() && p.first_now >= 0)
+                loan += c.bytes() - c.bytes_of(p.first_now);
+        const uint64_t mapped = (uint64_t) c.mapped_bytes();
+        loan = std::min(loan, mapped);
+        usage.device(dev, kind, mapped - loan);
+        usage.device(dev, "long_prefill", loan);
+    };
+    weights(wt, 0);
+    usage.device(0, "weights", native_head.weight_bytes());
+    session(ss, 0);
+    usage.device(0, "scratch", ver.scratch_bytes() + ver_same.scratch_bytes() + ver_b.scratch_bytes());
+    cache(xcache, 0, "experts");
+    usage.device(0, "mtp", mtp.vram_bytes() + (mtp.kv_state().kv_arena ? mtp.kv_state().kv_arena->mapped_bytes() : 0));
+    usage.device(0, "long_prefill", sp.allocated_bytes());
+    usage.device(0, "mmq_buffers", sp.mmq_bytes());
+    usage.device(0, "vision", vis_enc.device_bytes());
+    for (const auto& st : stages) {
+        weights(st->wt, st->dev);
+        session(st->ss, st->dev);
+        usage.device(st->dev, "scratch", st->ver.scratch_bytes() + st->ver_b.scratch_bytes());
+        cache(st->cache, st->dev, "experts");
+        usage.device(st->dev, "long_prefill", st->sp.allocated_bytes());
+        usage.device(st->dev, "mmq_buffers", st->sp.mmq_bytes());
+    }
+    for (size_t at = 0; at < bslot_ss.size(); ++at)
+        for (const auto& s : bslot_ss[at])
+            if (s) session(*s, at == 0 ? 0 : stages[at - 1]->dev);
+    const auto helper = [&](const basalt::core::PeerExperts& p) {
+        if (!p.valid()) return;
+        cache(p.cache(), p.device(), "expert_helper");
+    };
+    helper(peer);
+    for (const auto& p : xpeers) helper(*p);
+    usage.host["resident_experts"] += o.mmap_experts ? src.resident_bytes() : basalt::kernels::cpu::expert_layout().total;
+    usage.host["expert_homes"] += src.homes_bytes();
+    if (const auto* a = dynamic_cast<const basalt::core::ArenaExpertSource*>(srcp)) {
+        usage.host["pinned_experts"] += a->pinned_bytes();
+        usage.host["locked_experts"] += a->locked_bytes();
+    } else {
+        usage.host["pinned_experts"] += src.pinned_bytes();
+        usage.host["locked_experts"] += src.locked_bytes();
+    }
+}
+
+
 
 // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
 int32_t QfnRuntime::loan_plan(int64_t live, int64_t& chunk) {

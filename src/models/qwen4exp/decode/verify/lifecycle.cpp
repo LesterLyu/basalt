@@ -267,6 +267,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
+    arena_bytes_ = count.used;
     cudaMemset(arena_, 0, count.used);
     prof_on_ = diagnostics().profile;
     if (prof_on_) decode_gaps().host_on = true;
