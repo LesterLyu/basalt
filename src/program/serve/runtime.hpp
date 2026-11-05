@@ -24,7 +24,7 @@ namespace serve {
 // a driver that pages GPU memory do so, and a verify graph spinning on a host flag then never finishes.  A driver that
 // fails such an allocation instead needs room only for what is allocated after loading (lazily loaded kernels, graphs,
 // a streaming state's residency map).
-inline constexpr int kVramStallMib = 256;
+inline constexpr int kVramStallMib = 200;
 inline constexpr int kVramFloorMib = 128;
 inline int vram_floor_mib() { return basalt::platform::gpu_memory_pages() ? kVramStallMib : kVramFloorMib; }
 

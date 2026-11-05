@@ -180,7 +180,7 @@ longer time.
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
-- `--vram-reserve-mib` below 256 is refused at startup on Windows and WSL2: with less VRAM free once everything is
+- `--vram-reserve-mib` below 200 is refused at startup on Windows and WSL2: with less VRAM free once everything is
   loaded, a later allocation can make the driver page GPU memory and requests stall. On Linux, where the driver fails
   such an allocation instead, the floor is 128.
 - When some experts are read from the SSD (they fit in neither the GPUs nor the RAM copy), the RAM copy leaves a
