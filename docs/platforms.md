@@ -40,9 +40,9 @@ system's long-path policy on or off.
 
 ## Windows limitations
 
-- Pinned memory is capped by the driver under WDDM. When the whole arena cannot be registered,
-  the pinned slices are limited to the GPU's shared-memory budget (`RAM/2 - 8 GiB`), and the
-  start-up note says what was capped.
+- Pinned memory is capped by the driver under WDDM. Registration uses the visible adapters'
+  current DXGI non-local budgets, minus usage and room for later allocations. A driver refusal
+  stops the slice probe; startup reports the actual registered range. See [runtime details](windows-runtime.md).
 - Large pages need the "Lock pages in memory" privilege, which is granted to Administrators by
   default; locking the resident expert copy needs "Increase a process working set", which is
   granted to Users, so it works without elevation. The engine enables whichever its token holds.
@@ -84,3 +84,6 @@ If tests fail to create fixtures, point `TEMP` and `TMP` at a directory inside t
 CUDA 13.2 and later ship CCCL headers that `#error` under cl.exe's traditional preprocessor (C1189); the
 CMakeLists hands `/Zc:preprocessor` to nvcc's host compiler, verified on CUDA 13.4 and MSVC 19.44.
 Anything compiling these headers outside this CMakeLists needs the same flag.
+
+See [Windows runtime details](windows-runtime.md) for newer CUDA header flags, direct reads,
+resident registration, mapped-page trimming and tensor-map transport.
