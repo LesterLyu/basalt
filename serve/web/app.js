@@ -57,9 +57,9 @@ const baseLine = `<line x1="0" y1="100" x2="100" y2="100" stroke="var(--line)" s
 let gid = 0;
 // a sidebar chart: filled line between lo and hi; `limit` draws a dashed line at the top
 function sbChart(a, lo, hi, accent, limit) {
-  const id = `sbg${++gid}`, tint = accent ? "255,122,61" : "154,164,173";
+  const id = `sbg${onDevices() ? "d" : "o"}${++gid}`, tint = accent ? "255,122,61" : "154,164,173";
   const segs = lines(a, v => clamp(100 - (v - lo) / (hi - lo) * 100, 1, 99));
-  return `<div class="sb-ch"><svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">`
+  return `<div class="sb-ch"><svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="100%">`
     + `<stop offset="0" stop-color="rgba(${tint},.13)"/><stop offset="1" stop-color="rgba(${tint},.02)"/></linearGradient></defs>${baseLine}`
     + (limit ? `<line x1="0" y1="1" x2="100" y2="1" stroke="var(--basalt-500)" stroke-width="1" stroke-dasharray="2 3" vector-effect="non-scaling-stroke"/>` : "")
     + segs.map(p => area(p, `url(#${id})`) + poly(p, `stroke="${accent ? "var(--accent)" : "var(--fg-2)"}" stroke-width="1.5"`)).join("")
@@ -149,7 +149,6 @@ function sbTable(G, H, names) {
     + sbLoad(series("util"), mean, "Mean load") + sbPower(series("power"), sum("power"), sum("power_limit") || null) + `</div>`;
 }
 function drawSide(hw, st, hist, eng, r) {
-  gid = 0;
   const G = hw.gpus || [], H = Object.fromEntries((hist.gpus || []).map(x => [x.index, x]));
   const named = Object.fromEntries((st.gpus || []).map(g => [g.index, shortGpu(g.name)]));
   const title = g => `GPU ${g.index} · ${named[g.index] || "GPU"}`;
@@ -187,7 +186,7 @@ const SC = ["#FF7A3D", "#FFB547", "#F3D3B5", "#D9582A", "#FFD08A", "#C98A6B", "#
 const off = new Set();       // decode lines switched off: "t" (total) and slot numbers
 let offFor = 0;              // the slot count `off` was set up for
 let chip = "";
-function drawHero(live, hist, reqs, best, slots, total) {
+function drawHero(live, hist, reqs, best, slots, total, eng) {
   const multi = total > 1, generating = live.state === "generating", reading = live.state === "reading";
   // the live rate while generating, else the newest finished request's that has one
   const r = reqs[0], rd = reqs.find(x => num(x.decode_tok_s)), last = rd ? rd.decode_tok_s : null;
@@ -195,6 +194,13 @@ function drawHero(live, hist, reqs, best, slots, total) {
   text($("#dec-k"), liveDec ? (multi ? "Decode · All slots" : "Decode") : last != null ? "Decode · Last request" : "Decode");
   html($("#dec-v"), num(dec) ? `${dec.toFixed(1)}<small>tok/s</small>` : "-");
   $("#dec-v").classList.toggle("idle", !liveDec);
+
+  const draft = liveDec ? live : rd;
+  text($("#dec-accept"), draftAcceptance(eng, draft));
+  $("#dec-accept").hidden = !$("#dec-accept").textContent;
+  const phases = live.phases || [];
+  $("#dec-activity").hidden = !phases.length;
+  html($("#dec-activity"), phases.map(s => '<span>' + esc(s[0].toUpperCase() + s.slice(1)) + '</span>').join(""));
 
   if (offFor !== total) { offFor = total; off.clear(); if (total >= 4) off.add("t"); }
   const ss = multi ? Array.from({ length: total }, (_, k) => tail((hist.slot_tok_s || [])[k])) : [tail(hist.tok_s)];
@@ -415,9 +421,159 @@ function drawModels(models, shown) {
   if (focused) [...pop.children].find(b => b.dataset.v === focused && !b.disabled)?.focus();
 }
 
+/* ---- Devices ---- */
+const row = (label, value, unit = "", note = "") =>
+  '<div class="metric-row"><span>' + esc(label) + (note ? '<small>' + esc(note) + '</small>' : '') +
+  '</span><b class="num">' + esc(value) + (unit ? '<small>' + esc(unit) + '</small>' : '') + '</b></div>';
+const percent = (n, d, digits = 0) => num(n) && d > 0 ? (n / d * 100).toFixed(digits) + "%" : "-";
+const dash = "-";
+const bytes = n => !num(n) ? [dash, ""] : n >= 1024 ** 3 ? [gib(n), "GiB"] : [fmt(n / 1048576, 1), "MiB"];
+const memoryRow = (label, count, note) => row(label, ...bytes(count), note);
+const legend = (label, value, color) => '<div class="memory-item" style="--swatch:' + color + '">' +
+  memoryRow(label, value) + '</div>';
+const colors = ["#ff8047", "#68b5aa", "#71a7bd", "#83a9e5", "#b18acf", "#e6b569", "#d88e9b", "#82b189",
+  "#d59bcc", "#99b9c3", "#9ca9b8", "#837e9c"];
+const grouped = (label, content) => '<section class="device-section"><h3>' + label + '</h3>' + content + '</section>';
+const chart = (label, values, now, unit, ceiling, accent = false, decimals = 0, readout = null) => {
+  const series = tail(values), s = stats(series);
+  if (!num(now) && !s) return "";
+  return '<div class="device-chart">' + row(label, readout ?? (num(now) ? fmt(now, decimals) : dash), unit) +
+    sbChart(series, 0, ceiling > 0 ? ceiling : Math.max(1, (s?.max || 0) * 1.15), accent) + '</div>';
+};
+function usageBar(used, capacity, parts) {
+  if (!num(used) || !(capacity > 0)) return "";
+  const slices = parts && parts.length ? parts : [[used, "var(--accent)"]];
+  return '<div class="usage-bar" aria-hidden="true">' + slices.map(([n, color]) =>
+    '<i style="--share:' + (100 * clamp(n / capacity, 0, 1)).toFixed(4) + '%;--fill:' + color + '"></i>').join("") + '</div>';
+}
+function memoryMeter(label, used, total, free, parts) {
+  const quantity = num(used) ? gib(used) + (num(total) ? ' <span>/ ' + gib(total) + '</span>' : '') + ' <small>GiB</small>' : dash;
+  return '<div class="memory-meter"><div class="meter-label">' + label + ' <span>' + percent(used, total) +
+    '</span></div><div class="meter-value num">' + quantity + '</div>' + usageBar(used, total, parts) +
+    '<div class="meter-free">' + (num(free) ? gib(free) + ' GiB available' : 'Available memory unavailable') + '</div></div>';
+}
+const vramLabels = {weights: "Model weights", experts: "Expert cache", expert_helper: "Expert helper",
+  kv_state: "KV cache & state", scratch: "Scratch", mmq_buffers: "MMQ buffers", dense_prefill: "Dense prefill",
+  long_prefill: "Prefill workspace", dspark: "DSpark", mtp: "MTP", vision: "Vision workspace",
+  system_reserved: "System reserved", other_apps: "Other apps"};
+const hostLabels = {resident_experts: "Resident experts", expert_homes: "Evicted / borrowed experts",
+  checkpoints: "Conversation checkpoints", engram_workspace: "Engram workspace"};
+function memoryParts(parts, labels) {
+  return Object.entries(labels).flatMap(([key, label], i) =>
+    num(parts?.[key]) ? [[label, parts[key], colors[i % colors.length]]] : []);
+}
+function gpuCard(g, history, st) {
+  const b = g.vram_breakdown, entries = memoryParts(b?.components, vramLabels);
+  if (b && !b.pending_engine) entries.push(["Unattributed", b.unattributed, "var(--fg-3)"]);
+  const slices = b && num(b.unattributed) ? entries.filter(e => num(e[1])).map(e => e.slice(1)) : null;
+  const gen = g.pcie_gen ?? g.pcie_gen_max;
+  const link = num(gen) ? "Gen" + gen + (num(g.pcie_width) ? " ×" + g.pcie_width : "") : dash;
+  const power = num(g.power_limit) ? (num(g.power) ? fmt(g.power) + " W" : dash) + " / " + fmt(g.power_limit) + " W" : null;
+  const name = shortGpu(st?.name) || "NVIDIA GPU";
+  return '<article class="card device"><header class="device-head"><div><p>GPU ' + fmt(g.index) +
+    '</p><h2>' + esc(name) + '</h2></div><span class="badge">' + (num(g.temp) ? fmt(g.temp) + ' °C' : 'GPU') +
+    '</span></header>' + memoryMeter("VRAM", g.mem_used, g.mem_total, g.mem_free, slices) +
+    grouped("VRAM breakdown", entries.map(e => legend(...e)).join("") +
+      (b?.pending_engine ? '<p class="hint">Waiting for engine allocations.</p>' :
+        !entries.length ? '<p class="hint">Per-allocation data is not reported for this device.</p>' : "")) +
+    grouped("Activity", '<div class="chart-grid">' +
+      chart("Load", history.util, g.util, "%", 100, true) +
+      chart("Power", history.power, g.power, power ? "" : "W", g.power_limit, false, 0, power) +
+      chart("Temperature", history.temp, g.temp, "°C", 100) +
+      chart("VRAM used", (history.mem_used || []).map(v => num(v) ? v / 1024 ** 3 : null), num(g.mem_used) ? g.mem_used / 1024 ** 3 : null, "GiB", g.mem_total / 1024 ** 3, false, 1) +
+      '</div>' + row("PCIe link", link, "", num(g.pcie_gen_max) && g.pcie_gen_max !== gen ? "Max Gen" + g.pcie_gen_max : "") +
+      '<div class="chart-grid pcie">' + chart("RX to GPU", history.pcie_rx_mb, g.pcie_rx_mb, "MiB/s", null, false, 1) +
+      chart("TX from GPU", history.pcie_tx_mb, g.pcie_tx_mb, "MiB/s", null, false, 1) + '</div>' +
+      (!num(g.pcie_rx_mb) && !num(g.pcie_tx_mb) ? '<p class="hint">Bandwidth counters unavailable.</p>' : "")) + '</article>';
+}
+function hostCard(hw, st, hist) {
+  const ram = hw.ram_breakdown || {}, p = ram.processes || {}, parts = ram.engine_allocations || {};
+  const entries = memoryParts(parts, hostLabels);
+  const allocated = entries.reduce((sum, [, n]) => sum + n, 0);
+  const used = hw.ram_used, total = hw.ram_total;
+  const proc = [["engine", "Inference engine"], ["vision", "Vision process"], ["server", "API server"]];
+  const resident = proc.filter(([key]) => num(p[key]?.rss)).map(([key, label]) => memoryRow(label, p[key].rss)).join("");
+  const processStats = p.engine || {};
+  return '<article class="card device"><header class="device-head"><div><p>Host</p><h2>System memory</h2></div><span class="badge">RAM</span></header>' +
+    memoryMeter("Physical RAM", used, total, num(used) && num(total) ? total - used : null) +
+    grouped("Engine allocations", entries.length ? '<div class="allocation-bar">' +
+      usageBar(allocated, allocated, entries.map(e => e.slice(1))) + '</div>' +
+      entries.map(e => legend(...e)).join("") +
+      ((num(parts.pinned_experts) || num(parts.locked_experts)) ?
+        '<div class="subrows">' + (num(parts.pinned_experts) ? memoryRow("CUDA-registered", parts.pinned_experts) : "") +
+        (num(parts.locked_experts) ? memoryRow("OS locked", parts.locked_experts) : "") + '<p class="hint">Subsets of resident experts.</p></div>' : "") +
+      '<p class="hint">Allocated bytes can include paged-out memory.</p>' : '<p class="hint">This engine does not report RAM allocations.</p>') +
+    grouped("Process RAM · working set", (resident || '<p class="hint">Process counters unavailable.</p>') +
+      (num(processStats.peak_rss) ? memoryRow("Engine peak working set", processStats.peak_rss) : "") +
+      (num(processStats.private_commit) ? memoryRow("Engine private commit", processStats.private_commit) : "") +
+      (resident ? '<p class="hint">Working sets can overlap. Private commit can include paged-out memory.</p>' : "")) +
+    grouped("Host activity", row("Processor", shortCpu(st.cpu_name) || dash) +
+      row("Cores / threads", (num(st.cores) ? fmt(st.cores) : dash) + " / " + (num(st.threads) ? fmt(st.threads) : dash)) +
+      row("Disk read", num(hw.disk_read_mb) ? fmt(hw.disk_read_mb, 1) : dash, "MiB/s") +
+      '<div class="chart-grid">' + chart("CPU load", hist.cpu, hw.cpu, "%", 100, true) +
+      chart("RAM used", (hist.ram_used || []).map(v => num(v) ? v / 1024 ** 3 : null), num(used) ? used / 1024 ** 3 : null, "GiB", total / 1024 ** 3, false, 1) +
+      '</div>') + '</article>';
+}
+function drawDevices(hw, st, hist) {
+  const cards = Object.fromEntries((st.gpus || []).map(x => [x.index, x]));
+  const series = Object.fromEntries((hist.gpus || []).map(x => [x.index, x]));
+  text($("#device-driver"), [st.driver ? "Driver " + st.driver : "", st.cuda ? "CUDA " + st.cuda : ""].filter(Boolean).join(" · ") || "Last 60 seconds");
+  const gpus = (hw.gpus || []).map(g => gpuCard(g, series[g.index] || {}, cards[g.index]));
+  html($("#device-grid"), gpus.join("") + hostCard(hw, st, hist) +
+    (!gpus.length ? '<div class="card empty">No GPU telemetry available.</div>' : ""));
+}
+
+
+function draftAcceptance(eng, sample) {
+  return sample?.drafts_offered > 0
+    ? (eng.architecture === "deepseek41" ? "DSpark" : "MTP") + " accept " + percent(sample.drafts_accepted, sample.drafts_offered) : "";
+}
+function drawDeviceInference(live, eng, hist, reqs) {
+  const active = live.state === "generating" && num(live.tok_s);
+  const last = reqs.find(r => num(r.decode_tok_s));
+  const rate = active ? live.tok_s : last?.decode_tok_s;
+  const acceptance = draftAcceptance(eng, active ? live : last);
+  const samples = tail(hist.tok_s), scale = nice(Math.max(40, ...samples.filter(num)));
+  text($("#device-decode-source"), active ? "Live" : last ? "Last request" : "Idle");
+  html($("#device-decode-rate"), '<span>' + (num(rate) ? fmt(rate, 1) + ' <small>tok/s</small>' : dash) + '</span>' +
+    (acceptance ? '<small>' + acceptance + '</small>' : ''));
+  html($("#device-decode-chart"), sbChart(samples, 0, scale, true));
+
+  const phases = live.phases || [];
+  const reading = live.state === "reading" || phases.includes("reading the prompt");
+  const readOf = r => (r.prompt_tokens || 0) - (r.reused || 0);
+  const lastPrompt = reqs.find(r => r.prompt_ms > 0 && readOf(r) > 0);
+  const prefill = reading ? live.prefill_tok_s_mean : lastPrompt ? readOf(lastPrompt) * 1000 / lastPrompt.prompt_ms : null;
+  const prefillSamples = tail(hist.prefill_tok_s_mean);
+  text($("#device-prefill-source"), reading ? "Live" : lastPrompt ? "Last request" : "Idle");
+  html($("#device-prefill-rate"), prefill > 0 ? fmt(prefill) + ' <small>tok/s</small>' : dash);
+  html($("#device-prefill-chart"), sbChart(prefillSamples, 0, nice(Math.max(1000, ...prefillSamples.filter(num))), false));
+
+  const actions = {
+    reading: "Reading the prompt", generating: "Generating", unloaded: "Model unloaded", asleep: "Asleep", idle: "Idle",
+    loading: live.load?.kind === "wake" ? "Waking up" : "Loading weights",
+  };
+  const action = phases.length ? phases.map(s => s.charAt(0).toUpperCase() + s.slice(1)).join(" · ") : actions[live.state] || "Idle";
+  text($("#device-engine-action"), action);
+}
+const onDevices = () => location.hash === "#devices";
+function showPage() {
+  const devices = onDevices();
+  $("#overview").hidden = devices;
+  $("#devices").hidden = !devices;
+  for (const a of document.querySelectorAll("[data-page]")) {
+    if ((a.dataset.page === "devices") === devices) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  }
+  window.scrollTo(0, 0);
+  $("#devices").scrollTop = 0;
+  draw();
+}
+
 /* ---- the whole page ---- */
 function draw() {
   if (!M) return;
+  gid = 0;
   const live = M.live || {}, eng = M.engine || {}, hist = M.history || {}, reqs = M.requests || [];
   const total = (live.slots || {}).total || 1, slots = M.slots || [];
   const name = (live.state || "idle")[0].toUpperCase() + (live.state || "idle").slice(1);
@@ -434,9 +590,14 @@ function draw() {
   drawModels(models, eng.model);
   chip = cacheChip(M.conversation, live);
   drawTotals(M.totals);
-  drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
-  drawHero(live, hist, reqs, M.best || {}, slots, total);
-  drawMain(live, hist, reqs, slots, total);
+  if (onDevices()) {
+    drawDevices(M.hardware || {}, M.hardware_static || {}, hist);
+    drawDeviceInference(live, eng, hist, reqs);
+  } else {
+    drawSide(M.hardware || {}, M.hardware_static || {}, hist, eng, reqs[0]);
+    drawHero(live, hist, reqs, M.best || {}, slots, total, eng);
+    drawMain(live, hist, reqs, slots, total);
+  }
 }
 
 /* ---- logs ---- */
@@ -477,15 +638,17 @@ let lastLog = 0;
 async function pollMetrics() {
   try {
     const m = await get("metrics");
-    m.slots = await get("slots").catch(() => []);
+    if (!onDevices()) m.slots = await get("slots").catch(() => []);
     M = m; $("#auth").hidden = true; draw();
   } catch (e) {
     $("#auth").hidden = !e.locked; M = null;
     setState("offline", e.locked ? "Locked" : "Offline");
+    text($("#device-engine-action"), e.locked ? "Locked" : "Offline");
   }
   setTimeout(pollMetrics, 1000);
 }
 async function pollLog() {
+  if (onDevices()) { setTimeout(pollLog, 1000); return; }
   try {
     const r = await get(`api/logs?after=${lastLog}`);
     if (r.last < lastLog) { lastLog = 0; clearLog("The server restarted."); }
@@ -500,4 +663,6 @@ $("#auth").onsubmit = e => {
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
+window.addEventListener("hashchange", showPage);
+showPage();
 pollMetrics(); pollLog();

@@ -14,6 +14,10 @@
 
 <header class="bar">
   <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Basalt</span></div>
+  <nav class="dashboard-nav" aria-label="Dashboard">
+    <a href="#overview" data-page="overview" aria-current="page">Overview</a>
+    <a href="#devices" data-page="devices">Devices</a>
+  </nav>
   <div class="crumb">
     <span class="crumb-sep" id="crumb-sep" hidden>/</span>
     <span class="model" id="model"></span>
@@ -34,7 +38,7 @@
   <button>Connect</button>
 </form>
 
-<main class="lay">
+<main class="lay" id="overview">
   <aside class="a-side sb" aria-label="Hardware">
     <div class="sb-h">GPUs<span>Charts · Last 60 s</span></div>
     <div class="sb-gpus" id="gpus"></div>
@@ -53,7 +57,11 @@
     <div class="trio">
       <div class="dec">
         <div class="k" id="dec-k">Decode</div>
-        <div class="v big" id="dec-v">-</div>
+        <div class="dec-readout">
+          <div class="v big" id="dec-v">-</div>
+          <span id="dec-accept" hidden></span>
+        </div>
+        <div id="dec-activity" hidden></div>
         <div class="ch" id="chips" hidden></div>
         <div class="cw" id="dec-chart"></div>
       </div>
@@ -80,6 +88,34 @@
     <div class="hd lh"><b>Logs</b><span id="log-count"></span></div>
     <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
   </section>
+</main>
+
+<main id="devices" class="devices-page" aria-labelledby="devices-title" hidden>
+  <div class="devices-inner">
+    <div class="devices-heading">
+      <div>
+        <h1 id="devices-title">Devices</h1>
+        <p>GPU, CPU and memory telemetry · 60-second charts</p>
+        <span class="badge" id="device-driver">Live readings</span>
+      </div>
+      <section class="card device-inference" aria-label="Inference speed and activity">
+        <div class="device-inference-speed">
+          <div>
+            <div class="device-speed-label"><b>Decode</b><span id="device-decode-source"></span></div>
+            <div class="num device-speed-rate" id="device-decode-rate">—</div>
+            <div id="device-decode-chart"></div>
+          </div>
+          <div>
+            <div class="device-speed-label"><b>Prefill</b><span id="device-prefill-source"></span></div>
+            <div class="num device-speed-rate" id="device-prefill-rate">—</div>
+            <div id="device-prefill-chart"></div>
+          </div>
+        </div>
+        <div class="device-engine-status"><span>Engine</span><b id="device-engine-action" role="status">Connecting</b></div>
+      </section>
+    </div>
+    <div class="device-grid" id="device-grid"><div class="card empty">Waiting for hardware readings…</div></div>
+  </div>
 </main>
 
 </body>

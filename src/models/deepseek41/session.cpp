@@ -77,6 +77,13 @@ public:
         if (stream_) cudaStreamDestroy(stream_);
     }
 
+    void memory_usage(core::MemoryUsage& usage) const override {
+        usage.device(m_.device(), "scratch", allocated_bytes_);
+        if (ops_) ops_->memory_usage(usage);
+        if (prefill_) prefill_->memory_usage(usage);
+        if (vis_) usage.device(m_.device(), "vision", vis_->device_bytes());
+        if (drafter_) usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
+    }
     bool init(std::string& err) {
         // the layer's chain runs ahead of the mixes branch, one step below the attention's branches, which hold the chain
         // up on the compressor's layers (graph nodes keep their stream's priority)
@@ -100,6 +107,7 @@ public:
             void* v = nullptr;
             if (cudaMalloc(&v, floats * sizeof(float)) != cudaSuccess) return false;
             allocs_.push_back(v);
+            allocated_bytes_ += floats * sizeof(float);
             p = (float*) v;
             return true;
         };
@@ -138,22 +146,22 @@ public:
         void* v = nullptr;
         ok = ok && cudaMalloc(&v, 64 * sizeof(int32_t)) == cudaSuccess;
         ids_ = (int32_t*) v;
-        if (v) allocs_.push_back(v);
+        if (v) { allocs_.push_back(v); allocated_bytes_ += 64 * sizeof(int32_t); }
         v = nullptr;
         ok = ok && cudaMalloc(&v, W * sizeof(int32_t)) == cudaSuccess;
         am_dev_ = (int32_t*) v;
-        if (v) allocs_.push_back(v);
+        if (v) { allocs_.push_back(v); allocated_bytes_ += W * sizeof(int32_t); }
         v = nullptr;
         ok = ok && cudaMalloc(&v, argmax_workspace_bytes()) == cudaSuccess && cudaMemset(v, 0, argmax_workspace_bytes()) == cudaSuccess;
         am_ws_ = v;
-        if (v) allocs_.push_back(v);
+        if (v) { allocs_.push_back(v); allocated_bytes_ += argmax_workspace_bytes(); }
         ok = ok && cudaHostAlloc((void**) &h_next_, W * sizeof(int32_t), cudaHostAllocPortable) == cudaSuccess &&
              cudaHostAlloc((void**) &h_emb4_, 4 * n * W * sizeof(float), cudaHostAllocPortable) == cudaSuccess;
         v = nullptr;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), W), 1 << 16);
         ok = ok && cudaMalloc(&v, q8) == cudaSuccess;
         q8_ = v;
-        if (v) allocs_.push_back(v);
+        if (v) { allocs_.push_back(v); allocated_bytes_ += q8; }
         if (!ok) {
             err = "out of device memory for the session";
             return false;
@@ -656,6 +664,7 @@ private:
             void* v = nullptr;
             if (cudaMalloc(&v, bytes) != cudaSuccess) { err = "out of device memory for a logit bias"; return false; }
             allocs_.push_back(v);
+            allocated_bytes_ += bytes;
             dev = (float*) v;
         }
         if (cudaMemcpy(dev, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
@@ -681,6 +690,7 @@ private:
                 void* v = nullptr;
                 if (cudaMalloc(&v, (size_t) kHistoryCap * kMaxWindow * sizeof(int32_t)) != cudaSuccess) { err = "out of device memory for the penalties"; return false; }
                 allocs_.push_back(v);
+                allocated_bytes_ += (size_t) kHistoryCap * kMaxWindow * sizeof(int32_t);
                 d_hist_ = (int32_t*) v;
             }
             if (cudaMemcpy(d_hist_, r.history, (size_t) r.n_tokens * history_len_ * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -1143,6 +1153,7 @@ private:
     int vis_merge_ = 3, vis_min_pixels_ = 0;
     bool vis_borrowed_ = false;
     std::vector<void*> allocs_;
+    uint64_t allocated_bytes_ = 0;
     std::vector<int32_t> hist_;
     std::string dump_dir_, err_;
     int64_t whole_from_ = 0;   ///< the first position to save at or go back to, after a read that left rows short (prefillp::whole_from)

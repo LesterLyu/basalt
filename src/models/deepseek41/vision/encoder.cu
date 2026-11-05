@@ -157,6 +157,7 @@ struct VisionEncoder::Impl {
     };
     std::vector<Layer> L;
     std::vector<void*> owned;
+    uint64_t weight_bytes = 0, work_bytes = 0;
     float *wpatch = nullptr, *bpatch = nullptr, *postw = nullptr, *b1 = nullptr, *b2 = nullptr, *start = nullptr, *endv = nullptr, *nl = nullptr;
     __nv_bfloat16 *w1 = nullptr, *w2 = nullptr;
     std::vector<void*> work;
@@ -175,6 +176,7 @@ struct VisionEncoder::Impl {
         void* p = nullptr;
         if (cudaMalloc(&p, t->bytes) != cudaSuccess) return nullptr;
         owned.push_back(p);
+        weight_bytes += t->bytes;
         if (cudaMemcpy(p, t->data, t->bytes, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
         return (T*) p;
     }
@@ -183,6 +185,7 @@ struct VisionEncoder::Impl {
         void* p = nullptr;
         if (cudaMalloc(&p, count * sizeof(T)) != cudaSuccess) return nullptr;
         work.push_back(p);
+        work_bytes += count * sizeof(T);
         return slot = (T*) p;
     }
 
@@ -247,6 +250,7 @@ struct VisionEncoder::Impl {
         if (n <= cap && ng <= ng_cap && ntok <= tok_cap) return true;
         for (void* p : work) cudaFree(p);
         work.clear();
+        work_bytes = 0;
         cap = std::max(n, cap);
         ng_cap = std::max(ng, ng_cap);
         tok_cap = std::max(ntok, tok_cap);
@@ -261,6 +265,7 @@ struct VisionEncoder::Impl {
 VisionEncoder::VisionEncoder() : impl_(new Impl) {}
 VisionEncoder::~VisionEncoder() = default;
 int VisionEncoder::width() const { return impl_->proj; }
+uint64_t VisionEncoder::device_bytes() const { return impl_->weight_bytes + impl_->work_bytes; }
 
 struct VisionBlas::Impl {
     cublasHandle_t blas = nullptr;

@@ -26,6 +26,19 @@
 #include <vector>
 
 namespace basalt::models::deepseek41 {
+
+void ExpertTier::memory_usage(core::MemoryUsage& usage) const {
+    if (!usage.claim(this)) return;
+    usage.device(m_.device(), "experts", cache_.mapped_bytes() + ext_.mapped_bytes());
+    if (peer_) usage.device(peer_->device(), "expert_helper", peer_->cache().mapped_bytes());
+    for (size_t l = 0; l < ram_.size(); ++l)
+        if (ram_[l]) usage.host["resident_experts"] += (uint64_t) (cover_ + 1) * m_.pack().experts[l].blob_bytes;
+    for (const auto& pin : ram_pins_) {
+        usage.host["pinned_experts"] += pin.registered_bytes;
+        usage.host["locked_experts"] += pin.locked_bytes;
+    }
+}
+
 namespace {
 
 constexpr size_t kMaxPending = 128;              // copies claimed a window

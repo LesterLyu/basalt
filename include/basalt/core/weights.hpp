@@ -146,12 +146,15 @@ public:
     bool rebind(const std::string& name, const void* data);
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
+    uint64_t native_weight_bytes() const { return native_weight_bytes_; }
+    uint64_t native_scratch_bytes() const { return native_scratch_bytes_; }
 
 private:
     friend class NativeDense;
     friend struct WeightTableFixture;   // builds a table row by row for the shape-check test
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
+    uint64_t native_weight_bytes_ = 0, native_scratch_bytes_ = 0;
 };
 
 }  // namespace basalt::core

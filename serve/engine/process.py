@@ -113,7 +113,7 @@ def relay_auto_flags(line: str) -> bool:
 
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
-PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
+PROTOCOL_LINES = (AUTO_FLAGS, "MEMORY ", "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
                   "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
 
 
@@ -247,6 +247,7 @@ class ProcessEngine:
         self.can_stop = False            # READY <ctx> stop
         self.last = {}
         self.slot_drafts = {}
+        self._memory_snapshot = ({}, {})
         self.info = {}                   # INFO key=value facts
         self.video = None                # the in-engine encoder's VIDEO line: "on ..." or "off <reason>"
         self.conversation = {}           # the cache's figures from the engine's CONV lines; this process's only
@@ -303,6 +304,9 @@ class ProcessEngine:
             if line is None:
                 break
             if relay_auto_flags(line):
+                continue
+            if line.startswith("MEMORY "):
+                self._note_memory(line)
                 continue
             if line.startswith("INFO "):
                 self.info.update(info_facts(line))
@@ -401,6 +405,10 @@ class ProcessEngine:
         for line in proc.stdout:
             line = engine_line(line)
             log_unparsed(line, log)
+            if line.startswith("MEMORY "):
+                if self.proc is proc:
+                    self._note_memory(line)
+                continue
             if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
                 continue
             if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
@@ -434,6 +442,27 @@ class ProcessEngine:
         lines.put(None)
         for q in slot_q:
             q.put(None)
+
+    def _note_memory(self, line: str) -> None:
+        try:
+            snapshot = json.loads(line[7:])
+            def parts(value):
+                if not isinstance(value, dict) or any(not isinstance(k, str) or type(v) is not int or v < 0
+                                                      for k, v in value.items()):
+                    raise ValueError("invalid allocation counters")
+                return dict(value)
+            gpus = {int(k): parts(v) for k, v in snapshot["gpus"].items()}
+            if any(k < 0 for k in gpus):
+                raise ValueError("invalid device")
+            self._memory_snapshot = (gpus, parts(snapshot["host"]))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pass
+
+    def vram_usage(self) -> dict:
+        return {k: dict(v) for k, v in getattr(self, "_memory_snapshot", ({}, {}))[0].items()}
+
+    def ram_usage(self) -> dict:
+        return dict(getattr(self, "_memory_snapshot", ({}, {}))[1])
 
     def death_note(self) -> str:
         """What is known of why the engine ended: its exit code or signal and its last error line, never a guess."""

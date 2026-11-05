@@ -68,7 +68,7 @@ public:
     void stamp_before_commit() { basalt::core::decode_events().stamp(9); }
     bool commit(int keep, std::string& e, int phase) { return cv->commit(keep, e, phase); }
     void on_token(int32_t tok) { if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(tok); }
-    void count_round() { ++runtime_.rounds; }
+    void count_round() { ++runtime_.rounds; runtime_.report_memory(); }
     template <class After>
     bool draft_next(int T, int a, int e0, int TB, bool from_sfx, bool hold, bool will_draft, After& after_launch);
     bool draft_fatal() const { return draft_failed; }

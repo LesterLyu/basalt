@@ -156,6 +156,8 @@ public:
     int init_after_input() override;
     void after_input_start() override;
     void print_info() override;
+    void memory_usage(basalt::core::MemoryUsage& usage) const override;
+    bool memory_report_ready() const override { return !ba_job; }
     void at_exit() override;
     bool windows_in_flight() override;
     bool next_batch_window() override;

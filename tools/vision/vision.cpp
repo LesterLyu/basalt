@@ -155,7 +155,11 @@ int main(int argc, char** argv) {
     }
     const int n_embd = mp.hp().proj;
     std::printf("%s\n", video_line().c_str());
-    std::printf("READY %d\n", n_embd);
+    size_t vram_bytes = 0;
+#ifdef BASALT_VISION_CUDA
+    if (gpu) vram_bytes = cuda.device_bytes();
+#endif
+    std::printf("READY %d vram_bytes=%zu\n", n_embd, vram_bytes);
     std::fflush(stdout);
 
     std::string line;

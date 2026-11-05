@@ -583,6 +583,7 @@ int QfnRuntime::init_conversations() {
         // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
         const int64_t done = p0 + T;
         pp_reached = done;
+        report_memory();
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
         std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
                     ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);

@@ -246,6 +246,13 @@ Context::Context() {
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
+size_t Context::allocated_bytes() const {
+    const auto& ctx = *(ggml_backend_cuda_context*) ctx_;
+    size_t bytes = 0;
+    for (const auto& pool : ctx.pools) if (pool) bytes += pool->allocated_bytes();
+    return bytes;
+}
+
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;

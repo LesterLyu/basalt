@@ -113,11 +113,16 @@ public:
         return 0;
     }
     void print_info() override {
+        std::printf("INFO architecture=%s\n", model_.desc().arch.c_str());
         const std::string slots = o.batch > 0 ? " batch_slots=" + std::to_string(o.batch) + " slot_cache=" +
                                                     std::to_string(o.prompt_cache > 0 ? 1 : 0) + " slot0_solo=1 solo_any_slot=1"
                                               : std::string();
         std::printf("INFO logit_bias=%lld context=%lld spec=%d mtp_max=0 lookup=0%s engine=" BASALT_VERSION "\n",
                     (long long) n_vocab, (long long) o.max_context, o.spec, slots.c_str());
+    }
+    void memory_usage(basalt::core::MemoryUsage& usage) const override {
+        model_.memory_usage(usage);
+        for (const auto& s : sessions_) s->memory_usage(usage);
     }
     bool windows_in_flight() override { return false; }
     bool next_batch_window() override;
@@ -421,7 +426,7 @@ public:
         return true;
     }
     void on_token(int32_t) {}
-    void count_round() {}
+    void count_round() { rt_.report_memory(); }
     // The next window's drafts start before this window's tokens go out, which run in their shadow.
     template <class After>
     bool draft_next(int T, int a, int, int, bool, bool, bool will_draft, After& after_launch) {
@@ -699,7 +704,7 @@ Flow SessionRequest::read_to(int64_t to) {
             pr.rows_after = to - end;
             pr.more = end < n - 1;
             const int64_t base = at;
-            pr.progress = [this, base](int k) { progress_line("PP", base + k); basalt::core::progress_beat(); };
+            pr.progress = [this, base](int k) { progress_line("PP", base + k); basalt::core::progress_beat(); rt_.report_memory(); };
             pr.live = [this, base](int k) {
                 basalt::core::progress_beat();
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();

@@ -546,6 +546,8 @@ public:
     /// set by `open` when the RAM available is less than the arena needs (a recommendation; it still loads)
     const std::string& ram_warning() const { return ram_warning_; }
     double load_gib_per_second() const { return gib_per_s_; }
+    uint64_t pinned_bytes() const { return pinned_bytes_; }
+    uint64_t locked_bytes() const;
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned

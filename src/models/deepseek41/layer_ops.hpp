@@ -1,6 +1,7 @@
 // src/models/deepseek41/layer_ops.hpp - the parts of a layer that other kernel groups provide: attention, the routed
 // experts and the shared expert. The layer loop calls these; the default implementation reports what is missing.
 #pragma once
+#include "basalt/core/memory_usage.hpp"
 
 #include "basalt/core/conversation_cache.hpp"
 
@@ -16,6 +17,7 @@ class ExpertTier;
 class LayerOps {
 public:
     virtual ~LayerOps() = default;
+    virtual void memory_usage(core::MemoryUsage&) const {}
     /// Attention of `layer` for the token at `pos`. `x` is the normed sublayer input [n_embd] (device); the result
     /// goes to `out` [n_embd] (device), after the output projection.
     virtual bool attention(int layer, int64_t pos, int32_t token, const float* x, float* out, void* stream,

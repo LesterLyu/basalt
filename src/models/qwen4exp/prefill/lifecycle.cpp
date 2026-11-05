@@ -168,6 +168,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
+    o.allocated_bytes = &m.allocated_bytes;
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
         void* ws = o.take<uint8_t>(GEMM_WS, ok);
@@ -180,6 +181,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     return true;
 }
+
+uint64_t Prefill::allocated_bytes() const { return impl_ ? impl_->allocated_bytes : 0; }
+uint64_t Prefill::mmq_bytes() const { return impl_ && impl_->mmq_ctx ? impl_->mmq_ctx->allocated_bytes() : 0; }
 
 // Every device buffer of a chunk of T tokens, from the Alloc `alloc` (after the GEMM scratch and workspace): `init`
 // once, and `relayout` for a request's own chunk.  The order is `bytes_needed`'s.

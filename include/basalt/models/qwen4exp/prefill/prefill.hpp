@@ -120,6 +120,8 @@ public:
     void set_ple_warm(const int64_t* tokens, int64_t run_pos0, int64_t from, int64_t to);
 
     const PrefillStats& stats() const { return stats_; }
+    uint64_t allocated_bytes() const;
+    uint64_t mmq_bytes() const;
 
     /// Starts counting, per (layer, expert), the routed entries of the prompt rows this stage and the stages after it
     /// read, from zero.  Call with the stream idle (between requests).

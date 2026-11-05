@@ -149,6 +149,7 @@ public:
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
+    uint64_t scratch_bytes() const { return arena_ ? arena_bytes_ : 0; }
     /// The window capacity in rows given to init.  A batch planner must never build a window with more rows than this;
     /// kVerifyMaxT only bounds the graphs, not this verifier.
     int max_t() const { return max_t_; }
@@ -660,6 +661,7 @@ private:
 
     // device
     void* arena_ = nullptr;
+    uint64_t arena_bytes_ = 0;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;

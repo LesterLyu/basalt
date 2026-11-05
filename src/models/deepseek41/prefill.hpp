@@ -1,5 +1,6 @@
 // src/models/deepseek41/prefill.hpp - batched prompt processing for DeepSeek-V4.1: a chunk of tokens per layer call.
 #pragma once
+#include "basalt/core/memory_usage.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -15,6 +16,7 @@ class LayerOps;
 class Prefill {
 public:
     virtual ~Prefill() = default;
+    virtual void memory_usage(core::MemoryUsage&) const {}
     /// Optional: called after each chunk with the tokens of the current run read so far.
     std::function<void(int)> progress;
     /// Optional: called from a driver thread as each layer of a chunk finishes on the GPU, with an estimate of the
