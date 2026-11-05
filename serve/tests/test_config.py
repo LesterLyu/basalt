@@ -84,6 +84,15 @@ def engine_parser_flags() -> dict:
 
 
 class ConfigFile(unittest.TestCase):
+    def test_single_request_staging_switch(self):
+        known = engine_parser_flags()
+        for enabled in (False, True):
+            cfg = load_config_file(conf({"version": 2, "models": [{"model": "m.basalt"}],
+                                         "engine": {"single-request-staging": enabled}}), build_parser())
+            words = cfg.models[0].shared_words
+            self.assertEqual(words, ["--single-request-staging"] if enabled else [])
+            check_engine_flags(words, known, "staging config")
+
     def test_blocks(self):
         cfg = load_config_file(conf({"version": 2, "server": {"port": 9000, "lazy": False, "allowed-host": ["a", "b"]},
                                      "engine": {"--kv": "int8", "resident-experts": True, "vision": 2},

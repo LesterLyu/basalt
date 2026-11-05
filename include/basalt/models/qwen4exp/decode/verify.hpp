@@ -132,6 +132,8 @@ public:
     void set_route_prior(float lambda) { route_prior_ = lambda; }
     /// What the routing changes did since the start, one line each; empty when none applied.
     std::vector<std::string> route_report() const;
+    /// Before init: extend the batch window's PCIe staged share to single-request windows.
+    void set_single_request_staging(bool enabled) { single_request_staging_ = enabled; }
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -400,6 +402,7 @@ private:
     std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;
+    bool single_request_staging_ = false;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
     // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does

@@ -46,6 +46,7 @@ struct Options : CommonOptions {
     /// stage events include every gap where the GPU waited for the host.
     bool graph_only = false;
     bool gpu_only_full = false;   ///< pre + post + head, the true per-token GPU floor
+    bool single_request_staging = false; ///< PCIe staging in single-request decode windows
     bool full_resident_experts = false; ///< retain every expert in the resident RAM arena
     bool mmap_experts = false;    ///< opt OUT of the resident arena, back to a file mapping
     std::string shared_expert_arena; ///< optional file backing for the resident arena shared by processes

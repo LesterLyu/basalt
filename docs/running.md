@@ -93,3 +93,7 @@ identical embeddings.
 
 `dynamic` borrows the cache's last slots per image and refills them afterwards (about 70 ms), so the cache is identical after. Which
 images a request may name: [image sources](configuration/image-sources.md). An image may not sit in a system prompt.
+
+`--single-request-staging` (Flash-Next engine) opts single-request windows into the batch PCIe staging policy.
+It is off by default and stages only mapped RAM experts; it does not replace the adaptive expert cache.
+CPU/GPU placement can change rounding.
