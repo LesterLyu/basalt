@@ -648,11 +648,11 @@ def _closes_again(rest: str, final: bool) -> bool | None:
     return False if final or opener >= 0 else None
 
 
-def param_end(text: str, final: bool = False, name: str | None = None) -> int:
+def param_end(text: str, final: bool = False, name: str | None = None, *, start: int = 0, value_start: int = 0) -> int:
     """Find a structural parameter close, keeping quoted calls, a reopened parameter and a quoted whole call close
     inside its value. -1: none yet; -2: candidate awaiting more output. `final` falls back to the plain structural
     close."""
-    at = text.find(PARAM_END)
+    at = text.find(PARAM_END, start)
     fallback = -1
     while at >= 0:
         after = text[at + len(PARAM_END):].lstrip()
@@ -675,7 +675,7 @@ def param_end(text: str, final: bool = False, name: str | None = None) -> int:
         elif not after or PARAM_START.startswith(after) or FUNC_END.startswith(after):
             candidate = at if final else -2
         if candidate != -1:
-            if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+            if len(_QUOTED_OPEN.findall(text, value_start, at)) <= text.count(FUNC_END, value_start, at):
                 return candidate
             if fallback < 0:
                 fallback = at
@@ -1086,6 +1086,8 @@ class OutputParser(CodeTracker):
 
     def _reset_scan(self):
         self.sp = 0                  # consumed part of self.buf (the call body)
+        self.call_search = 0         # new call terminators, including a split suffix
+        self.param_search = 0        # raw values stay buffered, but rejected terminators need not be rescanned
         self.ss = "name"             # name -> between -> str|raw -> ... -> done
         self.scall = None            # the ToolCall being streamed
         self.sfirst = True
@@ -1102,7 +1104,7 @@ class OutputParser(CodeTracker):
             if s:
                 out.append(Event("tool_args", s, call=self.scall))
         while True:
-            rest = self.buf[self.sp:]
+            rest = self.buf[self.sp:] if self.ss != "raw" else ""
             if self.ss == "name":
                 a = rest.find("<function=")
                 b = rest.find(">", a + 10) if a >= 0 else -1
@@ -1126,6 +1128,7 @@ class OutputParser(CodeTracker):
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
+                    self.param_search = self.sp
                     self.spname = pname
                     text, null = _text_kinds(self.sdeclared.get(pname))
                     if text and not null:
@@ -1167,16 +1170,19 @@ class OutputParser(CodeTracker):
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest, final=final, name=self.spname)
+                end = param_end(self.buf, final=final, name=self.spname,
+                                start=self.sp if final else self.param_search, value_start=self.sp)
                 if end < 0:
+                    self.param_search = self.buf.rfind(PARAM_END, self.param_search) if end == -2 else \
+                        max(self.sp, len(self.buf) - len(PARAM_END) + 1)
                     return out
-                value = rest[:end]
+                value = self.buf[self.sp:end]
                 if value.startswith("\n"):
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
                 args(json.dumps(_decode_param(value, self.sdeclared.get(self.spname)), ensure_ascii=False))
-                self.sp += end + len(PARAM_END)
+                self.sp = end + len(PARAM_END)
                 self.ss = "between"
             else:
                 return out
@@ -1287,7 +1293,9 @@ class OutputParser(CodeTracker):
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
-                i = call_end(self.buf, final=final)
+                # A complete call can only appear when a new closing tag arrives.
+                i = call_end(self.buf, final=final) if final or self.buf.find(CALL_END, self.call_search) >= 0 else -1
+                self.call_search = max(0, len(self.buf) - len(CALL_END) + 1)
                 if self.stream_tools:
                     if i >= 0:
                         # scan only the call, closed: its </tool_call> tells a quoted close inside a value

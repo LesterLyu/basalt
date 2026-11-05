@@ -12,6 +12,7 @@ class Dialect:
     forced_call_ends_reply = False          # a named tool_choice ends the reply after its one call
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     call_newlines = 2                       # newlines the model writes between its thinking and a call
+    tool_repair_turn = ""                   # an optional corrective turn for orphaned tool-call syntax
     image_pad = "<|image_pad|>"             # the prompt token that stands for one row of an image's embeddings
     image_start = "<|vision_start|>"        # the token an image's pad run follows ("" : every pad is an image row)
     video_pad = ""                          # the prompt token for one row of a video group ("": the model reads no video)
@@ -32,6 +33,10 @@ class Dialect:
         out = dict(kwargs)
         out["preserve_thinking"] = out.pop("preserve_reasoning")
         return out
+
+    def tool_repair_needed(self, parser, text: str) -> bool:
+        """Whether an unannounced, malformed call needs one corrective turn."""
+        return False
 
     def effort_level(self, level):
         """The frontend's reasoning level (low, medium, high, max or a number) as this model's template takes it."""
