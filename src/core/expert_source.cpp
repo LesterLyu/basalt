@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <filesystem>
 #include <sstream>
 #include <limits>
@@ -455,6 +456,7 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
     path_ = path;
     view_ = std::move(*view_map);
     file_off_ = experts.offset;
+    file_path_ = path;
     base_ = view_.data();
     blobs_ = (int64_t) blob_count;
     n_layers_ = n_layers;
@@ -467,6 +469,7 @@ bool FileExpertSource::open(const FileRange& experts, int64_t n_layers, int64_t 
 
 void FileExpertSource::close() {
     repin_join();
+    advise_worker_.reset();
     if (complement_arena_ != nullptr) {
         if (complement_allocation_.allocation_pinned()) complement_allocation_.reset();
         else if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
@@ -515,8 +518,6 @@ void FileExpertSource::close() {
     complement_arena_ = nullptr;
     complement_host_ = nullptr;
     complement_device_ = nullptr;
-    complement_slice_at_.clear();
-    complement_slice_dev_.clear();
     complement_bytes_ = 0;
     complement_offsets_.clear();
     ++places_gen_;
@@ -526,6 +527,8 @@ void FileExpertSource::close() {
     pin_state_.reset();
     complement_partial_ = false;
     complement_pin_limit_ = 0;
+    complement_slice_at_.clear();
+    complement_slice_dev_.clear();
     complement_lock_off_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
@@ -539,6 +542,8 @@ void FileExpertSource::close() {
     fd_ = -1;
     path_.clear();
     base_ = nullptr;
+    file_path_.clear();
+    file_detached_ = false;
     blobs_ = 0;
     n_layers_ = 0;
     n_expert_ = 0;
@@ -559,6 +564,22 @@ bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 
 bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const {
     if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    if (file_detached_) {
+        uint64_t offset = 0, bytes = 0;
+        if (!blob_range(layer, expert, offset, bytes)) return false;
+        const uint64_t pos = file_off_ + offset;
+        constexpr uint64_t align = 4096;
+        const uint64_t first = pos - pos % align;
+        const uint64_t span = ((pos - first + bytes + align - 1) / align) * align;
+        const int direct = platform::open_unbuffered(file_path_);
+        void* stage = direct >= 0 ? platform::DirectFile::alloc_aligned((size_t) span) : nullptr;
+        const int64_t got = stage != nullptr ? platform::pread(direct, stage, (size_t) span, first) : -1;
+        const bool ok = got >= 0 && (uint64_t) got >= pos - first + bytes;
+        if (ok) std::memcpy(dst, (const uint8_t*) stage + (size_t) (pos - first), (size_t) bytes);
+        platform::DirectFile::free_aligned(stage);
+        platform::close_fd(direct);
+        if (ok) return true;
+    }
     const uint8_t* b = mapped_blob(layer, expert);
     if (b == nullptr) return false;
     std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
@@ -717,7 +738,7 @@ bool fill_cache_slots(ExpertSource& src, ExpertCache& cache, int device, const s
 }
 
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
-    if (base_ == nullptr || !basalt::platform::read_ahead_enabled()) return false;
+    if (file_detached_ || base_ == nullptr || !basalt::platform::read_ahead_enabled()) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
@@ -736,7 +757,7 @@ uint64_t FileExpertSource::expert_bytes() const {
 }
 
 bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
-    if (base_ == nullptr || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+    if (blobs_ == 0 || dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
@@ -758,29 +779,64 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
 }
 
 bool FileExpertSource::file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const {
-    const uint8_t* b = mapped_blob(layer, expert);
-    if (b == nullptr || fd_ < 0) return false;
+    uint64_t relative = 0, bytes = 0;
+    if (!blob_range(layer, expert, relative, bytes)) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     // a blob held in RAM (the complement, or a staged exchange) is not read from the file
     if (complement_ready_ && (complement_offsets_[index] != kNoComplement || (!override_.empty() && override_[index] != nullptr)))
         return false;
+    if (!file_detached_ && fd_ >= 0) {
+        fd = fd_;
+        offset = file_off_ + relative;
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(file_mu_);
+    if (fd_ < 0) fd_ = platform::open_fd_utf8(file_path_);
+    if (fd_ < 0) return false;
     fd = fd_;
-    offset = file_off_ + (uint64_t) (b - base_);
+    offset = file_off_ + relative;
+    return true;
+}
+
+bool FileExpertSource::blob_range(int64_t layer, int64_t expert, uint64_t& offset, uint64_t& bytes) const {
+    if (blobs_ == 0 || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    const size_t i = (size_t) layer;
+    if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return false;
+    const uint64_t blob_bytes = layer_blob_bytes_[i];
+    if (blob_bytes == 0 || (uint64_t) expert > std::numeric_limits<uint64_t>::max() / blob_bytes) return false;
+    const uint64_t expert_offset = (uint64_t) expert * blob_bytes;
+    const uint64_t layer_offset = layer_offsets_[i];
+    if (layer_offset > mapped_bytes_ || expert_offset > mapped_bytes_ - layer_offset) return false;
+    offset = layer_offset + expert_offset;
+    if (blob_bytes > mapped_bytes_ - offset) return false;
+    bytes = blob_bytes;
     return true;
 }
 
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
-    const size_t i = (size_t) layer;
-    if (i >= layer_offsets_.size() || i >= layer_blob_bytes_.size()) return nullptr;
-    const uint64_t blob_bytes = layer_blob_bytes_[i];
-    if (blob_bytes == 0 || (uint64_t) expert > std::numeric_limits<uint64_t>::max() / blob_bytes) return nullptr;
-    const uint64_t expert_offset = (uint64_t) expert * blob_bytes;
-    const uint64_t layer_offset = layer_offsets_[i];
-    if (layer_offset > mapped_bytes_ || expert_offset > mapped_bytes_ - layer_offset) return nullptr;
-    const uint64_t offset = layer_offset + expert_offset;
-    if (blob_bytes > mapped_bytes_ - offset) return nullptr;
+    uint64_t offset = 0, bytes = 0;
+    if (!blob_range(layer, expert, offset, bytes)) return nullptr;
+    if (!file_detached_) return base_ != nullptr ? base_ + (size_t) offset : nullptr;
+    std::lock_guard<std::mutex> lock(file_mu_);
+    if (base_ == nullptr) {
+        platform::MapOptions options;
+        options.offset = file_off_;
+        options.bytes = mapped_bytes_;
+        options.shared = true;
+        auto view = platform::MappedFile::open_ro(file_path_, nullptr, options);
+        if (!view) return nullptr;
+        view_ = std::move(*view);
+        base_ = view_.data();
+        basalt::log::info("basalt", "expert file view reopened for layer %lld expert %lld", (long long) layer,
+                         (long long) expert);
+    }
     return base_ + (size_t) offset;
+}
+
+void FileExpertSource::release_mapped_cache() const {
+    if (file_detached_ || base_ == nullptr) return;
+    (void) basalt::platform::drop_mapped_view(base_, mapped_bytes_, 0, mapped_bytes_);
+    basalt::platform::advise_dontneed(fd_, file_off_, mapped_bytes_);
 }
 
 bool FileExpertSource::pin_cache_complement(
@@ -1601,7 +1657,7 @@ int64_t FileExpertSource::commit_exchanges() {
 }
 
 const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
-    if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+    if (blobs_ == 0 || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
     bool from_files = true;
@@ -1665,9 +1721,24 @@ struct FileExpertSource::AdviseWorker {
     std::thread th;
 };
 
+bool FileExpertSource::detach_file_mapping() {
+    if (!complement_ready_) return false;
+    std::lock_guard<std::mutex> advice_lock(advise_mu_);
+    advise_worker_.reset();
+    std::lock_guard<std::mutex> lock(file_mu_);
+    platform::ram_guard_reclaim_view(nullptr, 0);
+    view_.reset();
+    base_ = nullptr;
+    platform::close_fd(fd_);
+    fd_ = -1;
+    file_detached_ = true;
+    return true;
+}
+
 void FileExpertSource::advise_cpu(int64_t layer, const int32_t* ids, int64_t n) const {
-    if (base_ == nullptr || ids == nullptr || n <= 0 || !basalt::platform::read_ahead_enabled()) return;
-    std::call_once(advise_once_, [this] { advise_worker_.reset(new AdviseWorker(this)); });
+    std::lock_guard<std::mutex> lock(advise_mu_);
+    if (file_detached_ || base_ == nullptr || ids == nullptr || n <= 0 || !basalt::platform::read_ahead_enabled()) return;
+    if (!advise_worker_) advise_worker_.reset(new AdviseWorker(this));
     AdviseWorker& w = *advise_worker_;
     {
         std::lock_guard<std::mutex> g(w.mu);

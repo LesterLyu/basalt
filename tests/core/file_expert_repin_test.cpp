@@ -135,6 +135,12 @@ int run() {
         // addresses); the copy stays registered and the read path below still runs
         const bool refused = src.unpin_complement(err);
         require(!refused, "the sleep is accepted although the device alias is not the host address");
+        require(!src.complement_unpinned(), "refused unpin leaves the registration in place");
+        for (size_t k = 0; k < probe.size(); ++k) {
+            const auto& [l, e] = probe[k];
+            require(registered(src.blob(l, e)) && src.pinned(l, e), "the refused copy remains registered");
+            require(std::memcmp(src.blob(l, e), bytes[k].data(), (size_t) blob) == 0, "the refused copy keeps its bytes");
+        }
         std::printf("file_expert_repin_test: this driver does not map the registered copy at its host address, the sleep is "
                     "refused: %s; the repin cycles are skipped\n",
                     err.c_str());

@@ -497,7 +497,8 @@ void advise_willneed(int fd, uint64_t offset, uint64_t bytes) {
 }
 #else
 namespace {
-constexpr uint64_t kAdviseStep = 128ull << 10;
+// Coarse hints allow adjacent file reads to merge before they reach the device.
+constexpr uint64_t kAdviseStep = 4ull << 20;
 }
 
 bool read_ahead_enabled() { return true; }
