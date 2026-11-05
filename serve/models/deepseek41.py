@@ -14,6 +14,7 @@ from serve import frontend
 from serve.frontend import Event, ToolCall
 from serve.models import Dialect
 from serve.models import deepseek41_encoding as enc
+from serve.models.deepseek41_tools import OrphanFilter, REPAIR_TURN
 
 EOS = enc.eos_token
 THINK_END = enc.thinking_end_token
@@ -91,8 +92,19 @@ class DeepseekParser:
         self.first = True               # no argument written yet
         self.pname, self.pstring, self.pvalue = "", True, ""
         self.calls_seen = False
+        self.tools_enabled = bool(tools)
+        self.orphan_filter = OrphanFilter()
+        self.orphaned_tool = self.incomplete_tool_call = False
+        self.completed_calls = 0
 
     # ------------------------------------------------------------------ helpers
+    def _text(self, out: list, text: str) -> None:
+        if self.tools_enabled:
+            text = self.orphan_filter.feed(text)
+            self.orphaned_tool = self.orphan_filter.found
+        if text:
+            out.append(Event("content", text))
+
     def _args(self, out: list, piece: str) -> None:
         if piece and self.stream_tools:
             out.append(Event("tool_args", piece, call=self.call))
@@ -101,6 +113,7 @@ class DeepseekParser:
         self._args(out, "}")
         out.append(Event("tool_call", call=ToolCall(name=self.call.name, arguments=self.args, id=self.call.id)))
         self.call = None
+        self.completed_calls += 1
 
     # ------------------------------------------------------------------ text outside the call block
     def _reasoning(self, out: list) -> bool:
@@ -126,14 +139,19 @@ class DeepseekParser:
     def _content(self, out: list) -> bool:
         calls = self.buf.find(CALLS_START)
         if calls >= 0:
+            if self.tools_enabled and self.orphan_filter.fenced_after(self.buf[:calls]):
+                end = calls + len(CALLS_START)
+                self._text(out, self.buf[:end])
+                self.buf = self.buf[end:]
+                return True
             text = self.buf[:calls].rstrip("\n")
             if text:
-                out.append(Event("content", text))
+                self._text(out, text)
             self.buf, self.state = self.buf[calls + len(CALLS_START):], "call"
             return True
         keep = _hold(self.buf, (CALLS_GAP + CALLS_START, CALLS_START))
         if len(self.buf) > keep:
-            out.append(Event("content", self.buf[:len(self.buf) - keep]))
+            self._text(out, self.buf[:len(self.buf) - keep])
             self.buf = self.buf[len(self.buf) - keep:]
         return False
 
@@ -156,6 +174,9 @@ class DeepseekParser:
                 return True
             if s and not (CALLS_END.startswith(s) or INVOKE_START.startswith(s) or
                           (s.startswith(INVOKE_START) and ">" not in s)):
+                if self.tools_enabled:
+                    self.orphaned_tool, self.buf = True, ""
+                    return False
                 self.buf, self.state = CALLS_START + self.buf, "content"     # not a call block: it is text
                 self.sub, self.calls_seen = "between", True
                 out.append(Event("content", self.buf))
@@ -197,6 +218,8 @@ class DeepseekParser:
 
     # ------------------------------------------------------------------ interface
     def feed(self, delta: str) -> list[Event]:
+        if self.orphaned_tool:
+            return []
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -206,13 +229,19 @@ class DeepseekParser:
                 more = self._content(out)
             else:
                 more = self._call(out)
-            if not more:
+            if not more or self.orphaned_tool:
                 return out
 
     def finish(self) -> list[Event]:
-        """End of generation: flush what is held. A call cut off mid-way is closed without a "tool_call"; text
-        that was only the start of a marker is text."""
+        """Flush text; never invent the missing end of an announced call."""
         out: list[Event] = []
+        if self.orphaned_tool:
+            self.buf = ""
+            return out
+        if self.tools_enabled and self.state == "call":
+            self.incomplete_tool_call = self.call is not None or not self.completed_calls
+            self.buf = ""
+            return out
         if self.state == "call":
             if self.call is not None:
                 if self.sub == "value":
@@ -226,8 +255,16 @@ class DeepseekParser:
             elif self.buf.strip() and not self.calls_seen:
                 out.append(Event("content", CALLS_START + self.buf))
         elif self.buf:
-            out.append(Event("reasoning" if self.state == "reasoning" else "content", self.buf))
+            if self.state == "reasoning":
+                out.append(Event("reasoning", self.buf))
+            else:
+                self._text(out, self.buf)
         self.buf = ""
+        if self.tools_enabled:
+            tail = self.orphan_filter.finish()
+            if tail:
+                out.append(Event("content", tail))
+            self.orphaned_tool = self.orphan_filter.found
         return out
 
 
@@ -254,6 +291,10 @@ class DeepSeek41(Dialect):
     reasoning_close = "\n" + THINK_END
     forced_call_ends_reply = True
     nothink_lead = CALLS_GAP
+    tool_repair_turn = REPAIR_TURN
+
+    def tool_repair_needed(self, parser, text):
+        return parser.orphaned_tool or parser.incomplete_tool_call or (parser.tools_enabled and enc.dsml_token in text)
 
     def template(self, source):
         return DeepseekTemplate()
