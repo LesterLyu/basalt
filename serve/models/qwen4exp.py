@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from serve import frontend
 from serve.models import Dialect
+from serve.tool_output import REPAIR_TURN, orphaned_tool_tail
 from serve.util.text import IM_END
 
 
@@ -11,6 +12,10 @@ class Qwen4Exp(Dialect):
     stop_texts = (IM_END, "<|endoftext|>")
     reasoning_close = "\n</think>\n\n"
     effort_turn = "<|im_start|>system\n{}<|im_end|>\n"
+    tool_repair_turn = REPAIR_TURN
+
+    def tool_repair_needed(self, parser, text):
+        return orphaned_tool_tail(text)
 
     def template(self, path):
         return frontend.ChatTemplate(path)

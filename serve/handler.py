@@ -27,8 +27,9 @@ from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.router import Router
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
-from serve.api.structured import anthropic_format, check_format
+from serve.api.structured import StructuredOutputError, anthropic_format, check_format, prepare_tool_format
 from serve.util.text import stop_strings
+from serve.tool_output import ToolOutputError
 
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
@@ -464,6 +465,13 @@ def make_handler(target: Service | Router):
                     self._json(e.status, responses_error_body(str(e)))
                 else:
                     self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except ToolOutputError as e:
+                if path == "/v1/responses":
+                    self._json(502, responses_error_body(str(e), "server_error", code="tool_output_invalid"))
+                elif path == "/v1/messages":
+                    self._json(502, {"type": "error", "error": {"type": "api_error", "message": str(e)}})
+                else:
+                    self._json(502, {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
@@ -639,6 +647,9 @@ def make_handler(target: Service | Router):
             except EngineDied as e:                          # mid-stream
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except ToolOutputError as e:
+                err = {"error": {"type": "server_error", "code": "tool_output_invalid", "message": str(e)}}
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # engine ERR after the stream started: no 400 now
                 err = {"error": {"type": "server_error", "message": str(e)}}
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
@@ -677,6 +688,11 @@ def make_handler(target: Service | Router):
             if not req.get("stream"):
                 try:
                     result = responses_api.collect(items)
+                except ToolOutputError as e:
+                    return self._json(502, responses_error_body(str(e), "server_error", code="tool_output_invalid"))
+                except StructuredOutputError as e:
+                    return self._json(502, responses_error_body(str(e), "server_error",
+                                                                code="structured_output_failed"))
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -711,6 +727,10 @@ def make_handler(target: Service | Router):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+            except StructuredOutputError as e:
+                self._responses_failed(asm, str(e), "structured_output_failed", send)
+            except ToolOutputError as e:
+                self._responses_failed(asm, str(e), "tool_output_invalid", send)
             except ValueError as e:                          # engine ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
 
@@ -731,16 +751,16 @@ def make_handler(target: Service | Router):
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
+            validator = None
             try:
-                check_format(responses_api.text_format(req))
+                fmt = responses_api.text_format(req)
+                structured = check_format(fmt)
+                self.svc.require_grammar(fmt)
+                if structured and tools:
+                    messages, validator = prepare_tool_format(fmt, messages)
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            try:
-                self.svc.require_grammar(responses_api.text_format(req))
-            except ValueError as e:
-                raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               responses_api.text_format(req))
+            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), fmt)
             noted = self.svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
@@ -770,7 +790,7 @@ def make_handler(target: Service | Router):
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
-                                          "reasoning.encrypted_content" in include)
+                                          "reasoning.encrypted_content" in include, validator)
             return ids, thinking, tools, max_new, asm, req, force
 
         def _count_tokens(self, req):
@@ -817,6 +837,9 @@ def make_handler(target: Service | Router):
                 events.close()
             except EngineDied as e:                          # mid-stream: an Anthropic error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except ToolOutputError as e:
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # engine ERR after the stream started
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
