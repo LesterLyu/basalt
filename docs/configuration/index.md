@@ -181,6 +181,9 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 Diagnostic flags: [diagnostics](diagnostics.md).
 
+`vision-max-tokens` (server, integer, default 4096, minimum 8) limits visual tokens per image for the encoder sidecar;
+a higher value preserves detail and reserves larger encoder buffers. Dynamic vision uses the engine's fixed limit.
+
 ## Control vectors
 
 A GGUF control vector added to the residual stream. A request switches it with `experimental_speed_projection`. A layer split

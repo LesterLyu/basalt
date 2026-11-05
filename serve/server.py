@@ -148,7 +148,7 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
                                    vision=False if a.mock_engine or mode == "off" else mode,
                                    engine_words=tuple(file_engine + cli_engine))
         try:
-            cfg.update(modelfile.model_config(spec, a.engine_bin))
+            cfg.update(modelfile.model_config(spec, a.engine_bin, vision_max_tokens=a.vision_max_tokens))
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
         if not a.mock_engine:
