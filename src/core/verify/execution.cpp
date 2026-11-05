@@ -113,6 +113,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     ms_stage_inputs += ms_since(t0);
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_begin(err, &gm)) return false;
+        if (single_request_staging_ && !dm_stage_places(err)) return false;
     }
     ms_host += ms_since(t0);
     if (prof_on_) decode_gaps().verify_end = 0;   // set again only by a collected window

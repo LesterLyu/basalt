@@ -14,6 +14,17 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 inline double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// Small host uploads pass queued adaptive copies instead of waiting behind the whole round.
+inline cudaError_t copy_small(void* dst, const void* src, size_t bytes, cudaStream_t s) {
+    constexpr size_t kSmallCopy = 16384;
+    for (size_t o = 0; o < bytes; o += kSmallCopy) {
+        const cudaError_t e = cudaMemcpyAsync((uint8_t*) dst + o, (const uint8_t*) src + o, std::min(kSmallCopy, bytes - o),
+                                              cudaMemcpyHostToDevice, s);
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
+}
+
 struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
