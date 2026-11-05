@@ -302,6 +302,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (slab) allocs_.push_back(slab.release());
         scratch_ = scratch.release();
         bytes_ = total;
+        table.native_weight_bytes_ = total;
+        table.native_scratch_bytes_ = basalt::kernels::native_q8_1_bytes(max_in);
         progress.finish();
         return true;
     } catch (const std::exception& error) {

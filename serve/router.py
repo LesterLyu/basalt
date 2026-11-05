@@ -162,7 +162,9 @@ class Router:
         if getattr(self.front, "telemetry", None) is None:
             from serve.util.telemetry import Telemetry
             cards = list(dict.fromkeys(i for svc in self.services for i in (getattr(svc, "gpu_indices", None) or [0])))
-            sampler = Telemetry(extra=lambda: self.shown().telemetry_extra(), gpu_indices=cards)
+            sampler = Telemetry(extra=lambda: self.shown().telemetry_extra(), gpu_indices=cards,
+                                gpu_owner_pids=lambda: set().union(*(svc._gpu_owner_pids() for svc in self.services)),
+                                ram_pids=lambda: self.shown()._ram_pids())
             for svc in self.services:
                 svc.telemetry = sampler
 

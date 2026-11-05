@@ -45,6 +45,10 @@ public:
     bool resolve_context(int64_t requested, std::string& err);
     model::Result make_session(std::unique_ptr<model::ModelSession>& out) override;
 
+    void memory_usage(core::MemoryUsage& usage) const override {
+        if (!usage.claim(this)) return;
+        for (const auto& [name, t] : dev_) if (t.ptr) usage.device(device_, "weights", t.bytes);
+    }
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
     /// Device tensor `blk.<layer>.<suffix>` or a global name; null when absent.

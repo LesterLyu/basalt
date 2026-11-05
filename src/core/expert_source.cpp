@@ -2126,6 +2126,10 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     return true;
 }
 
+uint64_t ArenaExpertSource::locked_bytes() const {
+    return arena_ ? ((const PinnedArena*) arena_)->locked_bytes : 0;
+}
+
 void ArenaExpertSource::close() {
     map_.reset();
     if (arena_ != nullptr) {

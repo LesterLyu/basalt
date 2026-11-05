@@ -47,6 +47,7 @@ public:
     /// `out` = [plan.n_tokens()][width] floats, the embedding block.
     bool encode(const std::vector<float>& rows, const VisionPlan& plan, std::vector<float>& out, std::string& err);
     int width() const;
+    uint64_t device_bytes() const;
 
     struct Impl;
 

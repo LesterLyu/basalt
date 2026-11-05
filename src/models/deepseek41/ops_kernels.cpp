@@ -85,6 +85,15 @@ public:
         for (void* p : allocs_) cudaFree(p);
     }
 
+    void memory_usage(core::MemoryUsage& usage) const override {
+        uint64_t kv = state_bytes_;
+        for (const auto& b : el_kv_) if (b) kv += b->backed();
+        for (const auto& b : el_ik_) if (b) kv += b->backed();
+        usage.device(m_.device(), "kv_state", kv);
+        usage.device(m_.device(), "scratch", allocated_bytes_ - state_bytes_);
+        if (batch_) batch_->memory_usage(usage);
+        if (tier_) tier_->memory_usage(usage);
+    }
     bool init(std::string& err) {
         const int nl = g_.n_layers;
         int least = 0, greatest = 0;   // the branches can hold the chain up (the compressor, the selection): the top priority
@@ -123,6 +132,7 @@ public:
                     return oom(err);
             }
         }
+        state_bytes_ = allocated_bytes_;
         float tab[kRopePairs];
         rope_freq_table(RopeParams{}, tab);
         if (!alloc((void**) &freq_[0], sizeof(tab))) return oom(err);
@@ -918,6 +928,7 @@ private:
         if (cudaMalloc(&v, bytes) != cudaSuccess) return false;
         cudaMemset(v, 0, bytes);
         allocs_.push_back(v);
+        allocated_bytes_ += bytes;
         *p = v;
         return true;
     }
@@ -930,6 +941,8 @@ private:
     const Geometry& g_;
     std::unique_ptr<AttnBatch> batch_;
     std::vector<void*> allocs_;
+    uint64_t allocated_bytes_ = 0;
+    uint64_t state_bytes_ = 0;
     std::vector<uint16_t*> ring_, comp_kv_, comp_ik_;
     std::vector<std::unique_ptr<ElasticBuf>> el_kv_, el_ik_;   // backing of comp_kv_ / comp_ik_ per kv-source layer
     int64_t backed_positions_ = 0;

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/memory_usage.hpp"
 #include "basalt/core/ram_load.hpp"
 #include "basalt/program/expert_spill.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -133,6 +134,7 @@ public:
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
 
+    void memory_usage(core::MemoryUsage& usage) const;
     void report(const char* tag) const;
     /// The routed experts so far: hits of the main card's slots, those plus the CPU's, a bus copy's or the second card's.
     int64_t hits() const { return hits_; }

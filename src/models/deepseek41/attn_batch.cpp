@@ -51,6 +51,9 @@ public:
             if (f.host) cudaFreeHost(f.host);
     }
 
+    void memory_usage(core::MemoryUsage& usage) const override {
+        usage.device(m_.device(), "long_prefill", allocated_bytes_);
+    }
     bool init(std::string& err) {
         namespace mmq = basalt::prefill::mmq;
         const size_t C = (size_t) cap_, S = kSub;
@@ -343,6 +346,7 @@ private:
         if (cudaMalloc(&v, bytes) != cudaSuccess) return false;
         cudaMemset(v, 0, bytes);
         allocs_.push_back(v);
+        allocated_bytes_ += bytes;
         *p = (P*) v;
         return true;
     }
@@ -356,6 +360,7 @@ private:
     Fixed fixed_[2];
     void* stage_ = nullptr;
     std::vector<void*> allocs_;
+    uint64_t allocated_bytes_ = 0;
     void *xq_ = nullptr, *cws_ = nullptr, *iws_ = nullptr;
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     int32_t *d_pos_ = nullptr, *d_start_ = nullptr, *d_n_ = nullptr, *d_lim_[2] = {nullptr, nullptr}, *ids_ = nullptr,

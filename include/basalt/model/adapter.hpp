@@ -9,6 +9,8 @@
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/program/grammar/tool_form.hpp"
 
+#include "basalt/core/memory_usage.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -174,6 +176,7 @@ public:
     virtual ExpertCounts expert_counts() const { return {}; }
     /// Facts for the engine's INFO lines once the session is prepared: `key=value` words.
     virtual std::string info_words() const { return {}; }
+    virtual void memory_usage(core::MemoryUsage&) const {}
     /// An encoded picture: `n_rows` embedding rows of the model's width (the encoder's whole block). Rows with no
     /// vision support leave the default.
     virtual Result encode_image(const uint8_t* data, size_t bytes, std::vector<float>& rows, int& n_rows) {
@@ -197,6 +200,7 @@ public:
     /// The context the loaded model runs with, when it sizes that itself (0: the caller's --max-context stands).
     virtual int64_t context() const { return 0; }
     virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
+    virtual void memory_usage(core::MemoryUsage&) const {}
 };
 
 /// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id.

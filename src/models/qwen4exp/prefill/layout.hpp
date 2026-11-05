@@ -20,6 +20,7 @@ struct Alloc {
     uint64_t cap = 0, used = 0;
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
+    uint64_t* allocated_bytes = nullptr;
     template <typename T> T* take(size_t n, bool& ok) {
         const uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
         if (count_only) { used += bytes; return nullptr; }
@@ -32,6 +33,7 @@ struct Alloc {
         void* p = nullptr;
         if (cudaMalloc(&p, bytes) != cudaSuccess) { ok = false; return nullptr; }
         owned->push_back(p);
+        if (allocated_bytes) *allocated_bytes += bytes;
         used += bytes;
         return (T*) p;
     }

@@ -48,7 +48,13 @@ namespace {
 struct CachingPool : ggml_cuda_pool {
     struct Buf { void * p; size_t size; bool used; };
     std::vector<Buf> bufs;
-    std::mutex mu;
+    mutable std::mutex mu;
+    size_t allocated_bytes() const override {
+        std::lock_guard<std::mutex> lk(mu);
+        size_t n = 0;
+        for (const auto& b : bufs) n += b.size;
+        return n;
+    }
     void * alloc(size_t size, size_t * actual_size) override {
         std::lock_guard<std::mutex> lk(mu);
         for (auto & b : bufs)

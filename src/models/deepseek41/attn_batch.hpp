@@ -1,5 +1,6 @@
 // src/models/deepseek41/attn_batch.hpp - attention of a chunk of prompt tokens for one layer.
 #pragma once
+#include "basalt/core/memory_usage.hpp"
 
 #include "basalt/models/deepseek41/attn.hpp"
 
@@ -29,6 +30,7 @@ struct AttnCaches {
 class AttnBatch {
 public:
     virtual ~AttnBatch() = default;
+    virtual void memory_usage(core::MemoryUsage&) const {}
     /// Attention of `layer` over T tokens at pos0.. (x: normed input [T][n_embd]; out: [T][n_embd]). Layers run in order
     /// 0..n-1 for one chunk; the layer-0 call starts a chunk.
     virtual bool run(int layer, int64_t pos0, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;

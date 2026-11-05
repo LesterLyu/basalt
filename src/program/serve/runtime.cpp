@@ -49,9 +49,26 @@ int Runtime::execute() {
     return run_requests();
 }
 
+void Runtime::report_memory(bool force) {
+    if (!memory_report_ready()) return;
+    const auto now = Clock::now();
+    if (!force && now - memory_at < std::chrono::seconds(1)) return;
+    memory_at = now;
+    basalt::core::MemoryUsage usage;
+    memory_usage(usage);
+    usage.host["checkpoints"] += conversations ? conversations->bytes() : 0;
+    for (const auto& c : checks) usage.host["checkpoints"] += c.bytes();
+    for (const auto& b : bs)
+        for (const auto& c : b.checks) usage.host["checkpoints"] += c.bytes();
+    std::printf("MEMORY %s\n", usage.json().c_str());
+    std::fflush(stdout);
+}
+
 int Runtime::run_requests() {
     for (;;) {
+        report_memory();
         const Flow flow = dispatch();
+        if (flow != Flow::error) report_memory(!batch_on() && !windows_in_flight());
         if (flow == Flow::error) {
             if (basalt::core::gpu_left_running().load()) {   // the teardown would wait for the stuck window forever
                 basalt::log::error("basalt serve", "the GPU did not finish a released window: ending without the CUDA teardown");

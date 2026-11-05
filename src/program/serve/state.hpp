@@ -90,6 +90,10 @@ public:
     virtual int init_after_input() = 0;
     virtual void after_input_start() {}
     virtual void print_info() = 0;   // the INFO line
+    virtual void memory_usage(basalt::core::MemoryUsage&) const {}
+    void report_memory(bool force = false);
+    virtual bool memory_report_ready() const { return true; }
+    Clock::time_point memory_at{};
     virtual void at_exit() {}
     /// The pack's tokenizer rule, set before the input starts.
     basalt::model::ModelAdapter::PreTokenizer pre_{};

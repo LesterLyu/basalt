@@ -75,6 +75,9 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
+        visible = (env or os.environ).get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+        self.vram_gpu = int(visible) if cfg.get("gpu") and visible.isdigit() else None
+        self._vision_memory = (None, 0.0)
         self.stopped = False
         self.ready_s = 0.0                              # last start's time to READY
         self.proc = None
@@ -100,6 +103,9 @@ class Vision:
             raise
         if not line.startswith("READY"):
             raise RuntimeError("the vision encoder did not start: " + line.strip())
+        words = dict(w.split("=", 1) for w in line.split()[2:] if "=" in w)
+        value = words.get("vram_bytes", "")
+        self._vision_memory = (int(value) if value.isdigit() else None, time.monotonic())
         self.ready_s = time.time() - t0
         self.stopped = False
 
@@ -124,6 +130,10 @@ class Vision:
             except OSError:
                 pass
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
+
+    def vram_usage(self):
+        count, changed = self._vision_memory
+        return (self.vram_gpu, count, changed) if self.vram_gpu is not None and count is not None and self.alive() else None
 
     def alive(self) -> bool:
         return not self.stopped and self.proc.poll() is None
@@ -332,6 +342,9 @@ class EngineVision(Vision):
 
     def attach(self, engine) -> None:
         self.engine = engine
+
+    def vram_usage(self):
+        return None   # the engine reports its encoder allocations
 
     def alive(self) -> bool:                            # the engine's life is the engine's business
         return True

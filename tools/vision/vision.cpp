@@ -141,7 +141,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "basalt-vision: on the CPU, %d threads, no warm-up\n", threads);
     }
     const int n_embd = mp.hp().proj;
-    std::printf("READY %d\n", n_embd);
+    size_t vram_bytes = 0;
+#ifdef BASALT_VISION_CUDA
+    if (gpu) vram_bytes = cuda.device_bytes();
+#endif
+    std::printf("READY %d vram_bytes=%zu\n", n_embd, vram_bytes);
     std::fflush(stdout);
 
     std::string line;

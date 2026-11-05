@@ -42,6 +42,10 @@ public:
         for (void* p : allocs_) cudaFree(p);
     }
 
+    void memory_usage(core::MemoryUsage& usage) const override {
+        usage.device(m_.device(), "long_prefill", allocated_bytes_);
+        if (ffn_) ffn_->memory_usage(usage);
+    }
     bool init(std::string& err) {
         const size_t n = (size_t) g_.n_embd, C = (size_t) cap_;
         const size_t cols = (size_t) m_.pack().engram.hash.n_cols() * 256;
@@ -49,6 +53,7 @@ public:
             void* v = nullptr;
             if (cudaMalloc(&v, count * sizeof(*p)) != cudaSuccess) return false;
             allocs_.push_back(v);
+            allocated_bytes_ += count * sizeof(*p);
             p = (std::remove_reference_t<decltype(p)>) v;
             return true;
         };
@@ -423,6 +428,7 @@ private:
     cudaStream_t stream_;
     int cap_;
     std::vector<void*> allocs_;
+    uint64_t allocated_bytes_ = 0;
     std::string err_;
     float *x_ = nullptr, *x2_ = nullptr, *cur_ = nullptr, *normed_ = nullptr, *attn_ = nullptr, *moe_ = nullptr,
           *sh_ = nullptr, *sum_ = nullptr, *coef_a_ = nullptr, *coef_f_[2] = {nullptr, nullptr}, *hc_ws_ = nullptr,

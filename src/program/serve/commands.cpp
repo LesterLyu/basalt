@@ -56,6 +56,7 @@ Flow Runtime::dispatch() {
             while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
             if (got) break;
             parking = parking && park_idle_engine(pe);
+            report_memory();
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
             if (!parking) break;
         }

@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import os
 import subprocess
 import threading
 import time
@@ -518,6 +519,18 @@ class Service:
         return {"tok_s": self._tok_s(), "prefill_tok_s_mean": self._prefill_tok_s_mean(),
                 "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]}
 
+    def _ram_pids(self):
+        pids = {"server": os.getpid()}
+        for role, owner in (("engine", self.engine), ("vision", self.vision)):
+            proc = getattr(owner, "proc", None)
+            if proc is not None and proc.poll() is None:
+                pids[role] = proc.pid
+        return pids
+
+    def _gpu_owner_pids(self):
+        return {proc.pid for owner in (self.engine, self.vision)
+                if (proc := getattr(owner, "proc", None)) is not None and proc.poll() is None}
+
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S (summed over parallel requests); 0.0 when idle."""
         with self.status_lock:
@@ -625,6 +638,8 @@ class Service:
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             # parallel: generating while any slot decodes, though the newest request may still wait or read
             decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
+            running = [st for st, _ in self.live_reqs.values()] or [s]
+            phases = list(dict.fromkeys(st["phase"] for st in running if st.get("busy") and st.get("phase")))
             hist = list(self.history)
         busy = bool(s.get("busy"))
         if self.loading:
@@ -644,17 +659,56 @@ class Service:
                 "prompt_tokens": s.get("prompt_tokens") if busy else None,
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
-                "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "tok_s": round(self._tok_s(), 1) if state == "generating" else None, "phases": phases,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         info = dict(getattr(self.engine, "info", {}) or {})
         spill = spill_of(info)
         engine = {"model": self.model, "max_context": self.engine.max_context, **info, "spill": spill}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
+        engine_vram = getattr(self.engine, "vram_usage", None)
+        indices = getattr(self, "engine_gpu_indices", None) or getattr(self, "gpu_indices", [0])
+        track_engine = callable(engine_vram) and self.loaded() and engine.get("memory", 1) == 1
+        engine_cards = ({indices[i]: parts for i, parts in engine_vram().items() if 0 <= i < len(indices)}
+                        if track_engine else {})
+        cards = {i: dict(parts) for i, parts in engine_cards.items()}
+        vision_vram = getattr(self.vision, "vram_usage", None)
+        vision_card, vision_changed = None, 0
+        if callable(vision_vram) and (usage := vision_vram()) is not None:
+            vision_card, count, vision_changed = usage
+            cards.setdefault(vision_card, {})["vision"] = count
+        engine_ram = getattr(self.engine, "ram_usage", None)
+        ram_parts = engine_ram() if callable(engine_ram) and self.loaded() else {}
+        hardware = {**tel["now"], "ram_breakdown": {
+            "engine_allocations": ram_parts, "processes": tel.get("ram_processes", {})}}
+        if cards or track_engine or tel.get("gpu_other_apps"):
+            gpus = []
+            for g in hardware["gpus"]:
+                index = g["index"]
+                pending = track_engine and index in indices and index not in engine_cards
+                other = tel.get("gpu_other_apps", {}).get(index)
+                parts = cards.get(index, {} if pending or other is not None else None)
+                if parts is not None:
+                    used = g.get("mem_used")
+                    reserved = g.get("mem_reserved")
+                    if reserved is not None:
+                        parts = {**parts, "system_reserved": reserved}
+                    tracked = sum(parts.values())
+                    fresh = index != vision_card or tel.get("gpu_sample_started", 0) >= vision_changed
+                    remaining = used - tracked if fresh and not pending and used is not None and used >= tracked else None
+                    if remaining is not None and other is not None:
+                        parts["other_apps"] = min(remaining, other)
+                        remaining -= parts["other_apps"]
+                    breakdown = {"components": parts, "unattributed": remaining}
+                    if pending:
+                        breakdown["pending_engine"] = True
+                    g = {**g, "vram_breakdown": breakdown}
+                gpus.append(g)
+            hardware = {**hardware, "gpus": gpus}
         with self.status_lock:
             best = {k: dict(v) for k, v in self.best.items()}
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
-                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+                "hardware": hardware, "hardware_static": tel["static"], "history": tel["history"]}
 
     def _note_best(self, r: dict) -> None:
         """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.

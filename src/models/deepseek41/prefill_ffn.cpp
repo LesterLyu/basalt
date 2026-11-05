@@ -56,6 +56,10 @@ public:
         if (copy_) cudaStreamDestroy(copy_);
     }
 
+    void memory_usage(core::MemoryUsage& usage) const override {
+        usage.device(m_.device(), "long_prefill", allocated_bytes_);
+        usage.device(m_.device(), "mmq_buffers", ctx_.allocated_bytes());
+    }
     bool init(std::string& err) {
         namespace mmq = basalt::prefill::mmq;
         for (const ExpertLayer& e : m_.pack().experts)
@@ -750,6 +754,7 @@ private:
         void* v = nullptr;
         if (cudaMalloc(&v, bytes) != cudaSuccess) return false;
         dev_.push_back(v);
+        allocated_bytes_ += bytes;
         p = (P*) v;
         return true;
     }
@@ -789,6 +794,7 @@ private:
     int64_t max_rows_ = 0;               // (token, slot) rows one launch handles
     size_t slot_ = 0;
     std::vector<void*> dev_;
+    uint64_t allocated_bytes_ = 0;
     void *xq1_ = nullptr, *xq2_ = nullptr;
     int32_t *ident_ = nullptr, *sbnd_ = nullptr;
     float *gu_ = nullptr, *h_ = nullptr, *rows_ = nullptr;

@@ -256,6 +256,7 @@ int Runtime::init_protocol() {
 
 int Runtime::announce() {
     print_info();
+    std::printf("INFO memory=1\n");
     {
         std::string ends;
         for (const int64_t id : o.eos_ids) ends += (ends.empty() ? "" : ",") + std::to_string((long long) id);

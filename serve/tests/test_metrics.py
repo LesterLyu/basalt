@@ -3,6 +3,7 @@ import collections
 import ctypes
 import json
 import os
+import queue
 import stat
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from serve.util import telemetry
 from serve.frontend import ChatTemplate
@@ -25,6 +27,45 @@ from serve.engine.vision import gpus_in_play
 from serve.util.telemetry import GPU_KEYS, Telemetry
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "chat_template.jinja"
+
+
+class NvmlLoading(unittest.TestCase):
+    def test_windows_loads_the_system_driver(self):
+        library = object()
+        with mock.patch.object(telemetry.os, "name", "nt"), \
+                mock.patch.object(telemetry.ctypes, "CDLL", return_value=library) as load:
+            self.assertIs(telemetry._load_nvml(), library)
+        load.assert_called_once_with("nvml.dll", winmode=0x800)
+
+    def test_windows_falls_back_to_the_driver_install_directory(self):
+        library = object()
+        root = "C:/Driver Programs"
+        path = os.path.join(root, "NVIDIA Corporation", "NVSMI", "nvml.dll")
+        with mock.patch.object(telemetry.os, "name", "nt"), \
+                mock.patch.dict(os.environ, {"ProgramW6432": root, "ProgramFiles": root}, clear=True), \
+                mock.patch.object(telemetry.ctypes, "CDLL", side_effect=[OSError("missing"), library]) as load:
+            self.assertIs(telemetry._load_nvml(), library)
+        self.assertEqual(load.call_args_list, [mock.call("nvml.dll", winmode=0x800), mock.call(path, winmode=0x900)])
+
+    def test_linux_tries_both_sonames(self):
+        library = object()
+        with mock.patch.object(telemetry.os, "name", "posix"), \
+                mock.patch.object(telemetry.ctypes, "CDLL", side_effect=[OSError("missing"), library]) as load:
+            self.assertIs(telemetry._load_nvml(), library)
+        self.assertEqual(load.call_args_list, [mock.call("libnvidia-ml.so.1"), mock.call("libnvidia-ml.so")])
+
+    def test_missing_driver_does_not_stop_telemetry(self):
+        for system in ("nt", "posix"):
+            with self.subTest(system=system), mock.patch.object(telemetry.os, "name", system), \
+                    mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(telemetry.ctypes, "CDLL", side_effect=OSError("missing")):
+                self.assertFalse(telemetry._Nvml().ok())
+
+    def test_failed_driver_initialization_is_unavailable(self):
+        library = mock.Mock()
+        library.nvmlInit_v2.return_value = 1
+        with mock.patch.object(telemetry, "_load_nvml", return_value=library):
+            self.assertFalse(telemetry._Nvml().ok())
 
 
 class Clocked(MockEngine):
@@ -80,14 +121,14 @@ class Http(unittest.TestCase):
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
         self.assertEqual(set(m["live"]), {"state", "load", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
-                                          "tok_s", "prefill_tok_s_mean"})
+                                          "tok_s", "prefill_tok_s_mean", "phases"})
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
-        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb", "ram_breakdown"})
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus", "cpu", "ram_used"})
 
     def test_requests_have_an_id_and_the_path(self):
         paths = ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/chat/completions"]
@@ -210,7 +251,113 @@ class FakeGpu:
                 "pcie_width": 16, "pcie_rx_mb": 1.5, "pcie_tx_mb": 0.5, "unlisted": 1}
 
 
+class MemoryFrames(unittest.TestCase):
+    def setUp(self):
+        self.engine = ProcessEngine("unused", [], lazy=True)
+
+    def test_memory_frames_keep_physical_allocation_counters_and_return_copies(self):
+        self.engine._note_memory('MEMORY {"gpus":{"1":{"kv_state":123,"experts":456}},'
+                                 '"host":{"resident_experts":789}}')
+        self.assertEqual(self.engine.vram_usage(), {1: {"kv_state": 123, "experts": 456}})
+        self.assertEqual(self.engine.ram_usage(), {"resident_experts": 789})
+        self.engine.vram_usage()[1]["experts"] = 0
+        self.engine.ram_usage()["resident_experts"] = 0
+        self.assertEqual(self.engine.vram_usage()[1]["experts"], 456)
+        self.assertEqual(self.engine.ram_usage()["resident_experts"], 789)
+
+    def test_invalid_or_truncated_frames_do_not_replace_a_good_snapshot(self):
+        self.engine._note_memory('MEMORY {"gpus":{"0":{"scratch":10}},"host":{}}')
+        for payload in ('{', '[]', '{"gpus":[],"host":{}}',
+                        '{"gpus":{"0":{"scratch":-1}},"host":{}}',
+                        '{"gpus":{"0":{"scratch":true}},"host":{}}',
+                        '{"gpus":{"-1":{"scratch":10}},"host":{}}'):
+            self.engine._note_memory("MEMORY " + payload)
+            self.assertEqual(self.engine.vram_usage(), {0: {"scratch": 10}}, payload)
+
+    def test_frames_are_consumed_before_batch_or_solo_reply_routing(self):
+        engine = self.engine
+        engine.log = None
+        engine.lines = queue.Queue()
+        engine.slot_q = [queue.Queue()]
+        engine.proc = mock.Mock()
+        engine.proc.stdout = iter(['MEMORY {"gpus":{"0":{"experts":100}},"host":{}}\n',
+                                   'BT 0 42\n', 'MEMORY {"gpus":{"0":{"experts":90}},"host":{}}\n',
+                                   'T 43\n'])
+        engine._pump()
+        self.assertEqual(engine.slot_q[0].get_nowait().strip(), "BT 0 42")
+        self.assertEqual(engine.slot_q[0].get_nowait(), None)
+        self.assertEqual(engine.lines.get_nowait().strip(), "T 43")
+        self.assertEqual(engine.lines.get_nowait(), None)
+        self.assertEqual(engine.vram_usage(), {0: {"experts": 90}})
+
+
 class PerGpu(unittest.TestCase):
+    def test_metrics_exposes_each_active_slots_phase(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", batch=2), tok, ChatTemplate(TEMPLATE))
+        svc.live_reqs = {
+            "one": ({"busy": True, "phase": "thinking", "first_token": 1, "generated": 10}, []),
+            "two": ({"busy": True, "phase": "writing a tool call: apply_patch", "first_token": 1, "generated": 10}, []),
+        }
+        self.assertEqual(svc.metrics()["live"]["phases"], ["thinking", "writing a tool call: apply_patch"])
+
+    def test_host_allocations_are_separate_from_working_sets(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok")
+        allocations = {"resident_experts": 80, "pinned_experts": 40, "expert_homes": 12}
+        engine.ram_usage = lambda: allocations
+        svc = Service(engine, tok, ChatTemplate(TEMPLATE))
+        svc.telemetry = mock.Mock()
+        svc.telemetry.snapshot.return_value = {
+            "now": {"gpus": [], "ram_used": 100, "ram_total": 128}, "history": {}, "static": {},
+            "ram_processes": {"engine": {"rss": 77, "private_commit": 110}}}
+        hw = svc.metrics()["hardware"]
+        self.assertEqual(hw["ram_used"], 100)
+        self.assertEqual(hw["ram_breakdown"], {
+            "engine_allocations": allocations, "processes": {"engine": {"rss": 77, "private_commit": 110}}})
+
+    def test_breakdown_uses_physical_cards_and_waits_for_vision_sample(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=16384)
+        engine.vram_usage = lambda: {0: {"experts": 70}, 1: {"expert_helper": 30, "dspark": 20}}
+        vision = mock.Mock()
+        vision.vram_usage.return_value = (0, 10, 3.0)
+        svc = Service(engine, tok, ChatTemplate(TEMPLATE), vision=vision)
+        svc.engine_gpu_indices = [1, 0]
+        readings = [{"index": 0, "mem_used": 100, "mem_reserved": 10}, {"index": 1, "mem_used": 110}]
+        snap = {"now": {"gpus": readings}, "static": {}, "history": {}, "gpu_sample_started": 2.0}
+        svc.telemetry = mock.Mock()
+        svc.telemetry.snapshot.return_value = snap
+        gpu0, gpu1 = [g["vram_breakdown"] for g in svc.metrics()["hardware"]["gpus"]]
+        self.assertEqual(gpu0["components"], {"expert_helper": 30, "dspark": 20, "vision": 10, "system_reserved": 10})
+        self.assertIsNone(gpu0["unattributed"])
+        self.assertEqual(gpu1, {"components": {"experts": 70}, "unattributed": 40})
+        snap["gpu_sample_started"] = 4.0
+        self.assertEqual(svc.metrics()["hardware"]["gpus"][0]["vram_breakdown"]["unattributed"], 30)
+        self.assertNotIn("vram_breakdown", readings[0])
+
+    def test_other_apps_partitions_only_reconciled_vram(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=16384)
+        engine.vram_usage = lambda: {0: {"mmq_buffers": 30, "dense_prefill": 20}, 1: {"expert_helper": 80}}
+        svc = Service(engine, tok, ChatTemplate(TEMPLATE))
+        svc.engine_gpu_indices = [0, 1]
+        svc.telemetry = mock.Mock()
+        svc.telemetry.snapshot.return_value = {
+            "now": {"gpus": [{"index": 0, "mem_used": 100, "mem_reserved": 10},
+                             {"index": 1, "mem_used": 100}]}, "history": {}, "static": {},
+            "gpu_other_apps": {0: 15, 1: 30}}
+        gpu0, gpu1 = [g["vram_breakdown"] for g in svc.metrics()["hardware"]["gpus"]]
+        self.assertEqual(gpu0["components"], {"mmq_buffers": 30, "dense_prefill": 20,
+                                              "system_reserved": 10, "other_apps": 15})
+        self.assertEqual(gpu0["unattributed"], 25)
+        self.assertEqual(gpu1, {"components": {"expert_helper": 80, "other_apps": 20}, "unattributed": 0})
+
+        engine.vram_usage = lambda: {}
+        gpu0 = svc.metrics()["hardware"]["gpus"][0]["vram_breakdown"]
+        self.assertEqual(gpu0, {"components": {"system_reserved": 10},
+                                "unattributed": None, "pending_engine": True})
+
     def telemetry(self, indices, factories=None):
         factories = factories or {}
         return Telemetry(gpu_indices=indices, gpu_factory=lambda i: factories.get(i) or FakeGpu(i))
@@ -236,7 +383,7 @@ class PerGpu(unittest.TestCase):
         self.assertEqual(snap["static"]["gpus"], [{"index": 0, "name": "Card 0"}, {"index": 1, "name": "Card 1"}])
         self.assertEqual((snap["static"]["driver"], snap["static"]["cuda"]), ("610.57.04", "13.3"))
         self.assertEqual(set(snap["static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus", "cpu", "ram_used"})
         self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
 
     def test_history_keeps_the_speeds_slots_and_cards(self):
@@ -246,7 +393,7 @@ class PerGpu(unittest.TestCase):
         for _ in range(70):
             tel.record(tel.sample())
         snap = tel.snapshot()
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus", "cpu", "ram_used"})
         self.assertEqual(len(snap["history"]["tok_s"]), 60)
         self.assertEqual(snap["history"]["tok_s"][-1], 12.35)
         self.assertEqual(snap["history"]["slot_tok_s"], [[1.23] * 60, [0.0] * 60])     # one series per slot
