@@ -165,6 +165,10 @@ Hy4-flash reads images with `dynamic` only: its main-card expert slots go back f
 prompt. Which
 images a request may name: [image sources](configuration/image-sources.md). An image may not sit in a system prompt.
 
+`--single-request-staging` (Flash-Next engine) opts single-request windows into the batch PCIe staging policy.
+It is off by default and stages only mapped RAM experts; it does not replace the adaptive expert cache.
+CPU/GPU placement can change rounding.
+
 ## Video
 
 With image input on, Qwen3.8-Flash-Next and Qwen3.8-27B read video (DeepSeek, Hy4-flash and Inkling 2 Mini do not). A user message names a video as it names an image, from
