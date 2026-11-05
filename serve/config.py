@@ -155,6 +155,11 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str]):
     a.sampling_cli = {k for k in a.sampling_launch if getattr(a_cli, k) is not None}
     if a.vision == "":                                     # a bare --vision
         ap.error(VISION_USAGE)
+    if a.vision_max_tokens is not None:
+        if a.vision_max_tokens < 8:
+            raise ValueError("vision-max-tokens must be at least 8")
+        if a.vision == "dynamic":
+            raise ValueError("vision-max-tokens needs a GPU number or cpu; dynamic uses the engine's limit")
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
         if isinstance(act, argparse._AppendAction) and getattr(a_cli, act.dest) != act.default:
             setattr(a, act.dest, getattr(a_cli, act.dest))
@@ -400,6 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="treat requests from this machine as remote too, so they get only data: URLs and what "
                          "--image-url-host and --image-dir allow. For a server behind anything on this machine that "
                          "forwards other people's requests")
+    ap.add_argument("--vision-max-tokens", type=int, default=None, metavar="N",
+                    help="maximum visual tokens per image with GPU-numbered or cpu vision (at least 8; default 4096); "
+                         "larger images keep more detail and reserve more encoder memory at startup")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")

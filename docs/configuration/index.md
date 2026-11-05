@@ -232,6 +232,8 @@ plain decoding would give.
 | `image-dir` | server | directory, repeatable | none | Let requests from other machines name image files under this directory. Requests from this machine need no flag. [image sources](image-sources.md) |
 | `image-remote-only` | server | switch | off | Treat requests from this machine as remote too. Set it when anything on this machine forwards other people's requests to the server. [image sources](image-sources.md) |
 
+| `vision-max-tokens` | server | integer, at least 8 | 4096 | Maximum visual tokens per image for a GPU-numbered sidecar or `cpu`. A higher limit preserves more detail and reserves larger encoder buffers at startup. `dynamic` uses the engine's fixed limit. |
+
 Diagnostic flags: [diagnostics](diagnostics.md)
 
 ## Control vectors
