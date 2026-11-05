@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 #include "cpu_warm.hpp"
+#include "peer_launcher.hpp"
 #include "basalt/core/verify.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -52,6 +53,7 @@ struct DecMoe {
     // the peer card
     int pdev = -1;
     cudaStream_t ps = nullptr;
+    std::unique_ptr<PeerWindowLauncher> launcher;
     unsigned long long* ptab = nullptr;      ///< [n_layers * n_expert] blob address or 0
     basalt::kernels::NativeExpertLayout* lay = nullptr;
     void* pscr = nullptr;
@@ -68,6 +70,7 @@ struct DecMoe {
         PeerExperts* peer = nullptr;
         int dev = -1;
         cudaStream_t ps = nullptr;
+        std::unique_ptr<PeerWindowLauncher> launcher;
         int32_t* res = nullptr;                  ///< CUDA0: [n_layers * n_expert] its slot or -1
         std::vector<int32_t> shadow;             ///< what res holds
         unsigned long long* ptab = nullptr;      ///< its card: blob address or 0

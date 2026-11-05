@@ -30,6 +30,12 @@ Flow Request::complete() {
                                                      " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                      " ms/window for it)").c_str());
         const std::string evr = basalt::core::decode_events().report();
+        basalt::log::info("basalt decode stage", "ms/window: inputs+PLE prefetch %.3f, residency upload %.3f, "
+                          "peer launch %.3f, PLE collect %.3f",
+                          (runtime_.ver.ms_stage_inputs - stage0[0]) / w, (runtime_.ver.ms_stage_residency - stage0[1]) / w,
+                          (runtime_.ver.ms_stage_peer - stage0[2]) / w, (runtime_.ver.ms_stage_ple - stage0[3]) / w);
+        const std::string pio = runtime_.ple_table.io_report();
+        if (!pio.empty()) basalt::log::info("basalt cumulative", "%s", pio.c_str());
         if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
         const std::string pr = runtime_.ver.profile_report();
         if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());

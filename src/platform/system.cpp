@@ -2,6 +2,7 @@
 #include "basalt/platform/system.hpp"
 
 #include "basalt/platform/file.hpp"
+#include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/process.hpp"
 
 #include <cctype>
@@ -23,6 +24,24 @@
 #endif
 
 namespace basalt::platform {
+
+bool gpu_physical_free(const std::string& pci_bus_id, uint64_t& bytes) {
+    bytes = 0;
+    DynLib lib = DynLib::open_nvml();
+    if (!lib) return false;
+    const auto init = lib.sym<int (*)()>("nvmlInit_v2");
+    const auto shutdown = lib.sym<int (*)()>("nvmlShutdown");
+    const auto handle = lib.sym<int (*)(const char*, void**)>("nvmlDeviceGetHandleByPciBusId_v2");
+    struct Memory { unsigned long long total, free, used; };
+    const auto memory = lib.sym<int (*)(void*, Memory*)>("nvmlDeviceGetMemoryInfo");
+    if (!init || !shutdown || !handle || !memory || init() != 0) return false;
+    void* device = nullptr;
+    Memory info{};
+    const bool ok = handle(pci_bus_id.c_str(), &device) == 0 && memory(device, &info) == 0;
+    shutdown();
+    if (ok) bytes = info.free;
+    return ok;
+}
 
 namespace {
 /// An argument for a shell's command line: wrapped in quotes the shell reads literally.
