@@ -228,3 +228,6 @@ of experts outside VRAM, and so does the error. The bare defaults are not measur
 The anonymous full-RAM arena uses the resident complement's automatic chunk ceiling, bounded by lendable cache capacity.
 A file-backed arena keeps the conservative 8192-token ceiling unless `auto:N` is explicit. Different chunk grids can
 change K/V rounding for long prompts; the quality gate's 256-token prompt half still fits in one chunk.
+
+Single-request PCIe staging is opt-in. It computes selected CPU misses on the GPU with the existing GPU expert
+arithmetic; changing their placement can change rounding against CPU computation.

@@ -200,9 +200,9 @@ bool Verifier::dm_init(std::string& err) {
         w->logits.assign((size_t) kVerifyMaxT * g.n_expert, 0.0f);
         d->warm = w;
     }
-    // The staged share: on one card, a batch window's layer with enough CPU misses sends some of them to CUDA0, copied
+    // The staged share: on one card, a window's layer with enough CPU misses sends some of them to CUDA0, copied
     // over PCIe from their RAM copies into staging while the pool reads the rest.  An expert without a mapped RAM copy
-    // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
+    // is never staged; the addresses are read again before a window when the source's places moved (a swap).
     // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
     // memory at once.
     bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
@@ -236,11 +236,15 @@ bool Verifier::dm_init(std::string& err) {
                    cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
         if (!sok) { err = "verify: the staged share's buffers"; return false; }
         std::memset(d->stage_host, 0, (size_t) LE * 8);
-        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
+        d->stage_gen = warm_src_->places_generation() + 1;   // read at the first window
         d->stage_stride = stride;
         d->stage_blocks = 8;
         d->stage_min = 1;
         while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
+        basalt::log::info("basalt verify", "staged share: %s windows, a layer with %d+ CPU misses sends a share over "
+                         "PCIe to CUDA0 (%d slots, %lld bytes each)",
+                         single_request_staging_ ? "single-request and batch" : "batch",
+                         d->stage_min, stage_slots, (long long) stride);
     }
     std::string served;
     if (d->pdev >= 0) {

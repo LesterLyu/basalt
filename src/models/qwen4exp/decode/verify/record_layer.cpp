@@ -231,6 +231,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     ring_fork = pk_ring;
     // the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
     glue_on = false;
+    staged = false;
     if (pk_ring && v_.dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
         const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
         glue_on = v_.dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type));
@@ -326,7 +327,8 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         ra.stats = v_.dm_->wstat;
         ra.peer_cap = 0;
         ra.rows = v_.dm_->rq != nullptr || v_.dm_->warm != nullptr;
-        if (v_.dm_->stage_src != nullptr && v_.batch_rec_) {   // batch windows: many rows, many misses
+        staged = v_.dm_->stage_src != nullptr && (v_.batch_rec_ || v_.single_request_staging_);
+        if (staged) {
             ra.stage_src = v_.dm_->stage_src + l * g.n_expert;
             ra.stage_k = v_.dm_->stage_k;
         }

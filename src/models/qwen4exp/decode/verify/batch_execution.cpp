@@ -133,15 +133,19 @@ bool Verifier::dm_stage_places(std::string& err) {
     if (gen == d->stage_gen) return true;
     const ModelGeometry& g = *g_;
     const int64_t LE = g.n_layers * g.n_expert;
-    bool changed = false;
+    int64_t first = LE, end = 0;
     for (int64_t i = 0; i < LE; ++i) {
         const unsigned long long p = (unsigned long long) warm_src_->device_alias(i / g.n_expert, i % g.n_expert);
         const unsigned long long v = (p & 15ull) == 0 ? p : 0ull;
-        changed = changed || d->stage_host[i] != v;
+        if (d->stage_host[i] != v) {
+            first = std::min(first, i);
+            end = i + 1;
+        }
         d->stage_host[i] = v;
     }
     d->stage_gen = gen;
-    if (changed && cudaMemcpyAsync(d->stage_src, d->stage_host, (size_t) LE * 8, cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+    if (first < end && copy_small(d->stage_src + first, d->stage_host + first,
+                                 (size_t) (end - first) * sizeof(*d->stage_src), cs_) != cudaSuccess) {
         err = std::string("verify: the staged share's addresses: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
