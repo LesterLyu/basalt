@@ -25,8 +25,7 @@ int run_deepseek(const Options& o) {
            o.no_pool || !o.dump_routing.empty() || !o.dump_mixed.empty() || !o.dump_final_r.empty() ||
            !o.rope_scaling.empty() || o.rope_scale!=0 || o.rope_freq_base!=0 || o.rope_freq_scale!=0 ||
            o.yarn_orig_ctx!=0 || o.yarn_ext_factor!=-1 || o.yarn_attn_factor!=1 || o.yarn_beta_fast!=32 || o.yarn_beta_slow!=1 ||
-           o.relaxed_drafting>0 || o.route_prior>0 || o.route_tail_skip>0 ||
-           std::any_of(o.expert_cache_remote.begin(),o.expert_cache_remote.end(),[](int n){return n!=0;})) {
+           o.relaxed_drafting>0 || o.route_prior>0 || o.route_tail_skip>0) {
             basalt::log::error("basalt deepseek41","requested Qwen-only tuning, dump or memory mode is not implemented");return 2;
         }
         if((o.tokens.empty() && !o.serve) || o.max_context<16 || o.max_context>1048576 || o.max_new<1 ||

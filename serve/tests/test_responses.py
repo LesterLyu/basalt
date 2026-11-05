@@ -196,6 +196,7 @@ class Server(unittest.TestCase):
 class OverHttp(Server):
     def test_deepseek_image_history_is_not_capped_at_eight(self):
         from serve.deepseek import DeepSeekTemplate
+        from serve.engine.vision import Vision
 
         self.svc.template = DeepSeekTemplate()
 
@@ -203,12 +204,16 @@ class OverHttp(Server):
             SPECIALS = ByteTokenizer.SPECIALS + [DeepSeekTemplate.image_placeholder]
 
         self.svc.tok = self.tok = ImageTokenizer()
-        sources = ["data:image/png;base64," + base64.b64encode(str(i).encode()).decode() for i in range(10)]
+        pixels = [b"\x89PNG\r\n\x1a\n" + str(i).encode() for i in range(10)]
+        sources = ["data:image/png;base64," + base64.b64encode(png).decode() for png in pixels]
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "request.sve"
             seen = []
 
-            class Vision:
+            class StubEncoder:
+                read = Vision.read
+                normalize = staticmethod(Vision.normalize)
+
                 def encode(self, images, *, token_budget):
                     seen.append(images)
                     if len(images) * 1024 > token_budget:
@@ -216,7 +221,7 @@ class OverHttp(Server):
                     path.write_bytes(b"fixture")
                     return path, [1024] * len(images)
 
-            self.svc.vision = Vision()
+            self.svc.vision = StubEncoder()
             history = [{"role": "user", "content": [
                 {"type": "input_text", "text": f"Screenshot note {i}."},
                 {"type": "input_image", "image_url": url},
@@ -231,13 +236,20 @@ class OverHttp(Server):
                     code, response = self.post({"model": self.svc.model, "input": history[:count + 1], "stream": True})
                     self.assertEqual(code, 200, response)
                     self.assertEqual(response[-1]["type"], "response.completed")
-                    self.assertEqual(seen[-1], sources[:count])
+                    self.assertEqual(seen[-1], pixels[:count])
                     prompt = self.tok.decode(self.engine.last_prompt)
                     self.assertNotIn("Basalt omitted this image", prompt)
                     self.assertEqual(prompt.count(DeepSeekTemplate.image_placeholder), 1024 * count)
                     self.assertIn("Screenshot note 0.", prompt)
                     self.assertIn(f"Screenshot note {count - 1}.", prompt)
                     self.assertFalse(path.exists())
+
+            url = "https://images.example/screenshot.png"
+            blocked = [{"role": "user", "content": [{"type": "input_image", "image_url": url}]}]
+            code, _ = self.post({"model": self.svc.model, "input": blocked},
+                                headers={"X-Forwarded-For": "203.0.113.9"})
+            self.assertEqual(code, 400)
+            self.assertEqual(len(seen), 2)
 
     def test_non_streaming_text_with_reasoning(self):
         code, r = self.post({"model": "qwen3.8-flash-next", "input": "hi", "store": False})
