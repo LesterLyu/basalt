@@ -148,7 +148,7 @@ def _number(v) -> bool:
 FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 # Engine ERR texts that are the request's fault (a 400); any other ERR of a request is an engine failure (a 500).
-REQUEST_ERRS = ("prompt (", "bad request:", "sampling ", "logit_bias:", "grammar:", "ppl:",
+REQUEST_ERRS = ("prompt (", "bad request:", "sampling ", "logit_bias:", "grammar:", "elastic KV:", "ppl:",
                 "a token id is outside the vocabulary", "this engine was started without --vision",
                 "the prompt cannot end in an image")
 
@@ -333,7 +333,7 @@ class ProcessEngine:
         self.lines: queue.Queue = queue.Queue()
         # the engine reports the slots it actually runs (INFO batch_slots=N), possibly fewer than asked
         asked = next((int(v) for v in (flag_value(args, k) for k in ("--batch", "--slots")) if v), 0)
-        self.batch = int(self.info.get("batch_slots") or 0)
+        self.batch = self.batch_slots()
         if asked and self.batch != asked:
             print(f"[server] warning: {asked} parallel requests asked, the engine runs {self.batch or 'one'}", flush=True)
         self.slot_order = list(range(self.batch))
@@ -356,6 +356,9 @@ class ProcessEngine:
         self.wlock = threading.Lock()                   # serializes stdin writes
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+
+    def batch_slots(self) -> int:
+        return int(self.info.get("batch_slots") or 0)
 
     def _note_load(self, status: dict) -> None:
         self.load_status = status

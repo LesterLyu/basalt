@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -20,7 +21,8 @@ class SuffixDrafter {
 public:
     static constexpr int WAYS = 4;
 
-    explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19);
+    explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19,
+                           int bigram_width = 0, bool trim_minority = false, bool skip_pairs = false);
 
     void reset();
     /// Add tokens to the history (the prompt, then every accepted token).
@@ -42,10 +44,15 @@ private:
     };
     Slot* find_slot(uint64_t key, bool insert);
     uint64_t key_at(size_t end) const;
+    uint64_t pair_at(size_t end, size_t distance) const;
+    int propose_pair(int max_k, int32_t* out);
 
     int min_match_, max_match_;
     std::vector<int32_t> hist_;
     std::vector<Slot> table_;
+    std::array<std::vector<Slot>,3> pairs_;
+    int bigram_width_=0;
+    bool trim_minority_=false;
     size_t mask_ = 0;
     int last_match_ = 0;
 };

@@ -377,14 +377,13 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_pdl_kernel(const floa
                                                                       const float* __restrict__ up,
                                                                       const int32_t* __restrict__ grp_start,
                                                                       const int32_t* __restrict__ n_groups, int n_ff,
-                                                                      block_q8_1* __restrict__ hq) {
+                                                                      block_q8_1* __restrict__ hq, float limit = 0.f) {
     pdl_trigger();
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     pdl_wait();
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
-        const float g = gate[i];
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = native_swiglu(gate[i], up[i], limit);
         q8_1_store(h, hq, i);
     }
 }

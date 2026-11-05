@@ -144,6 +144,23 @@ int main() {
               "a tensor is at the section offset + its own, and its bytes are in the mapping");
         check(g.in_bounds(*t, 0), "in_bounds");
     }
+    {
+        const std::string submeta =
+            R"({"gguf_kv":{"general.architecture":"deepseek41"},"tensors":{},)"
+            R"("dspark":{"gguf_kv":{"general.architecture":"dflash"},)"
+            R"("tensors":{"draft.weight":{"type_id":0,"shape":[2],"bytes":8,"offset":0}}}})";
+        const std::string subpath = write_model(d.path / "submodel.basalt", {{"meta", submeta}, {"dspark/gguf", "12345678"}});
+        ModelFile sub;
+        check(sub.open(subpath, err) && sub.load_meta(err) && sub.register_gguf_view(err) &&
+              sub.register_gguf_view(err, "dspark"), "register separate target and draft views");
+        const basalt::GgufFile target(subpath), draft(subpath + "#dspark");
+        const auto* t = draft.find("draft.weight");
+        check(target.get("general.architecture")->s == "deepseek41" && !target.find("draft.weight") &&
+              draft.get("general.architecture")->s == "dflash" && draft.path() == subpath &&
+              t && std::memcmp(draft.tensor_data(*t), "12345678", 8) == 0,
+              "submodel alias reads its physical container without mixing target metadata");
+        check(!sub.register_gguf_view(err, "missing"), "absent submodel refused");
+    }
 
     std::printf("3. the expert layout text and the hc8 table\n");
     {

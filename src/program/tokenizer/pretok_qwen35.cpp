@@ -151,4 +151,65 @@ void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends) {
     }
 }
 
+// JoyAI applies three regex partitions in order. Keep each partition's unmatched gaps.
+void pretok_joyai(const char* text,size_t size,std::vector<size_t>& ends) {
+    struct Point {uint32_t cp;uint16_t flags;size_t offset;};
+    std::vector<Point> points;
+    const auto* table=cpt_flag_table();
+    for(size_t i=0;i<size;) {
+        size_t n=0;const auto cp=decode_cp(reinterpret_cast<const uint8_t*>(text),size,i,n);
+        points.push_back({cp,table[cp],i});i+=n;
+    }
+    const auto cjk=[](uint32_t c) {
+        return (c>=0x4e00 && c<=0x9fa5) || (c>=0x3040 && c<=0x309f) || (c>=0x30a0 && c<=0x30ff);
+    };
+    const auto ascii_letter=[](uint32_t c){return (c>='a' && c<='z') || (c>='A' && c<='Z');};
+    const auto ascii_punct=[](uint32_t c) {
+        return (c>=33 && c<=47) || (c>=58 && c<=64) || (c>=91 && c<=96) || (c>=123 && c<=126);
+    };
+    const auto newline=[](uint32_t c){return c=='\r' || c=='\n';};
+    std::vector<size_t> cuts{0,points.size()},next;
+    for(int pass=0;pass<3;++pass) {
+        next.clear();next.push_back(0);
+        for(size_t part=1;part<cuts.size();++part) {
+            const auto limit=cuts[part];
+            const auto flag=[&](size_t j){return j<limit?points[j].flags:uint16_t(0);};
+            const auto cp=[&](size_t j){return j<limit?points[j].cp:kOutOfRange;};
+            auto cut=[&](size_t x){if(x>next.back())next.push_back(x);};
+            for(size_t pos=cuts[part-1];pos<limit;) {
+                size_t end=pos;
+                const auto f=flag(pos);const auto c=cp(pos);
+                if(pass==0) {
+                    while(end<pos+3 && (flag(end)&kNumber))++end;
+                } else if(pass==1) {
+                    while(cjk(cp(end)))++end;
+                } else if(ascii_punct(c) && ascii_letter(cp(pos+1))) {
+                    end=pos+2;while(ascii_letter(cp(end)))++end;
+                } else if((f&(kLetter|kMark)) ||
+                          (!newline(c) && !(f&(kLetter|kPunctuation|kSymbol)) && (flag(pos+1)&(kLetter|kMark)))) {
+                    end=pos+1;while(flag(end)&(kLetter|kMark))++end;
+                } else if(flag(pos+(c==' '))&(kPunctuation|kSymbol)) {
+                    end=pos+(c==' ');
+                    while(flag(end)&(kPunctuation|kSymbol))++end;
+                    while(newline(cp(end)))++end;
+                } else if(f&kWhitespace) {
+                    size_t last_newline=0;
+                    while(flag(end)&kWhitespace) {
+                        if(newline(cp(end)))last_newline=end+1;
+                        ++end;
+                    }
+                    if(last_newline)end=last_newline;
+                    else if(end<limit && end>pos+1)--end;
+                }
+                if(end==pos)++pos;
+                else {cut(pos);cut(end);pos=end;}
+            }
+            cut(limit);
+        }
+        cuts.swap(next);
+    }
+    ends.clear();
+    for(size_t i=1;i<cuts.size();++i)ends.push_back(cuts[i]<points.size()?points[cuts[i]].offset:size);
+}
+
 }  // namespace basalt::program::tokenizer

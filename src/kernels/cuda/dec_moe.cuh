@@ -2224,7 +2224,7 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
     const DmPlan* P = a.plan;
     const long long nh = (long long) cap * L.n_ff;
     launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
-                     (const float*) up, (const int32_t*) P->start, (const int32_t*) P->counts, (int) L.n_ff, hq);
+                     (const float*) up, (const int32_t*) P->start, (const int32_t*) P->counts, (int) L.n_ff, hq, L.swiglu_limit);
     check("dec_moe_glue/swiglu");
     const int d_rows = kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8);
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
@@ -2528,7 +2528,7 @@ void dec_moe_vram(const NativeExpertLayout& L, const DmPlan* plan, const void* x
         block_q8_1* hq = (block_q8_1*) (up + (size_t) kDmCap * L.n_ff);
         const long long nh = (long long) cap * L.n_ff;
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, plan->start, plan->counts,
-                                                                                (int) L.n_ff, hq);
+                                                                                (int) L.n_ff, hq, L.swiglu_limit);
         const int d_rows = kDown40Type(L.d_type) ? 32 : (L.d_type == 42 ? 16 : 8);
         const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) cap);
         switch (L.d_type) {

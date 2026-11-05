@@ -110,6 +110,33 @@ void refusals() {
     check(!load(layout(5, blob + 8, ""), 2, 512, err), "a blob size that does not match the formats is refused");
     check(!load("# experts v5: x\n0 12 seven 0 1\n", 1, 512, err), "a malformed line is refused");
 }
+
+void geometries() {
+    namespace cpu = basalt::kernels::cpu;
+    cpu::NativeFmt f;
+    std::string err;
+    check(!cpu::native_fmt(19, 19, 5120, 2304, f, err), "larger activations do not fit the default pool buffers");
+    const cpu::ExpertGeometry shape{5120, 2304, {8192, 4096}};
+    for (const auto pair : {std::pair<int, int>{19, 19}, {19, 16}, {16, 19}, {39, 39}}) {
+        const bool fmt = cpu::native_fmt(pair.first, pair.second, 5120, 2304, f, err, shape.buffers);
+        check(fmt, "native format with explicit larger scratch capacities");
+        if (!fmt) continue;
+        const auto text = layout(6, (int64_t) f.bytes, "", 3,
+                                 std::to_string(pair.first) + " " + std::to_string(pair.second));
+        check(cpu::expert_layout_load_text(text, 2, 3, err, shape), "5120/2304 layout loads");
+        const auto& got = cpu::expert_layout();
+        check(got.n_embd == 5120 && got.fmt[1].n_ff == 2304 && got.total == 6 * f.bytes,
+              "larger dimensions, offsets and bytes are preserved");
+        cpu::ExpertLayout local;
+        check(cpu::expert_layout_parse_text(layout(6, (int64_t) f.bytes, "", 7,
+                                                   std::to_string(pair.first) + " " + std::to_string(pair.second)),
+                                           2, 7, local, err, shape) && local.n_expert == 7 &&
+              cpu::expert_layout().n_expert == 3, "a model-local layout leaves the process-wide layout unchanged");
+        check(!load(text, 2, 3, err), "larger layout is not silently accepted as the default geometry");
+    }
+    check(!cpu::expert_layout_load_text("", 0, 3, err, shape), "zero layer count is refused");
+    check(!cpu::native_fmt(19, 19, 0, 2304, f, err, shape.buffers), "zero hidden dimension is refused");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -120,6 +147,7 @@ int main(int argc, char** argv) {
     }
     real_layouts(argv[1]);
     refusals();
+    geometries();
     std::printf(g_fail ? "expert_layout_test: %d FAILED\n" : "expert_layout_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

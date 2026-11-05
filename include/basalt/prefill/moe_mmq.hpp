@@ -28,6 +28,8 @@ size_t q8_bytes(int64_t rows, int64_t cols);
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
+/// Quantize clamped SwiGLU from split gate/up rows without materializing FP32 hidden rows.
+void quantize_swiglu(const float* gate_up,void* xq,int ggml_type,int64_t cols,int64_t rows,float limit,void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
@@ -47,6 +49,8 @@ struct Product {
     int64_t ld_dst = 0;
     /// The rows MMQ sizes its tile against (it takes its smallest tile of at least this many); 0: max_rows.
     int64_t opt_rows = 0;
+    // Optional logical SM count used only for stream-K partitioning.
+    int stream_k_sms = 0;
 };
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
@@ -57,6 +61,7 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
+    size_t reserved_bytes() const;
 
 private:
     void* ctx_ = nullptr;
@@ -89,7 +94,7 @@ void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
 /// h = silu(s_gate g) * (s_up u) * s_down, so the down product's output carries s_down (q8_1 keeps an fp32 scale
 /// per 32 values, so the scaled H rounds to the same codes up to fp32 rounding of that scale).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream,
-            const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0);
+            const float* tail = nullptr, const int32_t* bounds = nullptr, int n = 0, float limit = 0);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

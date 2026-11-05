@@ -365,10 +365,10 @@ def check_request(req: dict) -> None:
         raise ResponsesError("reasoning must be an object", "reasoning")
 
 
-def template_kwargs(req: dict) -> dict:
+def template_kwargs(req: dict, *, numeric_effort=False) -> dict:
     effort = (req.get("reasoning") or {}).get("effort")
     try:
-        return effort_kwargs(effort)
+        return effort_kwargs(effort, numeric=numeric_effort)
     except ValueError as e:
         raise ResponsesError(str(e), "reasoning.effort") from None
 

@@ -377,7 +377,117 @@ std::string tool_call_gbnf(const std::string& tools_json, const ToolGrammarOptio
     return c.format_grammar();
 }
 
-RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err) {
+namespace {
+
+// The streaming parser treats DSML closing markers as delimiters, not parameter text.
+std::string ds_raw_text(SchemaConverter& c) {
+    // Accept all Unicode characters except a slash followed by the DSML sentinel.
+    // A DFA keeps partial matches at the end of the value and permits repeated slashes.
+    const std::vector<std::string> tag={"/","｜","D","S","M","L","｜"};
+    const std::set<std::string> alpha(tag.begin(),tag.end());
+    std::string excluded;
+    for(const auto& a:alpha)excluded+=a;
+    for(size_t i=0;i<tag.size();++i) {
+        std::vector<std::string> alts={"\"\"", "[^"+excluded+"] ds-raw-0"};
+        for(const auto& a:alpha) {
+            std::vector<std::string> next(tag.begin(),tag.begin()+i);
+            next.push_back(a);
+            size_t n=std::min(tag.size(),next.size());
+            while(n && !std::equal(next.end()-n,next.end(),tag.begin()))--n;
+            if(n<tag.size())alts.push_back(literal(a)+" ds-raw-"+std::to_string(n));
+        }
+        c.add_rule("ds-raw-"+std::to_string(i),join(alts," | "));
+    }
+    return "ds-raw-0";
+}
+
+constexpr const char* ds_trigger="<｜DSML｜";
+std::string ds_tool_gbnf(const JsonValue& tools,const JsonValue* final_schema,bool required,bool parallel,std::string& err) {
+    try {
+        if(tools.items.empty())throw std::invalid_argument("no matching function");
+        SchemaConverter c;
+        std::string raw_rule;
+        std::vector<std::string> calls;
+        for(size_t ti=0;ti<tools.items.size();++ti) {
+            const auto& item=tools.items[ti];
+            const auto* f=item.get("function");if(!f)f=&item;
+            const auto* name=f->get("name");
+            if(!name || !name->is(Type::String) || name->s.empty() || name->s.find_first_of("\"<>\r\n")!=std::string::npos)
+                throw std::invalid_argument("invalid DSML function name");
+            const auto* params=f->get("parameters");if(!params)params=f->get("input_schema");
+            const auto* props=params?params->get("properties"):nullptr;
+            const auto* req=params?params->get("required"):nullptr;
+            std::set<std::string> needed;
+            if(req)for(const auto& n:req->items)needed.insert(n.s);
+            const std::string fn="ds-fn-"+std::to_string(ti);
+            std::vector<std::string> req_rules,opt_rules;
+            if(props)for(const auto& [key,sch]:props->members) {
+                if(key.find_first_of("\"<>\r\n")!=std::string::npos)
+                    throw std::invalid_argument("invalid DSML parameter name");
+                const std::string param=fn+"-p-"+std::to_string(req_rules.size()+opt_rules.size());
+                const std::string open="<｜DSML｜ parameter name=\""+key+"\" string=\"";
+                const std::string close=literal("</｜DSML｜ parameter>\n");
+                const JsonValue* plain=deref(params,&sch);
+                const auto* ty=plain?plain->get("type"):nullptr;
+                const auto* en=plain?plain->get("enum"):nullptr;
+                const auto* cn=plain?plain->get("const"):nullptr;
+                std::vector<std::string> raw;
+                auto add=[&](const JsonValue& v) {
+                    if(v.is(Type::String) && v.s.find("/｜DSML｜")==std::string::npos)raw.push_back(literal(v.s));
+                };
+                if(en)for(const auto& e:en->items)add(e);
+                if(cn)add(*cn);
+                bool unconstrained=plain && ty && is_text_type(*ty) && !en && !cn;
+                for(const char* field:{"minLength","maxLength","pattern","format","anyOf","oneOf","allOf","not"})
+                    if(plain && plain->get(field))unconstrained=false;
+                if(unconstrained) {
+                    if(raw_rule.empty())raw_rule=ds_raw_text(c);
+                    raw.push_back(raw_rule);
+                }
+                const auto doc=build_schema_document(sch,params);
+                const auto json_rule=c.add_schema(param+"-json",*doc.root);
+                std::string body=literal(open+"false\">")+" "+json_rule+" "+close;
+                if(!raw.empty())body+=" | "+literal(open+"true\">")+" ("+join(raw," | ")+") "+close;
+                const auto rule=c.add_rule(param,body);
+                (needed.erase(key)?req_rules:opt_rules).push_back(rule);
+            }
+            if(!needed.empty())throw std::invalid_argument("required parameter has no definition");
+            std::string body;
+            const size_t n=req_rules.size();
+            if(n>1 && n<=6) {
+                const auto rule=[&](size_t mask){return fn+"-req-"+std::to_string(mask);};
+                for(size_t mask=1;mask<(size_t(1)<<n);++mask) {
+                    std::vector<std::string> alts;
+                    for(size_t i=0;i<n;++i) {
+                        const size_t bit=size_t(1)<<i;
+                        if(mask&bit)alts.push_back(req_rules[i]+((mask^bit)?" "+rule(mask^bit):""));
+                    }
+                    c.add_rule(rule(mask),join(alts," | "));
+                }
+                body=rule((size_t(1)<<n)-1)+" ";
+            } else for(const auto& rule:req_rules)body+=rule+" ";
+            for(const auto& rule:opt_rules)body+=rule+"? ";
+            calls.push_back(c.add_rule(fn,literal("<｜DSML｜ invoke name=\""+name->s+"\">\n")+" "+
+                                          body+literal("</｜DSML｜ invoke>\n")));
+        }
+        const auto invoke=c.add_rule("ds-invoke",join(calls," | "));
+        const auto block=c.add_rule("ds-call",literal("<｜DSML｜ calls>\n")+" "+invoke+(parallel?"+":"")+" "+
+                                                   literal("</｜DSML｜ calls>"));
+        std::string root=block;
+        if(final_schema && !required) {
+            const auto doc=build_schema_document(*final_schema);
+            root+=" | "+c.add_schema("ds-answer",*doc.root);
+        }
+        c.add_rule("root",(required || final_schema?"[ \\t\\r\\n]* (":"(")+root+")");
+        c.check_errors();
+        return c.format_grammar();
+    } catch(const std::exception& e) {
+        err=std::string("tools: ")+e.what();return {};
+    }
+}
+}
+
+RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err, bool deepseek) {
     RequestGrammar out;
     JsonValue req;
     if (!read_json(grammar_json, req, err)) return out;
@@ -432,8 +542,22 @@ RequestGrammar grammar_from_request(const std::string& grammar_json, std::string
                 if (nm && nm->is(Type::String) && nm->s == only) list.items.push_back(t);
             }
         }
-        gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
-        out.triggers.words = {tool_call_trigger()};
+        if (deepseek) {
+            const auto* choice = req.get("tool_choice");
+            const bool required = !only.empty() || (choice && ((choice->is(Type::String) &&
+                (choice->s == "required" || choice->s == "any")) || (choice->is(Type::Object) &&
+                choice->get("type") && choice->get("type")->s == "any")));
+            const auto* schema = req.get("final_schema");
+            const auto* parallel = req.get("parallel_tool_calls");
+            gbnf = ds_tool_gbnf(list, schema, required, !parallel || parallel->dump() != "false", err);
+            if (!required && !schema) {
+                out.triggers.words = {ds_trigger};
+                out.triggers.once = true;
+            }
+        } else {
+            gbnf = tool_call_gbnf(list.dump(), ToolGrammarOptions{}, err);
+            out.triggers.words = {tool_call_trigger()};
+        }
     } else {
         err = "grammar: unknown kind '" + kind->s + "'";
         return out;

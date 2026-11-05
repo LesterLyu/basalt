@@ -1143,17 +1143,22 @@ struct SmallTraits {
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
 bool g_multi_exact = true;   // the upstream layout is not the default
 
-template<typename F, int NCOLS, int NW, int ROWS>
+template<typename F, int NCOLS, int NW, int ROWS, bool GROUPED = false>
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
                                          const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out) {
+                                         float* __restrict__ y, int n_in, int n_out, int groups) {
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
     const int blocks_per_row = n_in / F::DIV;
+    if constexpr (GROUPED) {
+        w += std::size_t(blockIdx.y) * n_out * blocks_per_row;
+        x += std::size_t(blockIdx.y) * (n_in / Q8K);
+        y += std::size_t(blockIdx.y) * n_out;
+    }
     pdl_wait();
-    const int x_stride = n_in / Q8K;                   // Q8_1 blocks per activation column
+    const int x_stride = (GROUPED?groups:1) * (n_in / Q8K);                   // Q8_1 blocks per activation column
     float tmp[NCOLS][ROWS] = {};
     for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
         const int kby = kbx * F::KBY;
@@ -1185,7 +1190,7 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 #pragma unroll
             for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
             tmp[j][i] = warp_sum(tmp[j][i]);
-            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * (GROUPED?groups:1) * n_out + row0 + i] = tmp[j][i];
         }
     }
 }
@@ -1197,17 +1202,17 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
-        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out);
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out, 1);
         return;
     }
     const dim3 threads(WARP, WARPS);
     if (n_in / F::DIV < F::BPI) {
         constexpr int ROWS = 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
-        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, 1);
     } else {
         launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in,
-                   n_out);
+                   n_out, 1);
     }
 }
 
@@ -1224,6 +1229,33 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
         case 7: launch_multi_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: launch_multi_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
         default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8");
+    }
+}
+
+template<typename F,int NCOLS>
+void launch_grouped_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int groups,
+                       cudaStream_t stream) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if (n_in / F::DIV < F::BPI) {
+        constexpr int ROWS = WARPS;
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true>,
+                   dim3(unsigned((n_out + ROWS - 1) / ROWS), unsigned(groups)), dim3(WARP, WARPS), 0,
+                   stream, w, x, y, n_in, n_out, groups);
+    } else {
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true>,
+                   dim3(unsigned(n_out), unsigned(groups)), dim3(WARP, WARPS), 0, stream, w, x, y, n_in, n_out, groups);
+    }
+}
+template<typename F>
+void launch_grouped(const void* w,const void* x,float* y,int in,int out,int groups,int tokens,cudaStream_t stream) {
+    switch(tokens) {
+        case 1: launch_grouped_n<F,1>(w,x,y,in,out,groups,stream);break;
+        case 2: launch_grouped_n<F,2>(w,x,y,in,out,groups,stream);break;
+        case 3: launch_grouped_n<F,3>(w,x,y,in,out,groups,stream);break;
+        case 4: launch_grouped_n<F,4>(w,x,y,in,out,groups,stream);break;
+        case 5: launch_grouped_n<F,5>(w,x,y,in,out,groups,stream);break;
+        case 6: launch_grouped_n<F,6>(w,x,y,in,out,groups,stream);break;
     }
 }
 
@@ -1941,7 +1973,7 @@ bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 19 || ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == 39;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -1958,7 +1990,8 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 14: block_elems = 256; block_bytes = 210; break;
     case 23: block_elems = 256; block_bytes = 136; break;
     case 42: block_elems = 64; block_bytes = 18; break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
+    case 39: block_elems = 32; block_bytes = 17; break;
+    case 16: case 17: case 18: case 19: case 21: case 22: case 29:
         block_elems = 256; block_bytes = (int) iq_row_bytes(ggml_type, 256); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
@@ -1969,6 +2002,21 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
         throw std::length_error("native MMVQ weight byte count overflows size_t");
     }
     return row_bytes * std::size_t(n_out);
+}
+
+void native_mmvq_grouped(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int groups, void* stream,int tokens) {
+    validate_shape(n_in, 1, 256);
+    if (n_out <= 0 || groups <= 0 || groups > 8 || tokens<1 || tokens>6)
+        throw std::invalid_argument("invalid grouped native MMVQ geometry");
+    validate_pointer(weights); validate_pointer(x_q8_1); validate_pointer(y); validate_stream(stream);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ggml_type) {
+    case 13: launch_grouped<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, groups, tokens, s); break;
+    case 14: launch_grouped<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, groups, tokens, s); break;
+    default: throw std::invalid_argument("grouped native MMVQ requires Q5_K or Q6_K");
+    }
+    launch_check();
 }
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
@@ -1985,7 +2033,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
+    case 16: case 17: case 18: case 19: case 21: case 22: case 29: case 39:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }

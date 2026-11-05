@@ -29,6 +29,7 @@ std::optional<int> parse_options(int argc, char** argv, Options& o, std::string&
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--model") o.model = next("--model");
+        else if (a == "--dspark-model") o.dspark_model = next("--dspark-model");
         else if (a == "--tokens") {
             if (have_tokens) { basalt::log::error("basalt", "supply one token input only"); return 2; }
             std::string e;

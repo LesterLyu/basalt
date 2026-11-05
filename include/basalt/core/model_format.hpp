@@ -28,6 +28,9 @@
 //   hc8                      the 8-bit copies of the hyper-connection matrices (model_file.hpp), required
 //   vision/mmproj            the vision projector GGUF, whole
 //   vision/<name>            anything else the vision sidecar reads
+// DeepSeek uses `experts`, `experts.layout`, `gguf` and `tokenizer/*` for the target, `dspark/experts`,
+// `dspark/experts.layout` and `dspark/gguf` for the drafter, and `engram.map` for its little-endian U32 token map.
+// Its submodel metadata is in meta.dspark; it does not use Qwen's dense, hc8 or mtp sections.
 #include <cstdint>
 
 namespace basalt::core {

@@ -9,6 +9,7 @@
 #include "basalt/kernels/cpu/nvfp4_avx512.hpp"
 #include "basalt/kernels/cpu/nvfp4_avx2.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
+#include "basalt/core/diag.hpp"
 
 #include "basalt/ggml/ggml.h"
 
@@ -25,7 +26,9 @@ const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((
 
 bool native_experts_available() noexcept { return true; }
 
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
+                NativeBufferLimits limits) {
+    if (n_embd <= 0 || n_ff <= 0) { err = "native experts: dimensions must be positive"; return false; }
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);
     if (tg == nullptr || tg->vec_dot == nullptr || td == nullptr || td->vec_dot == nullptr) {
@@ -49,6 +52,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
+    f.swiglu_limit = 0.f;
     f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
     f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
@@ -64,7 +68,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.bytes += f.tail;
     f.act_bytes = ggml_row_size(tg->vec_dot_type, n_embd);
     f.h_bytes = ggml_row_size(td->vec_dot_type, n_ff);
-    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
+    if (f.act_bytes > limits.activation || f.h_bytes > limits.intermediate) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
     }
@@ -85,6 +89,11 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.d_act == GGML_TYPE_Q8_K) {
+        if (cpu_avx512_ok()) quantize_q8_K_avx512(h, dst, f.n_ff);
+        else quantize_q8_K_avx2(h, dst, f.n_ff);
+        return;
+    }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
@@ -97,7 +106,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     static const bool avx512 = cpu_avx512_ok();
     static const bool avx2 = cpu_avx2_ok();
     static const bool cpu512 = avx512;
-    if ((iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
+    if(avx2 && f.gu_type==19) {
+        iq1s256_gu_rows(blob,f.gu_row,f.up_off,int(f.n_embd),act,nt,ff,r0,r1,f.swiglu_limit);
+        return;
+    }
+    if (f.swiglu_limit <= 0.f && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
@@ -115,12 +128,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         std::memcpy(&su, blob + f.bytes - f.tail + 4, 4);
     }
     // NVFP4 on AVX-512: the multi-token kernel, bitwise equal per token to the ggml dot it replaces.
-    if (avx512 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
+    if (f.swiglu_limit <= 0.f && avx512 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
         nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
         return;
     }
     // The same on AVX2 CPUs, bitwise equal per token to the AVX2 ggml dot.
-    if (!avx512 && avx2 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
+    if (f.swiglu_limit <= 0.f && !avx512 && avx2 && f.gu_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {
         nvfp4_256_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, act, nt, ff, r0, r1);
         return;
     }
@@ -135,6 +148,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
                 g *= sg;
                 u *= su;
             }
+            if (f.swiglu_limit > 0.f) {
+                g = std::fmin(g, f.swiglu_limit);
+                u = std::fmin(std::fmax(u, -f.swiglu_limit), f.swiglu_limit);
+            }
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
         }
     }
@@ -142,9 +159,17 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
-    // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles once per block instead of once per token;
-    // the ggml dot is single-token.
-    if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {   // the same rule as the gate/up rows
+    if(cpu_avx2_ok() && f.d_type==19) {
+        iq1s256_rows(blob+f.down_off,f.d_row,int(f.n_ff),hq,nt,out,r0,r1);
+        return;
+    }
+    if(f.d_type==GGML_TYPE_IQ2_XXS && nt>=2 && nt<=6 && cpu_avx512_ok() &&
+       core::exp_flag("ds-cpu-iq2-down-exact")!=0) {
+        iq2xxs512_rows_exact(blob+f.down_off,f.d_row,int(f.n_ff),hq,nt,out,r0,r1);
+        return;
+    }
+    // Decode IQ4_NL nibbles once per block for all tokens.
+    if (cpu_avx2_ok() && f.d_type == 20 && iq4nl256_fits((int) f.n_ff)) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }

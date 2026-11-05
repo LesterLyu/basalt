@@ -8,6 +8,9 @@ Test setup: one RTX 5090 at a 400 W power limit, an RTX 5060 Ti as the peer expe
 
 ## Summary
 
+Experimental [IQ1_S expert primitives](iq1s.md) and [DeepSeek/DSpark operations](deepseek41.md) have separate
+CPU/GPU parity checks; they do not yet provide a complete DeepSeek model backend.
+
 Changing the resident complement's registration cuts preserves expert bytes and arithmetic. Each registered chunk
 uses its own GPU alias. If more experts become available to the existing PCIe share, their CPU/GPU placement can
 change rounding as documented for that share below; fixed-tier greedy checks isolate the address-management change.

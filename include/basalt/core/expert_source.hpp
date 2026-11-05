@@ -450,11 +450,13 @@ public:
     /// margin) - the soft --resident-experts mode's second try when the whole complement does not fit; false when not
     /// even one expert fits.
     static constexpr uint64_t kResidentWhatFits = ~0ull;
+    enum class ResidentHeadroom { platform_minimum, exact };
     bool pin_cache_complement(
         const ExpertCache& cache, std::string& err, bool pin = true,
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
-        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+        const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr,
+        ResidentHeadroom headroom = ResidentHeadroom::platform_minimum);
     void close();
 
     /// Drop clean mapped pages after the GPU fill, before sizing the resident copy.
@@ -533,9 +535,10 @@ public:
     // returns the regions no expert uses to the OS.  Only on the main thread between requests, with no swap in flight
     // and no pool, keep-alive or read-ahead thread reading `blob()`; the place space only grows (a freed region's
     // places are not reused).
-    bool homes_take(const std::vector<std::pair<int32_t, int32_t>>& experts, std::string& err, std::vector<uint8_t*>& dst);
+    bool homes_take(const std::vector<std::pair<int32_t, int32_t>>& experts, std::string& err,
+                    std::vector<uint8_t*>& dst, bool pin = true, uint64_t ram_floor = 0);
     void homes_commit();
-    void homes_abort();
+    uint64_t homes_abort();
     bool home_release(int64_t layer, int64_t expert);
     uint64_t homes_reclaim();
     /// Moves the experts still in homes into fresh regions and frees the old ones (net bytes freed; 0 when it would
@@ -648,7 +651,7 @@ private:
     int64_t spares_want_ = 0;
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   // (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};
-    int64_t reads_ = 0;
+    std::atomic<int64_t> reads_{0};
     mutable int fd_ = -1;
     std::string path_;   ///< the mapped file, which the bulk reads open unbuffered
 };

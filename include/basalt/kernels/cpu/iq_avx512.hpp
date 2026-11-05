@@ -16,5 +16,7 @@ void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 /// out[t][r] = w_r . a[t], rows [r0, r1).
 void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
+// Decode two IQ2_XXS groups at once, but retain ggml's eight FP32 lanes and reduction order.
+void iq2xxs512_rows_exact(const uint8_t* w,size_t row_bytes,int n,const void* const* act,int nt,float* const* out,int r0,int r1);
 
 }  // namespace basalt::kernels::cpu

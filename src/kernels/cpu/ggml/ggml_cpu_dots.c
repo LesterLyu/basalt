@@ -1068,6 +1068,34 @@ static void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, c
 
 }
 
+static void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+    const block_iq1_s * GGML_RESTRICT x = vx;
+    const block_q8_K * GGML_RESTRICT y = vy;
+    float sum = 0.f;
+    for (int i = 0; i < n / QK_K; ++i) {
+        if (y[i].d == 0.f) continue;
+        int sumi = 0;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const uint16_t h = x[i].qh[ib];
+            const uint8_t * q = x[i].qs + 4 * ib;
+            const __m256i grid = _mm256_set_epi64x(
+                iq1s_grid[q[3] | (((h >> 9) & 7) << 8)],
+                iq1s_grid[q[2] | (((h >> 6) & 7) << 8)],
+                iq1s_grid[q[1] | (((h >> 3) & 7) << 8)],
+                iq1s_grid[q[0] | ((h & 7) << 8)]);
+            const __m256i q8 = _mm256_loadu_si256((const __m256i *) (y[i].qs + 32 * ib));
+            const int dot = hsum_i32_8(_mm256_madd_epi16(mul_add_epi8(grid, q8), _mm256_set1_epi16(1)));
+            const int delta = (h & 0x8000 ? -1 : 1) * (y[i].bsums[2 * ib] + y[i].bsums[2 * ib + 1]);
+            sumi += (8 * dot + delta) * (2 * ((h >> 12) & 7) + 1);
+        }
+        sum += (GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d * IQ1S_DELTA) * sumi;
+    }
+    *s = sum;
+}
+
 static void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -1249,6 +1277,31 @@ static inline float nvfp4_scale(uint8_t x) {
     float f;
     memcpy(&f, &bits, 4);
     return f;
+}
+
+static void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                                 size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_MXFP4 == 0 && nrc == 1);
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+    const block_mxfp4 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const __m128i values = _mm_loadu_si128((const __m128i *) kvalues_fp4);
+    const __m128i mask = _mm_set1_epi8(15);
+    float sum = 0.f;
+    for (int i = 0; i < n / QK_MXFP4; ++i) {
+        const __m128i q = _mm_loadu_si128((const __m128i *) x[i].qs);
+        const __m128i lo = _mm_shuffle_epi8(values, _mm_and_si128(q, mask));
+        const __m128i hi = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(q, 4), mask));
+        const __m256i w = MM256_SET_M128I(hi, lo);
+        const __m256i a = _mm256_loadu_si256((const __m256i *) y[i].qs);
+        const int dot = hsum_i32_8(_mm256_madd_epi16(mul_add_epi8(w, a), _mm256_set1_epi16(1)));
+        const uint32_t e = x[i].e;
+        const uint32_t bits = e < 2 ? 0x00200000u << e : (e - 1) << 23;
+        float d;
+        memcpy(&d, &bits, sizeof d);
+        sum += (GGML_CPU_FP16_TO_FP32(y[i].d) * d) * dot;
+    }
+    *s = sum;
 }
 
 // NVFP4 x Q8_0: a 64-value block meets two Q8_0 blocks; sub-block s (16 values) has scale d[s] and Q8_0 block s/2.
@@ -1531,7 +1584,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ3_S]   = {NULL, ggml_vec_dot_iq3_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ2_S]   = {NULL, ggml_vec_dot_iq2_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ4_XS]  = {NULL, ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_IQ1_S]   = {NULL, ggml_vec_dot_iq1_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_M]   = {NULL, ggml_vec_dot_iq1_m_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_MXFP4]   = {NULL, ggml_vec_dot_mxfp4_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_NVFP4]   = {NULL, ggml_vec_dot_nvfp4_q8_0, GGML_TYPE_Q8_0, 1},
 };
 

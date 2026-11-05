@@ -17,8 +17,9 @@ namespace basalt::kernels::cpu {
 struct ExpertLayout {
     bool native = false;
     int64_t n_layers = 0, n_expert = NE;
+    int64_t n_embd = H;
     std::vector<NativeFmt> fmt;           ///< per layer
-    std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
+    std::vector<uint64_t> offset, bytes;  ///< per layer: where its blobs start, bytes per blob
     int version = 0;                      ///< the layout header's version (0 = none given)
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< the experts section's size
@@ -63,7 +64,16 @@ void act_quant_any(const float* x, int n, ActQ& a);
 const ExpertLayout& expert_layout();
 /// Loads the layout from its text (the model's `experts.layout` section: "# experts vN: ..." then one line per layer,
 /// `layer gu_type d_type offset blob_bytes`; further columns are ignored).  A newer version is refused.
-bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err);
+struct ExpertGeometry {
+    int64_t n_embd = H, n_ff = FF;
+    NativeBufferLimits buffers;
+    float swiglu_limit = 0.f;
+};
+/// Parses a model-local layout without replacing the process-wide table.
+bool expert_layout_parse_text(const std::string& text, int64_t n_layers, int64_t n_expert, ExpertLayout& out,
+                             std::string& err, ExpertGeometry geometry = {});
+bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
+                            ExpertGeometry geometry = {});
 /// The newest layout version this engine reads.
 inline constexpr int kExpertLayoutVersion = 6;   // v6: NVFP4 blobs end in a 16-byte scale tail
 

@@ -13,6 +13,11 @@ namespace basalt::kernels::cpu {
 /// ggml's quantize_row_q8_K for k floats (a multiple of 256), bit for bit.
 void quantize_q8_K_avx2(const float* x, void* dst, int64_t k);
 bool iq256_supported(int ggml_type) noexcept;
+// IQ1_S decodes each grid once across the window; sums keep the single-row ggml block order.
+void iq1s256_gu_rows(const uint8_t* blob,size_t row_bytes,size_t up_offset,int n,const void* const* act,int nt,
+                      float* const* ff,int r0,int r1,float limit);
+void iq1s256_rows(const uint8_t* weights,size_t row_bytes,int n,const void* const* act,int nt,
+                   float* const* out,int r0,int r1);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);

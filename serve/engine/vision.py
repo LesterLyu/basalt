@@ -35,10 +35,14 @@ _decodes = threading.Semaphore(4)               # reads run outside the request 
 class Vision:
     """The resident `basalt-vision` encoder: `ENC <image> <out>` lines in, embeddings out, cached by image hash."""
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None):
+    def _command(self, cfg):
         args = [cfg["vision_bin"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]] + (["--gpu"] if cfg.get("gpu") else [])
         if cfg.get("max_tokens") is not None:
             args += ["--max-tokens", str(cfg["max_tokens"])]
+        return args
+
+    def __init__(self, cfg: dict, log=None, env: dict | None = None):
+        args = self._command(cfg)
         self.dir = Path(tempfile.mkdtemp(prefix="basalt-vision-"))
         self.spawn = (args, log, env)                   # to start again
         self.stopped = False
@@ -62,6 +66,7 @@ class Vision:
             raise
         if not line.startswith("READY"):
             raise RuntimeError("the vision encoder did not start: " + line.strip())
+        self.ready_fields = line.split()[1:]
         self.ready_s = time.time() - t0
         self.stopped = False
 
@@ -242,13 +247,16 @@ class Vision:
 
     def _enc(self, img: Path, out: Path) -> str:
         """One ENC round trip with the sidecar: its `OK <n> ...` or `ERR ...` line."""
-        self.proc.stdin.write(f"ENC {img} {out}\n")
+        self.proc.stdin.write(self._encode_command(img, out))
         self.proc.stdin.flush()
         try:
             return self._readline(VISION_ENCODE_S, "the image could not be read").strip()
         except RuntimeError as e:                       # silent: the encoder was ended
             self.stopped = True                         # alive() is False, so the next request starts it again
             raise ValueError(str(e)) from None
+
+    def _encode_command(self, img, out):
+        return f"ENC {img} {out}\n"
 
     def _remember(self, key: str, out: Path, n: int) -> tuple[Path, int, int]:
         size = out.stat().st_size

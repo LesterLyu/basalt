@@ -123,6 +123,31 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// Include the signed eighth offset in the int8 values; scales retain the raw block's exact binary factor.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_s(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size=ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps=ggml_cuda_mmq_get_nthreads(type,J,fallback)/warp_size;
+    constexpr int I=ggml_cuda_mmq_get_I(type,J,fallback);
+    constexpr int sram_stride=ggml_cuda_mmq_get_sram_stride(type,J,fallback);
+    constexpr int threads_per_row=8,nrows=warp_size/threads_per_row;
+    int* x_qs=x_tile;float* x_df=(float*)(x_qs+2*MMQ_TILE_NE_K);
+    const int sub=threadIdx.x%threads_per_row;
+    for(int i0=0;i0<I;i0+=nwarps*nrows) {
+        int i=i0+threadIdx.y*nrows+threadIdx.x/threads_per_row;
+        if(fallback)i=min(i,i_max);
+        const auto* b=(const block_iq1_s*)x+kbx0+i*stride;
+        const uint16_t h=b->qh[sub];
+        const uint32_t offset=h&0x8000?0xf7f7f7f7u:0xf9f9f9f9u;
+        for(int grid=0;grid<4;++grid) {
+            const uint32_t q=iq1s_grid_gpu[b->qs[4*sub+grid] | (((h>>(3*grid))&7)<<8)];
+            x_qs[i*sram_stride+8*sub+2*grid]=__vadd4((q&0x0f0f0f0fu)<<3,offset);
+            x_qs[i*sram_stride+8*sub+2*grid+1]=__vadd4(((q>>4)&0x0f0f0f0fu)<<3,offset);
+        }
+        x_df[i*sram_stride+sub]=float(b->d)*(2*((h>>12)&7)+1)/8;
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq2_xxs(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

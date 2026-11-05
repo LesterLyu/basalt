@@ -63,13 +63,23 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
-def effort_kwargs(value) -> dict:
+def effort_kwargs(value, *, numeric=False) -> dict:
     """A client's reasoning effort as template kwargs; unknown values are a 400."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
+    if numeric:
+        if type(value) is int or (isinstance(value, str) and key.isascii() and key.isdecimal()):
+            level = int(value)
+            if not 0 <= level <= 100:
+                raise ValueError("DeepSeek reasoning effort must be an integer from 0 to 100")
+            return {"enable_thinking": False} if level == 0 else {"reasoning_effort": level}
+        if key in {"low", "medium", "high", "xhigh", "max", "maximum"}:
+            return {"reasoning_effort": "max" if key == "maximum" else key}
+        if key not in EFFORT:
+            raise ValueError("DeepSeek reasoning effort must be an integer from 0 to 100 or a named level")
     if key not in EFFORT:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
     level = EFFORT[key]
@@ -362,7 +372,7 @@ def _order_chat_tool_results(messages: list[dict]) -> None:
             call.pop("_call_id", None)
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+def openai_to_messages(req: dict, *, numeric_effort=False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
     for m in _object_list(req.get("messages"), "messages"):
@@ -392,13 +402,16 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     kwargs = {}
     # "reasoning_effort", or Responses-style "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
+    effort = req.get("reasoning_effort")
+    if effort is None or (not numeric_effort and not effort):
+        effort = reasoning.get("effort")
+    kwargs.update(effort_kwargs(effort, numeric=numeric_effort))
     # chat_template_kwargs: enable_thinking / reasoning_effort
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
-            kwargs.update(effort_kwargs(v))
+            kwargs.update(effort_kwargs(v, numeric=numeric_effort))
     return _late_system_to_user(messages), tools, kwargs
 
 
@@ -429,7 +442,7 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True, *, numeric_effort=False) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, tools, kwargs). `think_unasked`: a request that asks nothing about
     thinking gets the template default; False renders it without thinking."""
     messages = []
@@ -468,8 +481,8 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
-    elif effort:
-        kwargs.update(effort_kwargs(effort))
+    elif effort or (numeric_effort and effort is not None):
+        kwargs.update(effort_kwargs(effort, numeric=numeric_effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
     elif thinking is None and not (req.get("reasoning_budget_tokens") or req.get("thinking_budget_tokens")) and not think_unasked:

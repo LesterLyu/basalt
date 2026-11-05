@@ -99,11 +99,11 @@ void synthetic() {
     CHECK(!t.load("{\"a\":1", "", "[]", bad));
 }
 
-int parity(const std::string& dir, const std::string& golden) {
+int parity(const std::string& dir, const std::string& golden,const char* pre) {
     Tokenizer t;
     std::string err;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!t.load(read_all(dir + "/vocab.json"), read_all(dir + "/merges.txt"), read_all(dir + "/token_type.json"), err)) {
+    if (!t.load(read_all(dir + "/vocab.json"), read_all(dir + "/merges.txt"), read_all(dir + "/token_type.json"), err,pre)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
     }
@@ -174,7 +174,7 @@ int parity(const std::string& dir, const std::string& golden) {
 int main(int argc, char** argv) {
     synthetic();
     if (failures) return 1;
-    if (argc >= 3) return parity(argv[1], argv[2]);
+    if (argc >= 3) return parity(argv[1], argv[2],argc>=4?argv[3]:"qwen35");
     std::printf("tokenizer_test: synthetic checks passed\n");
     return 0;
 }

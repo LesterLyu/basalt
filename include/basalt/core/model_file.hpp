@@ -77,7 +77,7 @@ struct Json {
 };
 
 /// Parses `text`.  False with `err` (and the position) on a syntax error.
-bool parse_json(const char* text, size_t n, Json& out, std::string& err);
+bool parse_json(const char* text, size_t n, Json& out, std::string& err, size_t array_keep = Json::kJsonArrayKeep);
 
 class ModelFile {
 public:
@@ -102,7 +102,8 @@ public:
     const Json& meta() const { return meta_; }
 
     /// After load_meta: makes `GgufFile(path())` serve meta.gguf_kv and the tensors of the `gguf` section.
-    bool register_gguf_view(std::string& err) const;
+    /// A prefix uses meta[prefix] and prefix/gguf, registered as path() + "#" + prefix.
+    bool register_gguf_view(std::string& err, const std::string& prefix = {}) const;
 
 private:
     std::string path_;

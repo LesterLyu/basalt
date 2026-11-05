@@ -802,7 +802,7 @@ bool GrammarState::fire(size_t from, bool by_token, int32_t token_id, std::strin
     active_ = true;
     tail_.clear();
     pieces_.clear();
-    if (stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
+    if (!triggers_.once && stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
     return true;
 }
 
@@ -814,7 +814,7 @@ bool GrammarState::accept(std::string_view bytes, int32_t token_id) {
         if (!advance(st, u, bytes, token_id)) return false;
         stacks_.swap(st);
         utf8_ = u;
-        if (triggers_.lazy() && stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
+        if (triggers_.lazy() && !triggers_.once && stacks_.size() == 1 && stacks_[0] == 0 && utf8_.n_remain == 0) reset();
         return true;
     }
     for (int32_t t : triggers_.tokens) {

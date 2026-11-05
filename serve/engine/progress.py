@@ -91,6 +91,9 @@ class LoadBars:
 
     def key(self, target: str) -> str:
         """The target's name as a key in a console line (no spaces)."""
+        prefix, sep, gpu = target.partition("-")
+        if sep and prefix in ("target", "dspark"):
+            return f"{prefix}-{self.name(gpu)}"
         return "ram" if target == "ram" else self.name(target)
 
     def _target(self, target: str, copy: bool) -> dict:
@@ -152,8 +155,14 @@ class LoadBars:
                 rows.append(((target, copy), "[server] loading the n-gram table into system ram",
                              have, t["plan"], rate))
                 continue
-            verb = "copying experts to" if copy else "loading weights into"
-            rows.append(((target, copy), f"[server] {verb} {self.name(target)}", have, t["plan"], rate))
+            prefix, _, gpu = target.partition("-")
+            if prefix in ("target", "dspark") and gpu:
+                name = "DSpark" if prefix == "dspark" else "target"
+                label = f"loading {name} weights into {self.name(gpu)}"
+            else:
+                verb = "copying experts to" if copy else "loading weights into"
+                label = f"{verb} {self.name(target)}"
+            rows.append(((target, copy), f"[server] {label}", have, t["plan"], rate))
         pad = max((len(r[1]) for r in rows), default=0)
         out = []
         for key, label, have, plan, rate in rows:
@@ -449,6 +458,9 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                     bars.say(f"[server] warning: {w}")
                 elif (r := engine_ram_floor(line)) is not None:
                     bars.say(tagged("ram", f"floor {r}"))
+                elif line.startswith(("basalt deepseek41: loading target,", "basalt deepseek41: loading DSpark on device ")):
+                    bars.say(tagged("loading", line.removeprefix("basalt deepseek41: loading ")))
+                    last = time.time()
         if on_progress is not None and chunk.count(b"\n"):
             on_progress(bars.progress())
         bars.refresh()

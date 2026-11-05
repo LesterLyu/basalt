@@ -100,27 +100,37 @@ def jsonschema_modules():
         return _jsonschema or None
 
 
-def prepare_tool_format(response_format, messages):
-    """Tool grammar is lazy: constrain the final answer separately from tool arguments."""
-    check_format(response_format)
-    if response_format["type"] == "json_object":
-        schema, modules = {"type": "object"}, None
-    else:
-        schema, modules = response_format["json_schema"]["schema"], jsonschema_modules()
+def schema_validator(schema, *, required=False):
+    modules = jsonschema_modules()
     if modules is None:
-        validator = _ObjectOnly()
-    else:
-        validators, SchemaError, Registry, NoSuchResource = modules
+        if required:
+            raise ValueError("strict schema validation requires jsonschema")
+        return _ObjectOnly()
+    validators, SchemaError, Registry, NoSuchResource = modules
 
-        def no_remote(uri):
-            raise NoSuchResource(ref=uri)
+    def no_remote(uri):
+        raise NoSuchResource(ref=uri)
 
-        try:
-            cls = validators.validator_for(schema)
-            cls.check_schema(schema)
-            validator = cls(schema, registry=Registry(retrieve=no_remote))
-        except SchemaError as exc:
-            raise ValueError(f"invalid response_format schema: {exc.message}") from exc
+    try:
+        cls = validators.validator_for(schema)
+        cls.check_schema(schema)
+        return cls(schema, registry=Registry(retrieve=no_remote))
+    except SchemaError as exc:
+        raise ValueError(f"invalid JSON Schema: {exc.message}") from exc
+
+
+def format_validator(response_format, *, required=False):
+    if response_format["type"] == "json_object":
+        return _ObjectOnly()
+    return schema_validator(response_format["json_schema"]["schema"], required=required)
+
+
+def prepare_tool_format(response_format, messages):
+    """Show the model the final-answer format when tools can be called first."""
+    check_format(response_format)
+    schema = ({"type": "object"} if response_format["type"] == "json_object"
+              else response_format["json_schema"]["schema"])
+    validator = format_validator(response_format)
     directive = ("OUTPUT FORMAT REQUIREMENT: Your final answer must be exactly one JSON object matching the JSON Schema below. "
                  "No Markdown, headings, code fences, commentary, or text outside the JSON. "
                  "Use every required field, correct types, and only allowed fields. "
@@ -140,7 +150,7 @@ def prepare_tool_format(response_format, messages):
     return messages, validator
 
 
-def validated_json(text, validator, finish):
+def strict_json_loads(text):
     def pairs(items):
         obj = {}
         for key, value in items:
@@ -152,10 +162,14 @@ def validated_json(text, validator, finish):
     def constant(value):
         raise ValueError(f"invalid JSON constant: {value}")
 
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+
+
+def validated_json(text, validator, finish):
     if finish != "stop":
         raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
     try:
-        value = json.loads(text or "", object_pairs_hook=pairs, parse_constant=constant)
+        value = strict_json_loads(text or "")
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (ValueError, TypeError) as exc:
         raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc

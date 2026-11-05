@@ -3,6 +3,7 @@
 
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/dynlib.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
 
 #include <cctype>
@@ -15,6 +16,7 @@
 
 #if defined(_WIN32)
 #include "basalt/platform/win.hpp"
+#include <psapi.h>
 #include <fcntl.h>   // _O_BINARY
 #include <io.h>      // _fileno, _setmode
 #else
@@ -131,7 +133,18 @@ std::string meminfo_path() { return std::string(); }
 std::string self_cgroup_path() { return std::string(); }
 std::string cgroup_root() { return std::string(); }
 
-ProcessMemory process_memory() { return ProcessMemory{}; }   // the stall report names the Linux readings only
+ProcessMemory process_memory() {
+    ProcessMemory m;
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof counters;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), counters.cb)) {
+        m.rss_mib = counters.WorkingSetSize >> 20;
+        m.peak_rss_mib = counters.PeakWorkingSetSize >> 20;
+        m.private_commit_mib = counters.PrivateUsage >> 20;
+    }
+    m.avail_mib = available_memory() >> 20;
+    return m;
+}
 
 int disk_rotational(const std::string&, std::string&) {
     return -1;   // sysfs names the queue on Linux; unknown means the caller does not warn
@@ -199,6 +212,7 @@ ProcessMemory process_memory() {
         return v;
     };
     m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
+    m.peak_rss_mib = kb("/proc/self/status", "VmHWM:") >> 10;
     m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
     m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
     return m;

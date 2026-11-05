@@ -97,6 +97,7 @@ private:
 
 /// When a lazy state starts enforcing.
 struct Triggers {
+    bool once = false;                 ///< keep enforcing after the first complete lazy match
     std::vector<std::string> words;       ///< a substring of the output that starts the grammar (at the substring)
     std::vector<int32_t> tokens;          ///< a token id that starts the grammar (its bytes are fed too)
     /// ECMAScript regexes over the output so far; the grammar starts at the first non-empty capture group, else at the

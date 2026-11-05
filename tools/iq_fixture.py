@@ -1,6 +1,6 @@
 """Deterministic i-quant fixtures for tests/kernels/iq_parity.cpp.
 
-For each of the ten types iq_parity tests, writes `<out>/<name>.bin` (int32 header: the KERNEL type id,
+For each type iq_parity tests, writes `<out>/<name>.bin` (int32 header: the KERNEL type id,
 rows, cols - then the raw GGUF block bytes) and `<out>/<name>.f32` (rows*cols float32 reference values,
 dequantized by the same library the comparison treats as ground truth):
 
@@ -45,6 +45,7 @@ LAYOUT = {   # equals ggufq's GGML_QUANT_SIZES and the kernels' sizes
     "IQ3_XXS": (256,  98),
     "IQ3_S":   (256, 110),
     "IQ1_M":   (256,  56),
+    "IQ1_S":   (256,  50),
     "IQ4_NL":   (32,  18),
     "IQ4_XS":  (256, 136),
     "Q3_K":    (256, 110),
@@ -67,7 +68,7 @@ def repair_scales(name: str, raw: np.ndarray) -> None:
     raw[:, 0:2] = np.frombuffer(HALF_ONE, dtype=np.uint8)
 # name -> kernel type id for the .bin header (equal to the ggufq enum id)
 KERNEL_IDS = {"IQ2_XXS": 16, "IQ2_XS": 17, "IQ2_S": 22, "IQ3_XXS": 18, "IQ3_S": 21,
-              "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11}
+              "IQ1_S": 19, "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11}
 
 
 def build(name: str, rows: int, cols: int, seed: int):

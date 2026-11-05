@@ -62,6 +62,8 @@ struct ProcessMemory {
     unsigned long long rss_mib = 0;      ///< resident set
     unsigned long long avail_mib = 0;    ///< RAM the system can hand out
     unsigned long long commit_mib = 0;   ///< what is swapped out
+    unsigned long long peak_rss_mib = 0; ///< peak resident set
+    unsigned long long private_commit_mib = 0; ///< process private commit, where available
 };
 ProcessMemory process_memory();
 

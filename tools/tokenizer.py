@@ -43,6 +43,13 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# llama.cpp's JOYAI_LLM pre-tokenizer applies these splits in order.
+JOYAI_PATTERNS = (
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    r'''[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+''',
+)
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -64,7 +71,11 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        if pre not in ("qwen35", "joyai-llm"):
+            raise ValueError("unsupported pre-tokenizer: %r" % pre)
+        self.patterns = JOYAI_PATTERNS if pre == "joyai-llm" else (QWEN35_PATTERN,)
+        self._res = [regex.compile(p) for p in self.patterns]
+        self._re = self._res[0]
 
         # Literals matched directly instead of through BPE (GGUF token types):
         #   * type 4 (USER_DEFINED: `<think>`, `<tool_call>`, ...) always matches, with or without parse_special;
@@ -165,12 +176,30 @@ class Tokenizer:
 
     PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered; bounds the memo's memory
 
+    def pieces(self, text: str) -> list[str]:
+        if self.pre == "qwen35":
+            return self._re.findall(text)
+        parts = [text] if text else []
+        for pattern in self._res:
+            split = []
+            for part in parts:
+                at = 0
+                for match in pattern.finditer(part):
+                    if match.start() > at:
+                        split.append(part[at:match.start()])
+                    split.append(match.group())
+                    at = match.end()
+                if at < len(part):
+                    split.append(part[at:])
+            parts = split
+        return parts
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again. Same ids as running _bpe each time. Idea from Strata f346dc6 (MIT).
         cache = self.__dict__.setdefault("_piece_ids", {})
-        for piece in self._re.findall(text):
+        for piece in self.pieces(text):
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
@@ -253,9 +282,12 @@ def extract_metadata(md: dict, out_dir) -> dict:
         "special_ids": tk.special_ids,
         "add_bos_token": False,
         # shipped rather than re-derived by readers, so a port cannot lose the `\p{M}` classes
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern_source": "llama.cpp src/llama-vocab.cpp (" + tk.pre + ")",
     }
+    if tk.pre == "qwen35":
+        cfg["pre_pattern"] = QWEN35_PATTERN
+    else:
+        cfg["pre_patterns"] = list(tk.patterns)
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8",

@@ -40,6 +40,7 @@ namespace k = basalt::kernels;
 namespace {
 
 int g_fail = 0;
+uint64_t g_grouped_fingerprint = 14695981039346656037ull;
 
 void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) {
@@ -61,6 +62,7 @@ const char* name_of(int t) {
         case 16: return "IQ2_XXS";
         case 17: return "IQ2_XS";
         case 18: return "IQ3_XXS";
+        case 19: return "IQ1_S";
         case 20: return "IQ4_NL";
         case 21: return "IQ3_S";
         case 22: return "IQ2_S";
@@ -68,6 +70,7 @@ const char* name_of(int t) {
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
         case 40: return "NVFP4";
+        case 39: return "MXFP4";
         case 12: return "Q4_K";
         case 13: return "Q5_K";
         case 7: return "Q5_1";
@@ -75,7 +78,7 @@ const char* name_of(int t) {
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 || t == 40 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 7 || t == 8 || t == 39 ? 32 : t == 42 || t == 40 ? 64 : 256; }
 // A UE4M3 sub-block scale byte.  Profile 0: exponent 1..4 (small blocks).  Profile 1: exponent 6..14, block values in
 // the hundreds as the packs' are (their tails are 1e-5..1e-4).  Profile 2: profile 1 with the odd bytes mixed in: 0x7F
 // (the NaN code, decoded as 0), the sign bit set (ignored), zero and subnormals.
@@ -115,7 +118,9 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 3);
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {
-        if (t == 40) {
+        if (t == 39) {
+            w[o] = (uint8_t) (114 + rng() % 10);
+        } else if (t == 40) {
             // NVFP4: four UE4M3 sub-block scales (profiles in nvfp4_scale_byte)
             const int prof = g_nv_profile >= 0 ? g_nv_profile : (int) (rng() % 3);
             for (int j = 0; j < 4; ++j) w[o + j] = nvfp4_scale_byte(prof, rng);
@@ -368,20 +373,32 @@ struct Grouped {
     }
 };
 
-void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
+void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng, float limit = 0.f) {
     // 0..11 entries per group: one pass, a partial pass, two passes and three passes of GRP_NC = 4
     Grouped G(gu, dt, H, FF, {1, 3, 4, 5, 0, 8, 2, 11, 1}, 8, rng);
+    G.L.swiglu_limit = limit;
     const auto a = G.result(true, s), b = G.result(false, s);
+    for (size_t i = 0; limit == 0.f && i < b.size() * sizeof(float); ++i) {
+        g_grouped_fingerprint ^= reinterpret_cast<const uint8_t*>(b.data())[i];
+        g_grouped_fingerprint *= 1099511628211ull;
+    }
     size_t diff = 0, written = 0;
     bool finite = true;
     for (size_t i = 0; i < a.size(); ++i) {
         diff += std::memcmp(&a[i], &b[i], 4) != 0;
         if (i < (size_t) G.n_ent * H) { ++written; finite = finite && std::isfinite(b[i]); }
     }
+    if (limit > 0.f) {
+        k::native_grouped_set_v1(true);
+        const auto c = G.result(true, s);
+        k::native_grouped_set_v1(false);
+        for (size_t i = 0; i < b.size(); ++i) diff += std::memcmp(&c[i], &b[i], 4) != 0;
+    }
     const bool ok = diff == 0 && finite;
     std::printf("%-8s/%-7s %5lld x %4lld  native_expert_grouped, %d groups, %d entries: %s\n", name_of(gu),
                 name_of(dt), (long long) H, (long long) FF, G.n_groups, G.n_ent,
                 ok ? "bitwise equal to the old kernels" : "FAIL");
+    if (limit > 0.f) std::printf("  clamp %g: two-kernel, fused and dependent activation paths compared\n", limit);
     if (!ok) {
         std::printf("  %zu of %zu floats differ%s\n", diff, a.size(), finite ? "" : ", non-finite outputs");
         ++g_fail;
@@ -548,7 +565,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 40, 12, 13, 7, 8}) {
+    for (int t : {16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 39, 40, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
@@ -562,10 +579,21 @@ int main(int argc, char** argv) {
     }
     check_grouped(40, 40, 2560, 640, s, rng);                               // NVFP4: its own pair, with the scale tail
     check_grouped(40, 40, 1024, 512, s, rng);
+    for (int gu : {16, 19}) {
+        check_mmvq(gu, 5120, 67, s, rng);
+        check_mmvq(gu, 2304, 67, s, rng);
+        for (int dt : {16, 19}) check_grouped(gu, dt, 5120, 2304, s, rng);
+    }
+    check_mmvq(39, 5120, 67, s, rng);
+    check_mmvq(39, 2304, 67, s, rng);
+    check_grouped(39, 39, 5120, 2304, s, rng);
     check_mmvq_mma(s, rng);
     check_q8_1_finite(s, rng);
+    for (auto [gu, dt] : {std::pair<int, int>{16,16}, {16,19}, {19,16}, {19,19}, {39,39}})
+        check_grouped(gu, dt, 5120, 2304, s, rng, 10.f);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
+    std::printf("grouped fingerprint: %016llx\n", (unsigned long long) g_grouped_fingerprint);
     cudaStreamDestroy(s);
     return g_fail ? 1 : 0;
 }

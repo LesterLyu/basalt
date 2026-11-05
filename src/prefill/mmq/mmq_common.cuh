@@ -185,6 +185,7 @@ MMQ_TYPE_TRAITS(GGML_TYPE_Q5_1, QK5_1, QR5_1, QI5_1, block_q5_1);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q4_K, QK_K, QR4_K, QI4_K, block_q4_K);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q5_K, QK_K, QR5_K, QI5_K, block_q5_K);
 MMQ_TYPE_TRAITS(GGML_TYPE_Q6_K, QK_K, QR6_K, QI6_K, block_q6_K);
+MMQ_TYPE_TRAITS(GGML_TYPE_IQ1_S, QK_K, 8, 8, block_iq1_s);
 MMQ_TYPE_TRAITS(GGML_TYPE_IQ2_XXS, QK_K, QR2_XXS, QI2_XXS, block_iq2_xxs);
 MMQ_TYPE_TRAITS(GGML_TYPE_IQ2_XS, QK_K, QR2_XS, QI2_XS, block_iq2_xs);
 MMQ_TYPE_TRAITS(GGML_TYPE_IQ2_S, QK_K, QR2_S, QI2_S, block_iq2_s);
@@ -216,6 +217,7 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual size_t reserved_bytes() const = 0;
 };
 
 template<typename T>

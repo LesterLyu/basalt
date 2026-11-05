@@ -26,7 +26,6 @@ bool peer_portable() { return g_peer_portable; }
 
 namespace {
 
-constexpr int64_t H = basalt::kernels::cpu::H;
 constexpr int64_t CAP = basalt::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
 
 struct Meta {                           // one block, uploaded with one copy per layer
@@ -63,6 +62,10 @@ void PeerExperts::close() {
         On on(device_);
         if (stream_) cudaStreamSynchronize(stream_);
         if (refill_) cudaStreamSynchronize(refill_);
+        for (auto& [key, graph] : single_token_graphs_) if (graph.exec) cudaGraphExecDestroy(graph.exec);
+        single_token_graphs_.clear();
+        single_token_graphs_enabled_ = false;
+        single_token_graph_launches_ = 0;
         cache_.close();
         if (d_x_) cudaFree(d_x_);
         if (d_out_) cudaFree(d_out_);
@@ -95,6 +98,7 @@ namespace {
 
 size_t scratch_bytes() {
     const auto& lay = basalt::kernels::cpu::expert_layout();
+    const int64_t H = lay.n_embd;
     int64_t ff = basalt::kernels::cpu::FF;
     if (lay.native)
         for (const auto& f : lay.fmt) ff = std::max<int64_t>(ff, f.n_ff);
@@ -105,6 +109,7 @@ size_t scratch_bytes() {
 }  // namespace
 
 uint64_t PeerExperts::device_overhead_bytes() {
+    const int64_t H = basalt::kernels::cpu::expert_layout().n_embd;
     return (uint64_t) scratch_bytes() + (uint64_t) CAP * H * sizeof(float) * 2 + sizeof(Meta) +
            (uint64_t) CAP * (H / 32) * 36;
 }
@@ -141,6 +146,21 @@ uint64_t PeerExperts::slot_bytes(int64_t layer) {
 
 bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
+    const auto& layout = basalt::kernels::cpu::expert_layout();
+    if (!layout.native || layout.n_layers != n_layers || layout.n_expert != n_expert ||
+        layout.fmt.size() != (size_t) n_layers || layout.n_embd <= 0 || layout.n_embd % 256 != 0) {
+        err = "peer experts: incompatible model layout";
+        return false;
+    }
+    for (const auto& f : layout.fmt) {
+        if (f.n_embd != layout.n_embd ||
+            !basalt::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
+            err = "peer experts: unsupported expert geometry or format";
+            return false;
+        }
+    }
+    n_embd_ = layout.n_embd;
+    const int64_t H = n_embd_;
     int count = 0;
     if (!ck(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err)) return false;
     if (device < 1 || device >= count) {
@@ -263,6 +283,11 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
 
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
+    const int64_t H = n_embd_;
+    if (device_ < 0 || layer < 0 || layer >= n_layers_ || n_tok < 0 || k <= 0 || n_tok > CAP / k) {
+        err = "peer experts: invalid layer or window";
+        return false;
+    }
     const bool direct = out != nullptr;
     launched_direct_ = false;
     launched_rows_ = 0;
@@ -303,35 +328,69 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-        return false;
     Meta* dm = (Meta*) d_meta_;
     const auto& lay = basalt::kernels::cpu::expert_layout();
-    if (lay.native) {
+    if (!lay.native) { err = "peer experts: only native packs are supported"; return false; }
+    const auto& f = lay.fmt[(size_t) layer];
+    const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit);
+    const auto submit = [&]() {
+        if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
+            !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+            return false;
         basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, H, d_q8_, s);
-        const auto& f = lay.fmt[(size_t) layer];
-        const auto L = basalt::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
         basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
         basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                                d_scratch_, d_out_, s);
         basalt::kernels::native_grouped_set_mma_hint(false);
-    } else {
-        err = "peer experts: only native packs are supported";
-        return false;
-    }
-    if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
-        try {
-            basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
-        } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
-        launched_direct_ = true;
-        return true;
-    }
-    return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
-              "results", err);
+        if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
+            try {
+                basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
+            } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
+            return true;
+        }
+        return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
+                  "results", err);
+    };
+    if (single_token_graphs_enabled_ && direct && n_tok == 1) {
+        // Plans and expert pointers are read from the live metadata copy on every replay.
+        auto& cached = single_token_graphs_[{f.gu_type, f.d_type, f.n_embd, f.n_ff, f.swiglu_limit, groups, rows}];
+        if (cached.exec && (cached.input != x || cached.output != out)) {
+            if (!ck(cudaGraphExecDestroy(cached.exec), "graph release", err)) return false;
+            cached.exec = nullptr;
+        }
+        if (!cached.exec) {
+            if (!ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "graph begin", err)) return false;
+            cudaGraph_t graph = nullptr;
+            bool submitted = false;
+            try { submitted = submit(); }
+            catch (...) {
+                cudaStreamEndCapture(s, &graph);
+                if (graph) cudaGraphDestroy(graph);
+                throw;
+            }
+            if (!submitted) {
+                cudaStreamEndCapture(s, &graph);
+                if (graph) cudaGraphDestroy(graph);
+                return false;
+            }
+            if (!ck(cudaStreamEndCapture(s, &graph), "graph end", err)) {
+                if (graph) cudaGraphDestroy(graph);
+                return false;
+            }
+            const auto status = cudaGraphInstantiate(&cached.exec, graph, 0);
+            cudaGraphDestroy(graph);
+            if (!ck(status, "graph instantiate", err)) return false;
+            cached.input = x; cached.output = out;
+        }
+        if (!ck(cudaGraphLaunch(cached.exec, s), "graph launch", err)) return false;
+        ++single_token_graph_launches_;
+    } else if (!submit()) return false;
+    launched_direct_ = direct;
+    return true;
 }
 
 bool PeerExperts::finish(float* out, std::string& err) {
+    const int64_t H = n_embd_;
     if (launched_rows_ == 0) return true;
     const auto t0 = std::chrono::steady_clock::now();
     {

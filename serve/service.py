@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import ctypes
+import os
 import subprocess
 import threading
 import time
@@ -12,7 +13,7 @@ from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, unmark_think_literals
+from serve.frontend import ChatTemplate, Event, OutputParser, images_of, literal_tags, mark_think_literals, tool_choice_of, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
@@ -20,7 +21,9 @@ from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, 
 from serve.tool_output import REPAIR_TURN, ToolOutputError, orphaned_tool_tail
 from serve.engine.image_source import USAGE as IMAGE_USAGE, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, Vision
-from serve.api.grammar import grammar_spec, unenforced
+from serve.api import patch as codex_patch
+from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, grammar_spec, unenforced
+from serve.api.structured import schema_validator
 from serve.config import GRAMMAR_DEFAULT
 
 
@@ -328,15 +331,40 @@ class Service:
 
     def require_grammar(self, response_format) -> None:
         """A JSON response format the engine would not enforce is refused rather than silently served as free text."""
+        if (getattr(self.template, "native_grammar", False) and not self.grammar_engine
+                and isinstance(response_format, dict) and response_format.get("type") in ("json_schema", "json_object")):
+            raise ValueError("response_format requires a DeepSeek engine with constrained decoding")
         if unenforced(self.grammar, response_format):
             raise ValueError("response_format json_schema and json_object (structured output) need grammar enabled "
                              "on this server; start it without --no-grammar, or send strict: true")
 
-    def grammar_for(self, tools, tool_choice, raw_tools, response_format) -> dict | None:
-        """The engine request's `grammar` value (api.grammar.grammar_spec); None when the engine cannot take it."""
+    def grammar_for(self, tools, tool_choice, raw_tools, response_format, *, parallel=True) -> dict | None:
+        """The grammar for the engine, including both answer forms when DeepSeek can call tools."""
+        native = getattr(self.template, "native_grammar", False)
         if not self.grammar_engine:
+            if native and grammar_spec(False, tools, tool_choice, raw_tools, response_format):
+                raise ValueError("strict output requires a DeepSeek engine with constrained decoding")
             return None
-        return grammar_spec(self.grammar, tools, tool_choice, raw_tools, response_format)
+        spec = grammar_spec(self.grammar, tools, tool_choice, raw_tools, response_format)
+        if native and tools:
+            answer = grammar_spec(self.grammar, None, None, None, response_format)
+            if answer and spec is None:
+                spec = grammar_spec(True, tools, tool_choice, raw_tools, response_format)
+            if spec:
+                choice, name = tool_choice_of(tool_choice)
+                spec["tool_choice"] = {"name": name} if choice == "named" else choice
+                spec["parallel_tool_calls"] = parallel is not False
+                if answer:
+                    spec["final_schema"] = answer.get("schema", {"type": "object"})
+                for tool in spec["tools"]:
+                    function = tool["function"]
+                    schema = function.get("parameters", {"type": "object"})
+                    schema_validator(schema, required=True)
+        return spec
+
+    def grammar_force(self, force, spec):
+        # A forced DSML call is generated from its grammar root, not injected into the prompt.
+        return None if spec and spec.get("kind") == "tools" and getattr(self.template, "native_grammar", False) else force
 
     def load(self):
         """Start the engine if unloaded (POST /load and every generation request); may raise GpuBusy."""
@@ -492,7 +520,20 @@ class Service:
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(),
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean(),
                                                     "slot_tok_s": [r["tok_s"] for r in self.slot_table()[0]]},
-                                       gpu_indices=getattr(self, "gpu_indices", None) or [0])
+                                       gpu_indices=getattr(self, "gpu_indices", None) or [0],
+                                       gpu_owner_pids=self._gpu_owner_pids, ram_pids=self._ram_pids)
+
+    def _ram_pids(self):
+        pids = {"server": os.getpid()}
+        for role, owner in (("engine", self.engine), ("vision", self.vision)):
+            proc = getattr(owner, "proc", None)
+            if proc is not None and proc.poll() is None:
+                pids[role] = proc.pid
+        return pids
+
+    def _gpu_owner_pids(self):
+        return {proc.pid for owner in (self.engine, self.vision)
+                if (proc := getattr(owner, "proc", None)) is not None and proc.poll() is None}
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S (summed over parallel requests); 0.0 when idle."""
@@ -590,6 +631,10 @@ class Service:
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
                            else None,
                            draft_len=round(st.get("window_tokens", 0) / windows, 2) if windows else None)
+                if st.get("phase"):
+                    row["phase"] = st["phase"]
+                if stats := st.get("decode_progress"):
+                    row.update(stats)
             rows.append(row)
         return rows, queue
 
@@ -601,6 +646,9 @@ class Service:
                 s = {**s, **dict(list(self.live_reqs.values())[-1][0]), "queued": s.get("queued", 0)}
             # parallel: generating while any slot decodes, though the newest request may still wait or read
             decoding = any(st.get("first_token") is not None for st, _ in self.live_reqs.values())
+            running = [st for st, _ in self.live_reqs.values()] or [s]
+            phases = list(dict.fromkeys(st["phase"] for st in running if st.get("busy") and st.get("phase")))
+            decode_progress = [st["decode_progress"] for st in running if st.get("busy") and st.get("decode_progress")]
             hist = list(self.history)
         busy = bool(s.get("busy"))
         if self.loading:
@@ -620,16 +668,59 @@ class Service:
                 "prompt_tokens": s.get("prompt_tokens") if busy else None,
                 "generated": s.get("generated") if busy else None,
                 "elapsed_s": round(time.time() - s["started"], 1) if busy and s.get("started") else None,
-                "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
+                "tok_s": round(self._tok_s(), 1) if state == "generating" else None, "phases": phases,
+                "drafts_accepted": sum(p.get("drafts_accepted", 0) or 0 for p in decode_progress),
+                "drafts_offered": sum(p.get("drafts_offered", 0) or 0 for p in decode_progress),
+                "expert_routes": {key: sum((p.get("expert_routes") or {}).get(key, 0) for p in decode_progress)
+                                  for key in ("primary", "helper", "ram")},
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if busy else None}
         engine = {"model": self.model, "max_context": self.engine.max_context,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else \
             {"now": {"gpus": []}, "history": {}, "static": {"gpus": []}}
+        engine_vram = getattr(self.engine, "vram_usage", None)
+        indices = getattr(self, "engine_gpu_indices", None) or getattr(self, "gpu_indices", [0])
+        track_engine = callable(engine_vram) and self.loaded() and engine.get("memory", 1) == 1
+        engine_cards = ({indices[i]: parts for i, parts in engine_vram().items() if 0 <= i < len(indices)}
+                        if track_engine else {})
+        cards = {i: dict(parts) for i, parts in engine_cards.items()}
+        vision_vram = getattr(self.vision, "vram_usage", None)
+        vision_card, vision_changed = None, 0
+        if callable(vision_vram) and (usage := vision_vram()) is not None:
+            vision_card, count, vision_changed = usage
+            cards.setdefault(vision_card, {})["vision"] = count
+        engine_ram = getattr(self.engine, "ram_usage", None)
+        ram_parts = engine_ram() if callable(engine_ram) and self.loaded() else {}
+        hardware = {**tel["now"], "ram_breakdown": {
+            "engine_allocations": ram_parts, "processes": tel.get("ram_processes", {})}}
+        if cards or track_engine or tel.get("gpu_other_apps"):
+            gpus = []
+            for g in hardware["gpus"]:
+                index = g["index"]
+                pending = track_engine and index in indices and index not in engine_cards
+                other = tel.get("gpu_other_apps", {}).get(index)
+                parts = cards.get(index, {} if pending or other is not None else None)
+                if parts is not None:
+                    used = g.get("mem_used")
+                    reserved = g.get("mem_reserved")
+                    if reserved is not None:
+                        parts = {**parts, "system_reserved": reserved}
+                    tracked = sum(parts.values())
+                    fresh = index != vision_card or tel.get("gpu_sample_started", 0) >= vision_changed
+                    remaining = used - tracked if fresh and not pending and used is not None and used >= tracked else None
+                    if remaining is not None and other is not None:
+                        parts["other_apps"] = min(remaining, other)
+                        remaining -= parts["other_apps"]
+                    breakdown = {"components": parts, "unattributed": remaining}
+                    if pending:
+                        breakdown["pending_engine"] = True
+                    g = {**g, "vram_breakdown": breakdown}
+                gpus.append(g)
+            hardware = {**hardware, "gpus": gpus}
         with self.status_lock:
             best = {k: dict(v) for k, v in self.best.items()}
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
-                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+                "hardware": hardware, "hardware_static": tel["static"], "history": tel["history"]}
 
     def _note_best(self, r: dict) -> None:
         """Keep finished request `r` as the best decode or prefill when it is the fastest big enough one.
@@ -664,7 +755,8 @@ class Service:
             "loaded": self.loaded(), "loading": self.loading, "load": self.load_progress(), "asleep": getattr(self.engine, "asleep", False) is True,
             "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "grammar",
-                                  "constrained_decoding": bool(self.grammar_engine), "stream_buffered": False},
+                                  "constrained_decoding": bool(self.grammar_engine),
+                                  "stream_buffered": bool(getattr(self.template, "native_grammar", False))},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
@@ -689,6 +781,8 @@ class Service:
     def render_prompt(self, messages, tools, kwargs) -> str:
         """Render the template. With `effort_end`, a non-default effort is rendered as the default up to the answer
         (same prefix, cache kept) and follows as a short system turn right before it."""
+        if hasattr(self.template, "parser"):
+            return self.template.render(messages, tools=tools, **kwargs)
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -737,6 +831,8 @@ class Service:
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
         tail = force if force and kwargs.get("enable_thinking", True) is False else ""
+        if tail and getattr(self.template, "forced_tail_separate", False):
+            tail = self.template.forced_prefix(tail)
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):
@@ -764,14 +860,17 @@ class Service:
         images = images_of(messages)
         if images:
             self._check_images(messages, images)
-        elif getattr(self.engine, "takes_text", False) and not getattr(self.engine, "batch", 0):
+        elif (getattr(self.engine, "takes_text", False)
+              and (not getattr(self.engine, "batch", 0) or getattr(self.engine, "text_batch", False))):
             return self._prepare_text(messages, tools, kwargs, max_new, force)
         ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.tok.encode(force, parse_special=True)
+            prefix = getattr(self.template, "forced_prefix", lambda name: name)(force)
+            ids = ids + self.tok.encode(prefix, parse_special=True)
         if images:
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            placeholder = getattr(self.template, "image_placeholder", None)
+            pad = self.tok.encode(placeholder or IMAGE_PAD, parse_special=True)[0]
+            start = None if placeholder else self.tok.encode(VISION_START, parse_special=True)[0]
             try:                                        # before the fifo: a slow source must not hold the turn
                 images = self.vision.read(images, image_access)
             except ImageRefused as e:
@@ -791,7 +890,13 @@ class Service:
                     if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
                         self.ensure_loaded()
                     try:
-                        self.embeddings.path, counts = self.vision.encode(images)
+                        if placeholder:
+                            reserve = max(1, max_new or 0) if not self.fit_max_tokens else 1
+                            ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+                            budget = ctx - CTX_SLACK - (len(ids) - len(images)) - reserve
+                            self.embeddings.path, counts = self.vision.encode(images, token_budget=budget)
+                        else:
+                            self.embeddings.path, counts = self.vision.encode(images)
                     except ValueError as e:             # a refused image: the client gets the 400, the log says why
                         print(f"[server] error: {e}", flush=True)
                         raise
@@ -799,10 +904,10 @@ class Service:
                 with self.images_lock:
                     self.images_waiting -= held
             # expand each image's pad to one per image token; a pad not after <|vision_start|> is message text
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+            literal = self.tok.encode(placeholder or IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
+                if t == pad and (placeholder or (j > 0 and ids[j - 1] == start)):
                     # more markers than images
                     if k == len(counts):
                         _refuse_images("the prompt and its images do not match")
@@ -834,13 +939,16 @@ class Service:
             max_new = max(1, room)          # fit_max_tokens: shorten rather than 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
-    def _note(self, n, evs, st=None, rate=None):
+    def _note(self, n, evs, st=None, rate=None, parser=None):
         with self.status_lock:
             s = self.status if st is None else st
             s["generated"] = n
             windows = getattr(self.engine, "window_stats", None)
             if windows is not None:
                 s["windows"], s["window_tokens"] = windows()
+            progress = getattr(self.engine, "decode_progress", None)
+            if progress is not None and (stats := progress()) is not None:
+                s["decode_progress"] = stats
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
             (self.rate if rate is None else rate).append((time.time(), n))   # live rate window
@@ -850,10 +958,16 @@ class Service:
                 elif ev.kind == "content":
                     s["phase"] = "answering"
                 elif ev.kind == "tool_start":
-                    s["phase"], s["tool"] = f"writing a tool call: {ev.call.name}", ev.call.name
+                    name = log_tool_name(ev.call.name)
+                    s["phase"], s["tool"] = "writing a tool call" + (f": {name}" if name else ""), ev.call.name
                 elif ev.kind == "tool_call":
-                    s["phase"] = "tool call complete"
+                    name = log_tool_name(ev.call.name)
+                    s["phase"] = "tool call complete" + (f": {name}" if name else "")
+                    s["completed_tool"] = name
                 s["tail"] = ((s.get("tail") or "") + (ev.text or ""))[-600:]
+            if parser is not None and parser.state == "dsml":
+                name = log_tool_name(parser.pending_tool_name())
+                s["phase"] = "writing a tool call" + (f": {name}" if name else "")
 
     def _slot_of(self, st) -> int | None:
         """The slot a running request holds, as the slot table shows it (the lowest free one, kept to its end).
@@ -882,8 +996,10 @@ class Service:
             seen = now - st["first_token"]
             rate = st["generated"] / seen if seen >= LIVE_MIN_S else None   # too soon after the first token for a rate
             total += rate or 0.0
+            metrics = decode_metrics_line(st.get("decode_progress"))
+            phase = " ".join((st.get("phase") or "").split())
             parts.append(f"{slot_tag(None if slot < 0 else slot)} tg={st['generated']}/{st.get('max_tokens')}"
-                         + (f" {rate:.1f}t/s" if rate is not None else ""))
+                         + (f" {rate:.1f}t/s" if rate is not None else "") + metrics + (f" · {phase}" if phase else ""))
         return "[server] live | " + " | ".join(parts) + f" | total {total:.0f}t/s"
 
     def _progress(self, last_print, every=1.0, st=None):
@@ -912,7 +1028,8 @@ class Service:
                 print(line, flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, *,
+            patch_tools=()) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None
@@ -921,12 +1038,47 @@ class Service:
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = getattr(self.template, "parser", OutputParser)(thinking=thinking, tools=tools, stream_tools=True)
+        force = getattr(self.template, "forced_prefix", lambda s: s)(force)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         thinking_n = 0                                 # tokens written while thinking
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
         answer_parts, has_call, complete_call, repaired = [], False, False, False
+        bad_patch, pending_patches, held_events = None, set(), []
+        validators = {}
+        spec = (sampling or {}).get(GRAMMAR_KEY)
+        if spec and getattr(self.template, "native_grammar", False):
+            parser.structured = spec["kind"] in ("json_schema", "json_object") or "final_schema" in spec
+        if spec and spec["kind"] == "tools" and getattr(self.template, "native_grammar", False):
+            for entry in spec["tools"]:
+                function = entry["function"]
+                validators[function["name"]] = schema_validator(function.get("parameters", {"type": "object"}), required=True)
+
+        def gate(evs):
+            """Only publish a patch call after checking its complete input."""
+            nonlocal bad_patch
+            if not patch_tools:
+                return evs
+            out = []
+            for ev in evs:
+                if ev.call and ev.call.name in patch_tools:
+                    if ev.kind == "tool_start":
+                        pending_patches.add(ev.call.id)
+                    if ev.kind != "tool_call":
+                        continue
+                    pending_patches.discard(ev.call.id)
+                    patch = ev.call.arguments.get("input")
+                    if not isinstance(patch, str):
+                        raise codex_patch.PatchSyntaxError(1, "expected a patch string")
+                    try:
+                        codex_patch.validate(patch)
+                    except codex_patch.PatchSyntaxError as exc:
+                        if bad_patch:
+                            raise ToolOutputError(f"{exc}; more than one malformed patch in the response") from exc
+                        bad_patch = ev, patch, exc
+                (held_events if bad_patch else out).append(ev)
+            return out
 
         def cut(evs):
             """Track reply text and calls, cutting answer text at a stop string."""
@@ -937,6 +1089,14 @@ class Service:
                 elif ev.kind in ("tool_start", "tool_call"):
                     has_call = True
                     complete_call |= ev.kind == "tool_call"
+                    if ev.kind == "tool_call" and validators:
+                        validator = validators.get(ev.call.name)
+                        try:
+                            invalid = validator is None or not validator.is_valid(ev.call.arguments)
+                        except Exception as exc:
+                            raise ToolOutputError(f"could not validate arguments for {ev.call.name}") from exc
+                        if invalid:
+                            raise ToolOutputError(f"arguments for {ev.call.name} failed its JSON Schema")
             if stops is None:
                 return evs
             out = []
@@ -955,7 +1115,7 @@ class Service:
             return out
         opening = []                                    # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
-            opening, force = parser.feed(force), None
+            opening, force = gate(parser.feed(force)), None
             has_call = any(ev.kind in ("tool_start", "tool_call") for ev in opening)
         tail = ""                                       # the last characters written (the newlines before a call)
         reused0 = None                                  # reused prefix of the request's first engine run
@@ -1014,7 +1174,8 @@ class Service:
                         self.ensure_loaded()
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
-                                  generated=0, started=time.time(), first_token=None, tool=None, tail="",
+                                  generated=0, started=time.time(), first_token=None, tool=None, completed_tool=None,
+                                  decode_progress=None, tail="",
                                   max_tokens=max_new, slot=None, reused=None,
                                   api="anthropic" if path == "/v1/messages" else "openai",
                                   model=getattr(self.request_ctx, "model", None) or self.model)
@@ -1077,8 +1238,8 @@ class Service:
                                 thinking_n += parser.state == "reasoning"
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
-                                evs = cut(parser.feed(piece))
-                                self._note(n, evs, st, rate)
+                                evs = cut(gate(parser.feed(piece)))
+                                self._note(n, evs, st, rate, parser)
                                 if st.get("reused") is None:    # the prefix reuse, once the engine reports it
                                     run_last = getattr(self.engine, "last", None)
                                     if isinstance(run_last, dict) and run_last is not engine_last0 \
@@ -1088,6 +1249,9 @@ class Service:
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
                                     yield "event", ev
+                                if getattr(parser, "orphaned_tool", False):
+                                    finish = "stop"
+                                    break
                                 if evs:
                                     last_out = time.monotonic()
                                 elif time.monotonic() - last_out >= KEEPALIVE_S:
@@ -1137,18 +1301,26 @@ class Service:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
                         if (not (wrap or opens or ended_thinking) and finish == "stop" and not cancel.is_set()
                                 and not looped and (stops is None or stops.hit is None)):
-                            for ev in cut(parser.finish()):
+                            for ev in cut(gate(parser.finish())):
                                 yield "event", ev
                             if stops is not None and stops.hit is not None:
                                 break
-                            if repaired and not complete_call and (has_call or not "".join(answer_parts).strip()):
+                            native_repair = getattr(parser, "repair_turn", None)
+                            native_orphan = bool(getattr(parser, "orphaned_tool", False))
+                            if repaired and not complete_call and native_repair and not bad_patch:
+                                finish = "error"
+                                raise ToolOutputError("DeepSeek did not produce a complete tool call after repair")
+                            if (repaired and not complete_call and not bad_patch
+                                    and (has_call or not "".join(answer_parts).strip())):
                                 finish = "error"
                                 raise ToolOutputError("model output is empty or has an incomplete tool call after repair")
-                            if tools and not has_call and orphaned_tool_tail("".join(answer_parts)):
+                            qwen_orphan = (not bad_patch and not hasattr(self.template, "parser") and tools and not has_call
+                                           and orphaned_tool_tail("".join(answer_parts)))
+                            if tools and not has_call and not bad_patch and (native_orphan or qwen_orphan):
                                 if repaired:
                                     finish = "error"
                                     raise ToolOutputError("model output still has orphaned tool-call tags after repair")
-                                extra = self.tok.encode(REPAIR_TURN, parse_special=True)
+                                extra = self.tok.encode(native_repair or REPAIR_TURN, parse_special=True)
                                 retry_prompt = prompt + seg + extra
                                 room = self.engine.max_context - CTX_SLACK - len(retry_prompt)
                                 if max_new <= n or room < 1:
@@ -1156,7 +1328,10 @@ class Service:
                                     raise ToolOutputError("orphaned tool-call tags; no token or context budget for repair")
                                 max_new = min(max_new, n + room)
                                 prompt = retry_prompt
-                                parser = OutputParser(thinking=False, tools=tools, stream_tools=True)
+                                retry_parser = type(parser)(thinking=False, tools=tools, stream_tools=True)
+                                if native_repair:
+                                    retry_parser.structured = parser.structured
+                                parser = retry_parser
                                 detok = Detokenizer(self.tok)
                                 answer_parts.clear()
                                 repaired, closed_early = True, True
@@ -1200,16 +1375,65 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state == "reasoning"
-                            evs = cut(parser.feed(detok.push(t)))
-                            self._note(n, evs, st, rate)
+                            evs = cut(gate(parser.feed(detok.push(t))))
+                            self._note(n, evs, st, rate, parser)
                             for ev in evs:
                                 yield "event", ev
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                    if not cancel.is_set() and (stops is None or stops.hit is None):
+                        for ev in cut(gate(parser.finish())):
+                            yield "event", ev
+                        if bad_patch and (stops is None or stops.hit is None):
+                            ev, patch, issue = bad_patch
+                            begin, end = getattr(self.template, "patch_repair_turn",
+                                ("<|im_end|>\n<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+                            extra = (self.tok.encode(begin, parse_special=True)
+                                     + self.tok.encode(codex_patch.repair_instruction(patch, issue))
+                                     + self.tok.encode(end, parse_special=True))
+                            retry = prompt + seg + extra
+                            cap = min(codex_patch.MAX_REPAIR_TOKENS, max_new - n,
+                                      self.engine.max_context - CTX_SLACK - len(retry))
+                            if cap < 1:
+                                raise ToolOutputError(f"{issue}; no token or context budget for repair")
+                            repair_sampling = {**(sampling or {}), "temperature": 0}
+                            repair_sampling.pop(GRAMMAR_KEY, None)
+                            if self.grammar_engine and getattr(self.template, "native_grammar", False):
+                                repair_sampling[GRAMMAR_KEY] = {"kind": "json_schema", "schema": codex_patch.REPAIR_SCHEMA}
+                            repair_sampling.pop("stop", None)
+                            repair_sampling.pop("stop_sequences", None)
+                            with self.status_lock:
+                                st.update(phase="repairing apply_patch", tool=ev.call.name)
+                            print(f"[server] warning: {issue}; retrying line once", flush=True)
+                            gen = self.engine.generate(retry, cap, repair_sampling, cancel, embeddings=emb) if emb \
+                                else self.engine.generate(retry, cap, repair_sampling, cancel)
+                            repair_detok, fragments = Detokenizer(self.tok), []
+                            try:
+                                for t in gen:
+                                    if t is None:
+                                        yield "ping", None
+                                        continue
+                                    n += 1
+                                    raw_ids.append(t)
+                                    if t in self.stop_ids:
+                                        break
+                                    fragments.append(repair_detok.push(t))
+                            finally:
+                                gen.close()
+                            if not cancel.is_set():
+                                ev.call.arguments["input"] = codex_patch.repair(patch, issue, "".join(fragments))
+                                for event in cut(held_events):
+                                    yield "event", event
+                                finish = "stop"
+                    if pending_patches and finish == "stop":
+                        finish = "length"
                     if cancel.is_set():
                         finish = "cancel"
+                except ToolOutputError:
+                    finish = "error"
+                    raise
                 except GeneratorExit:                  # client disconnected
                     finish = "disconnect"
                     raise
@@ -1224,6 +1448,9 @@ class Service:
                                 last["reused"] = reused0
                             started = st.get("started", time.time())
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                            expert_routes = last.get("expert_routes")
+                            if expert_routes:
+                                hit_rate = route_hit_rate(expert_routes)
                             # experts read over PCIe or computed elsewhere are not in the hit rate's lookups
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
@@ -1245,6 +1472,7 @@ class Service:
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share,
+                                **({"expert_routes": expert_routes} if expert_routes is not None else {}),
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted"),
                                 "ttft_s": round(ttft, 2) if ttft is not None else None,
@@ -1258,7 +1486,7 @@ class Service:
                             now = time.time()
                             rate = n / max(1e-6, now - ft) if ft else 0.0
                             print(done_line(self._slot_of(st), seen, n, finish, cancel.is_set(), timings, ttft, rate,
-                                            dl, hit_rate, pcie_share), flush=True)
+                                            dl, hit_rate, pcie_share, st.get("completed_tool")), flush=True)
                             if finish == "length" and parser.state == "reasoning":
                                 print("[server] warning: max tokens reached while thinking, no answer "
                                       "(set reasoning_budget_tokens, or start with --reasoning-budget-tokens)",
@@ -1279,12 +1507,12 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in cut(parser.finish()):
-            yield "event", ev
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n}
+        if isinstance(ids, PromptText) and ids.n is not None:
+            done["prompt_tokens"] = ids.n
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
@@ -1310,9 +1538,27 @@ def slot_tag(slot: int | None) -> str:
     return "s?" if slot is None else f"s{slot + 1}"
 
 
+def route_hit_rate(routes: dict) -> float | None:
+    total = sum(routes.values())
+    return (routes["primary"] + routes["helper"]) / total if total else None
+
+
+def decode_metrics_line(stats: dict | None) -> str:
+    if not stats:
+        return ""
+    offered = stats["drafts_offered"]
+    hit = route_hit_rate(stats["expert_routes"])
+    return (f" acc={stats['drafts_accepted'] / offered:.0%}" if offered else "") + (
+        f" hit={hit:.1%}" if hit is not None else "")
+
+
+def log_tool_name(name: str | None) -> str:
+    return " ".join((name or "").split())[:128]
+
+
 def done_line(slot: int | None, prompt_total: int, generated: int, finish: str, cancelled: bool,
               timings: dict | None, ttft: float | None, wall_rate: float, dl: float | None = None,
-              hit: float | None = None, pcie: float | None = None) -> str:
+              hit: float | None = None, pcie: float | None = None, tool: str | None = None) -> str:
     """The request's closing log line: slot, prompt (total, cached, read time, read rate), reply (count, rate,
     drafts accepted, tokens per window), time to the first token, end, expert cache hit and PCIe share.
     `timings` is request_timings(); None when the engine gave no clock."""
@@ -1336,6 +1582,8 @@ def done_line(slot: int | None, prompt_total: int, generated: int, finish: str, 
         groups.append(f"hit={hit * 100:.1f}%")
         if pcie is not None:
             groups.append(f"pcie={pcie * 100:.1f}%")
+    if tool:
+        groups.append(f"tool={tool}")
     return f"[server] {slot_tag(slot)} done  " + "  ".join(groups)
 
 

@@ -7,6 +7,7 @@ import http.client
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from serve.frontend import ChatTemplate  # noqa: E402
 from serve.api.responses import (ENCRYPTED_PREFIX, ResponsesError, input_messages, request_tools,  # noqa: E402
                              template_kwargs, text_format)
 from serve.api.structured import jsonschema_modules  # noqa: E402
+from serve.engine import modelfile  # noqa: E402, F401 (adds the packaged tokenizer to sys.path)
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
 from serve.service import Service  # noqa: E402
@@ -192,6 +194,51 @@ class Server(unittest.TestCase):
 
 
 class OverHttp(Server):
+    def test_deepseek_image_history_is_not_capped_at_eight(self):
+        from serve.deepseek import DeepSeekTemplate
+
+        self.svc.template = DeepSeekTemplate()
+
+        class ImageTokenizer(ByteTokenizer):
+            SPECIALS = ByteTokenizer.SPECIALS + [DeepSeekTemplate.image_placeholder]
+
+        self.svc.tok = self.tok = ImageTokenizer()
+        sources = ["data:image/png;base64," + base64.b64encode(str(i).encode()).decode() for i in range(10)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "request.sve"
+            seen = []
+
+            class Vision:
+                def encode(self, images, *, token_budget):
+                    seen.append(images)
+                    if len(images) * 1024 > token_budget:
+                        raise ValueError("image tokens exceed the remaining request context")
+                    path.write_bytes(b"fixture")
+                    return path, [1024] * len(images)
+
+            self.svc.vision = Vision()
+            history = [{"role": "user", "content": [
+                {"type": "input_text", "text": f"Screenshot note {i}."},
+                {"type": "input_image", "image_url": url},
+            ]} for i, url in enumerate(sources)]
+            # Codex can replay screenshots as tool results as well as user attachments.
+            history[0:1] = [
+                {"type": "function_call", "call_id": "snapshot", "name": "screenshot", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "snapshot", "output": history[0]["content"]},
+            ]
+            for count in (8, 10):
+                with self.subTest(count=count):
+                    code, response = self.post({"model": self.svc.model, "input": history[:count + 1], "stream": True})
+                    self.assertEqual(code, 200, response)
+                    self.assertEqual(response[-1]["type"], "response.completed")
+                    self.assertEqual(seen[-1], sources[:count])
+                    prompt = self.tok.decode(self.engine.last_prompt)
+                    self.assertNotIn("Basalt omitted this image", prompt)
+                    self.assertEqual(prompt.count(DeepSeekTemplate.image_placeholder), 1024 * count)
+                    self.assertIn("Screenshot note 0.", prompt)
+                    self.assertIn(f"Screenshot note {count - 1}.", prompt)
+                    self.assertFalse(path.exists())
+
     def test_non_streaming_text_with_reasoning(self):
         code, r = self.post({"model": "qwen3.8-flash-next", "input": "hi", "store": False})
         self.assertEqual(code, 200)
@@ -356,7 +403,8 @@ class ToolsWithStructuredOutput(Server):
 
     def test_custom_tool_turn_does_not_need_a_final_json_answer(self):
         self.scripts('</think>\n\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n'
-                     '*** Begin Patch\n</parameter>\n</function>\n</tool_call>')
+                     '*** Begin Patch\n*** Add File: test.txt\n+hello\n*** End Patch\n'
+                     '</parameter>\n</function>\n</tool_call>')
         code, result = self.post({"model": "qwen3.8-flash-next", "input": "use the tool", "text": {"format": self.fmt},
                                  "tools": [{"type": "custom", "name": "apply_patch"}], "stream": True})
         self.assertEqual(code, 200, result)
@@ -404,6 +452,123 @@ class ToolsWithStructuredOutput(Server):
 
 
 class ToolRoundTrip(Server):
+    def test_patch_repair_replaces_one_line_before_streaming_to_codex(self):
+        from serve.deepseek import DeepSeekTemplate
+
+        fixed = ("*** Begin Patch\n*** Add File: first.txt\n" +
+                 "".join(f"+original {i}\n" for i in range(253)) +
+                 "*** Update File: second.txt\n@@\n unchanged\n-old\n+new\n*** End Patch")
+        bad = fixed.replace("*** Update File:", "\n*** Update File:")
+        tool = {"type": "namespace", "name": "functions", "tools": [{"type": "custom", "name": "apply_patch"}]}
+        for native in (False, True):
+            for repair_reply in ('{"lines":[]}', '{"lines":["*** Delete File: unrelated.txt"]}'):
+                good = repair_reply == '{"lines":[]}'
+                with self.subTest(native=native, valid_repair=good):
+                    if native:
+                        self.svc.template = DeepSeekTemplate()
+                        script = ('</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="apply_patch">\n'
+                                  '<｜DSML｜ parameter name="input" string="true">' + bad +
+                                  '</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>')
+                    else:
+                        self.svc.template = TEMPLATE
+                        script = ("</think>\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n" +
+                                  bad + "\n</parameter>\n</function>\n</tool_call>")
+                    self.engine.turns = 0
+                    self.engine.requests.clear()
+                    self.engine.scripts = [self.tok.encode(s + "<|im_end|>", parse_special=True)
+                                           for s in (script, repair_reply)]
+                    code, events = self.post({"model": self.svc.model, "input": "Apply the edit.",
+                                              "tools": [tool], "stream": True, "max_output_tokens": 8192})
+                    self.assertEqual(code, 200, events)
+                    self.assertEqual(len(self.engine.requests), 2)
+                    self.assertIn("apply_patch line 256:", self.tok.decode(self.engine.requests[1][0]))
+                    if native:
+                        self.assertEqual(self.engine.requests[1][1]["_grammar"]["kind"], "json_schema")
+                    self.assertEqual(events[-1]["type"], "response.completed" if good else "response.failed")
+                    sent = [e["delta"] for e in events if e["type"] == "response.custom_tool_call_input.delta"]
+                    self.assertEqual(sent, [fixed] if good else [])
+                    if not good:
+                        self.assertFalse(any(e["type"] == "response.output_item.added" and
+                                             e["item"]["type"] == "custom_tool_call" for e in events))
+                        self.assertEqual(events[-1]["response"]["error"]["code"], "tool_output_invalid")
+
+    def test_invalid_patch_with_no_repair_budget_fails_nonstreaming(self):
+        script = ("</think>\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n"
+                  "*** Begin Patch\n*** Delete File: a.txt\n\n*** End Patch\n"
+                  "</parameter>\n</function>\n</tool_call>")
+        tokens = self.tok.encode(script, parse_special=True)
+        self.engine.script = tokens
+        self.engine.scripts = [tokens]
+        code, result = self.post({"model": self.svc.model, "input": "Delete a.txt.",
+                                  "tools": [{"type": "custom", "name": "apply_patch"}],
+                                  "max_output_tokens": len(tokens)})
+        self.assertEqual(code, 502, result)
+        self.assertEqual(result["error"]["code"], "tool_output_invalid")
+        self.assertIn("apply_patch line 3", result["error"]["message"])
+        self.assertEqual(len(self.engine.requests), 1)
+
+    def test_deepseek_retries_orphan_parameters_once(self):
+        from serve.deepseek import DeepSeekTemplate
+
+        self.svc.template = DeepSeekTemplate()
+        bad = ('</think>\n</｜DSML｜ parameter>\n'
+               '<｜DSML｜ parameter name="workdir" string="true">/workspace</｜DSML｜ parameter>')
+        fixed = ('<｜DSML｜ calls>\n<｜DSML｜ invoke name="exec_command">\n'
+                 '<｜DSML｜ parameter name="cmd" string="true">pwd</｜DSML｜ parameter>\n'
+                 '<｜DSML｜ parameter name="workdir" string="true">/workspace</｜DSML｜ parameter>\n'
+                 '</｜DSML｜ invoke>\n</｜DSML｜ calls>')
+        tool = {"type": "function", "name": "exec_command", "parameters": {"type": "object"}}
+        for second, terminal in ((fixed, "response.completed"), (bad.removeprefix("</think>"), "response.failed")):
+            with self.subTest(terminal=terminal):
+                self.engine.turns = 0
+                self.engine.requests.clear()
+                self.engine.scripts = [self.tok.encode(reply + "<|im_end|>", parse_special=True)
+                                       for reply in (bad, second)]
+                code, events = self.post({"model": self.svc.model, "input": "Print the working directory.",
+                                          "tools": [tool], "stream": True, "max_output_tokens": 1024})
+                self.assertEqual(code, 200, events)
+                self.assertEqual(events[-1]["type"], terminal)
+                self.assertEqual(len(self.engine.requests), 2)
+                self.assertIn("no tool ran", self.tok.decode(self.engine.requests[1][0]))
+                self.assertNotIn("DSML", "".join(e["delta"] for e in events if e["type"] == "response.output_text.delta"))
+                result = events[-1]["response"]
+                if terminal == "response.completed":
+                    calls = [(item["name"], json.loads(item["arguments"])) for item in result["output"]
+                             if item["type"] == "function_call"]
+                    self.assertEqual(calls, [("exec_command", {"cmd": "pwd", "workdir": "/workspace"})])
+                else:
+                    self.assertEqual(result["error"]["code"], "tool_output_invalid")
+
+    def test_deepseek_code_mode_accepts_only_an_unambiguous_short_name(self):
+        from serve.deepseek import DeepSeekTemplate
+
+        self.svc.template = DeepSeekTemplate()
+        script = ('</think>\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="exec">\n'
+                  '<｜DSML｜ parameter name="input" string="true">text(2 + 2)</｜DSML｜ parameter>\n'
+                  '</｜DSML｜ invoke>\n</｜DSML｜ calls><|im_end|>')
+        tokens = self.tok.encode(script, parse_special=True)
+        def namespace(name):
+            return {"type": "namespace", "name": name, "tools": [{"type": "custom", "name": "exec"}]}
+
+        for namespaces, terminal in ((["functions"], "response.completed"),
+                                     (["functions", "other"], "response.failed"),
+                                     ([], "response.failed")):
+            with self.subTest(namespaces=namespaces):
+                self.engine.scripts = [tokens]
+                self.engine.script = tokens
+                code, events = self.post({"model": self.svc.model, "input": "calculate", "stream": True,
+                                          "tools": [namespace(name) for name in namespaces]})
+                self.assertEqual(code, 200, events)
+                self.assertEqual(events[-1]["type"], terminal)
+                result = events[-1]["response"]
+                calls = [item for item in result["output"] if item["type"] == "custom_tool_call"]
+                if len(namespaces) == 1:
+                    self.assertEqual([(c["namespace"], c["name"], c["input"]) for c in calls],
+                                     [("functions", "exec", "text(2 + 2)")])
+                else:
+                    self.assertFalse(calls)
+                    self.assertEqual(result["error"]["code"], "tool_output_invalid")
+
     script = [CALL, ANSWER]
 
     def test_function_call_round_trip(self):
@@ -442,10 +607,11 @@ class ToolRoundTrip(Server):
         self.assertEqual(r["output"][-1]["content"][0]["text"], "The file says before.")
 
     def test_namespace_and_custom_calls_come_back_under_their_own_names(self):
+        patch = "*** Begin Patch\n*** Add File: test.txt\n+hello\n*** End Patch"
         self.engine.scripts = [self.tok.encode(
             "</think>\n\n<tool_call>\n<function=multi_agent_v1.spawn_agent>\n<parameter=message>\nhi\n</parameter>\n"
-            "</function>\n</tool_call>\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n*** Begin Patch\n"
-            "</parameter>\n</function>\n</tool_call><|im_end|>", parse_special=True)]
+            "</function>\n</tool_call>\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n" + patch +
+            "\n</parameter>\n</function>\n</tool_call><|im_end|>", parse_special=True)]
         self.engine.script = self.engine.scripts[0]
         tools = [{"type": "namespace", "name": "multi_agent_v1", "description": "Agents.", "tools": [
             {"type": "function", "name": "spawn_agent", "strict": False,
@@ -457,7 +623,7 @@ class ToolRoundTrip(Server):
         self.assertEqual((ns["type"], ns["namespace"], ns["name"], json.loads(ns["arguments"])),
                          ("function_call", "multi_agent_v1", "spawn_agent", {"message": "hi"}))
         self.assertEqual((custom["type"], custom["name"], custom["input"]),
-                         ("custom_tool_call", "apply_patch", "*** Begin Patch"))
+                         ("custom_tool_call", "apply_patch", patch))
         msgs = input_messages({"input": [{"role": "user", "content": "go"}, ns, custom,
                                          {"type": "function_call_output", "call_id": ns["call_id"], "output": "1"},
                                          {"type": "custom_tool_call_output", "call_id": custom["call_id"],

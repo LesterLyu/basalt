@@ -2,6 +2,7 @@
 // that the stream-k fixup of a launch takes from.
 #include "mmq_common.cuh"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -49,6 +50,8 @@ struct CachingPool : ggml_cuda_pool {
     struct Buf { void * p; size_t size; bool used; };
     std::vector<Buf> bufs;
     std::mutex mu;
+    std::atomic<size_t> reserved{0};
+    size_t reserved_bytes() const override { return reserved.load(std::memory_order_relaxed); }
     void * alloc(size_t size, size_t * actual_size) override {
         std::lock_guard<std::mutex> lk(mu);
         for (auto & b : bufs)
@@ -56,6 +59,7 @@ struct CachingPool : ggml_cuda_pool {
         void * p = nullptr;
         CUDA_CHECK(cudaMalloc(&p, size));
         bufs.push_back({p, size, true});
+        reserved.fetch_add(size, std::memory_order_relaxed);
         *actual_size = size;
         return p;
     }

@@ -111,6 +111,44 @@ void unit_tests() {
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
     }
+    {
+        SuffixDrafter d(3,32,1024,2);
+        int32_t out[4]{};
+        const std::vector<int32_t> agrees={10,2,3,9,11,2,3,9,12,2,3};
+        d.append(agrees.data(),agrees.size());
+        check(d.propose(4,out)==1 && out[0]==9,"bigram fallback requires agreeing continuations");
+        check(d.last_match()==2,"bigram reports matched suffix length");
+        check(d.propose(0,out)==0,"bigram respects proposal limit");
+        d.reset();
+        const std::vector<int32_t> disagrees={10,2,3,9,11,2,3,8,12,2,3};
+        d.append(disagrees.data(),disagrees.size());
+        check(d.propose(4,out)==0,"bigram rejects conflicting continuations");
+        d.reset();
+        const std::vector<int32_t> one={10,2,3,9,11,2,3};
+        d.append(one.data(),one.size());
+        check(d.propose(4,out)==0,"bigram requires two earlier continuations");
+        d.reset();
+        const std::vector<int32_t> extends={10,2,3,9,7,11,2,3,9,7,12,2,3};
+        d.append(extends.data(),extends.size());
+        check(d.propose(4,out)==2 && out[0]==9 && out[1]==7,"bigram extends agreeing continuation");
+        check(d.propose(1,out)==1,"bigram extension respects remaining tokens");
+    }
+    {
+        SuffixDrafter d(3,32,1024,0,true);
+        const std::vector<int32_t> ids={7,1,2,3,9,8,6,1,2,3,9,5,4,1,2,3,9,5,7,1,2,3};
+        d.append(ids.data(),ids.size());
+        int32_t out[4]{};
+        check(d.propose(4,out)==1 && out[0]==9,"trigram trim retains the agreed prefix");
+    }
+    {
+        const std::vector<int32_t> ids={2,10,3,9,7,2,11,3,9,7,2,12,3};
+        SuffixDrafter exact(3,32,1024,2), skip(3,32,1024,2,false,true);
+        exact.append(ids.data(),ids.size());
+        skip.append(ids.data(),ids.size());
+        int32_t out[4]{};
+        check(exact.propose(4,out)==0,"nonadjacent pair is opt-in");
+        check(skip.propose(4,out)==2 && out[0]==9 && out[1]==7,"nonadjacent pair accepts agreeing history");
+    }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }
 }  // namespace

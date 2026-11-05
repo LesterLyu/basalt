@@ -46,6 +46,7 @@ public:
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
+    void f32_emulated(const float* X,const float* W,float* Y,int64_t T,int64_t N,int64_t K);
 
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
@@ -65,6 +66,7 @@ private:
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
     bool external_ = false;
+    bool emulation_ready_ = false;
     void* hipblaslt_state_ = nullptr;
 };
 

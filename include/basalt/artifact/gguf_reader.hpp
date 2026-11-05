@@ -173,6 +173,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 98;
         return true;
+    case 19:
+        elems = 256;
+        bytes = 50;
+        return true;
     case 20:
         elems = 32;
         bytes = 18;
@@ -196,6 +200,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 24:   // I8: raw bytes
         elems = 1;
         bytes = 1;
+        return true;
+    case 39:   // MXFP4
+        elems = 32;
+        bytes = 17;
         return true;
     case 40:   // NVFP4
         elems = 64;
@@ -263,6 +271,7 @@ struct MetaValue {
     MetaType elem = MetaType::U32; // arrays
     uint64_t count = 0;
     std::vector<MetaValue> items;
+    uint64_t array_offset = ~uint64_t{0}; // raw GGUF array payload; unavailable in virtual metadata
     bool is_num() const { return type != MetaType::STRING && type != MetaType::ARRAY; }
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
@@ -314,6 +323,7 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
     case MetaType::ARRAY: {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
+        v.array_offset = c.pos();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
         v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
         for (uint64_t i = 0; i < v.count; ++i) {
@@ -329,9 +339,10 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
 }
 
 // A GGUF-shaped view of a file that is not a GGUF: the metadata and the tensor directory come from elsewhere
-// (a .basalt model file's `meta` section) and every tensor offset is an absolute file offset.  Registered under the
-// file's path, so everything that opens `GgufFile(path)` reads the tensors in place from it.
+// (a .basalt model file's `meta` section) and every tensor offset is an absolute file offset. A submodel registry
+// key can name a separate tensor directory backed by the same physical file.
 struct VirtualGguf {
+    std::string source_path;         // physical file when the registry key names a submodel
     std::map<std::string, MetaValue> meta;
     std::vector<TensorInfo> tensors;   // offset: absolute, from the start of the file
 };
@@ -380,6 +391,21 @@ public:
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
     }
+    /// Reads one complete flat metadata array with an explicit allocation bound. Normal parsing keeps its sample.
+    MetaValue full_array(const std::string& key, uint64_t max_items) const {
+        const auto* v = get(key);
+        if (!v || v->type != MetaType::ARRAY || v->elem == MetaType::ARRAY || v->count > max_items)
+            throw std::runtime_error("GGUF: array missing, nested or exceeds limit: " + key);
+        if (v->items.size() == v->count) return *v;
+        if (virtual_ || v->array_offset > size_)
+            throw std::runtime_error("GGUF: full array unavailable: " + key);
+        Cursor c(base_ + v->array_offset, size_ - v->array_offset);
+        MetaValue out = *v;
+        out.items.clear();
+        out.items.reserve((size_t) v->count);
+        for (uint64_t i = 0; i < v->count; ++i) out.items.push_back(read_value(c, v->elem, 1));
+        return out;
+    }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
 private:
@@ -387,17 +413,19 @@ private:
         // A read-only view: the pages are the cache manager's or page cache's, demand faulted, and nothing here writes
         // to them.
         std::string why;
+        const auto& reg = gguf_virtual_registry();
+        const auto it = reg.find(path_);
+        const auto view = it == reg.end() ? std::shared_ptr<const VirtualGguf>{} : it->second;
+        if (view && !view->source_path.empty()) path_ = view->source_path;
         auto m = platform::MappedFile::open_ro(path_, &why);
         if (!m) throw std::runtime_error(why);
         map_ = std::move(*m);
         base_ = map_.data();
         size_ = map_.size();
-        const auto& reg = gguf_virtual_registry();
-        const auto it = reg.find(path_);
-        if (it != reg.end()) {
+        if (view) {
             virtual_ = true;
-            meta_ = it->second->meta;
-            tensors_ = it->second->tensors;
+            meta_ = view->meta;
+            tensors_ = view->tensors;
             version_ = 3;
             data_start_ = 0;
             alignment_ = 1;
@@ -447,7 +475,11 @@ private:
             if (a->u) align = a->u;
         alignment_ = align;
         data_start_ = (c.pos() + align - 1) / align * align;
-        if (data_start_ > size_) throw std::runtime_error("GGUF: data section starts past EOF");
+        if (data_start_ > size_) {
+            // Metadata-only shards have no data section and need no trailing alignment padding.
+            if (!tensors_.empty()) throw std::runtime_error("GGUF: data section starts past EOF");
+            data_start_ = size_;
+        }
     }
 
     std::string path_;

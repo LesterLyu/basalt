@@ -49,6 +49,6 @@ struct RequestGrammar {
 /// A json_schema or json_object request may carry "tools" too: from the first answer token, either tool calls or the
 /// JSON value. tool_choice "none" gives a null grammar; a named choice keeps only that tool. A null grammar with empty `err` is
 /// not an error; an unusable request sets `err`.
-RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err);
+RequestGrammar grammar_from_request(const std::string& grammar_json, std::string& err, bool deepseek = false);
 
 }  // namespace basalt::program::grammar

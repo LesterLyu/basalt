@@ -45,6 +45,10 @@ class _Nvml:
     class Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
+    class MemV2(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint), ("total", ctypes.c_ulonglong), ("reserved", ctypes.c_ulonglong),
+                    ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
     def __init__(self, index=0):
         self.lib, self.dev = _load_nvml(), None
         if self.lib is None:
@@ -65,6 +69,17 @@ class _Nvml:
 
     def ok(self):
         return self.lib is not None and self.dev is not None
+
+    def device_count(self):
+        if self.lib is not None:
+            count = ctypes.c_uint()
+            try:
+                get = getattr(self.lib, "nvmlDeviceGetCount_v2", None) or self.lib.nvmlDeviceGetCount
+                if get(ctypes.byref(count)) == 0:
+                    return count.value
+            except (AttributeError, OSError):
+                pass
+        return 0
 
     def _uint(self, fn, *args):
         v = ctypes.c_uint()
@@ -102,6 +117,23 @@ class _Nvml:
                 continue
         return None
 
+    def memory(self):
+        m = self.MemV2()
+        m.version = ctypes.sizeof(m) | (2 << 24)
+        try:
+            if self.lib.nvmlDeviceGetMemoryInfo_v2(self.dev, ctypes.byref(m)) == 0:
+                # Use occupied bytes consistently when drivers report reserved bytes outside used.
+                return {"mem_used": m.total - m.free, "mem_total": m.total, "mem_free": m.free, "mem_reserved": m.reserved}
+        except (AttributeError, OSError):
+            pass
+        old = self.Mem()
+        try:
+            if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(old)) == 0:
+                return {"mem_used": old.used, "mem_total": old.total, "mem_free": old.free}
+        except (AttributeError, OSError):
+            pass
+        return {}
+
     def read(self):
         out = {}
         u = self.Util()
@@ -110,12 +142,7 @@ class _Nvml:
                 out["util"] = u.gpu
         except (AttributeError, OSError):
             pass
-        m = self.Mem()
-        try:
-            if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
-                out["mem_used"], out["mem_total"] = m.used, m.total
-        except (AttributeError, OSError):
-            pass
+        out.update(self.memory())
         out["temp"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))          # NVML_TEMPERATURE_GPU
         mw = self._uint("nvmlDeviceGetPowerUsage")
         out["power"] = mw / 1000.0 if mw is not None else None
@@ -142,6 +169,13 @@ def _cpu_name():
         for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
+    if os.name == "nt":
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                return winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+        except OSError:
+            pass
     return platform.processor() or None
 
 
@@ -177,10 +211,11 @@ class _CpuRamFallback:
 
 
 # ------------------------------------------------------------------------------------------------ the sampler
-GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
+GPU_KEYS = ("util", "mem_used", "mem_total", "mem_free", "mem_reserved", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
             "pcie_rx_mb", "pcie_tx_mb")
 SERIES = ("tok_s", "prefill_tok_s_mean")      # series kept as history
-GPU_SERIES = ("util", "power", "temp")         # per-card series kept as history
+HOST_SERIES = ("cpu", "ram_used")
+GPU_SERIES = ("util", "power", "temp", "mem_used", "pcie_rx_mb", "pcie_tx_mb")
 
 
 def _r2(v):
@@ -188,16 +223,28 @@ def _r2(v):
 
 
 class Telemetry:
-    def __init__(self, extra=None, gpu_indices=None, gpu_factory=gpu_reader):
+    def __init__(self, extra=None, gpu_indices=None, gpu_factory=gpu_reader, gpu_owner_pids=None, ram_pids=None):
         """`extra()` returns the server's own speeds, recorded each second. `gpu_indices`: the engine's cards
         (NVML numbering); `gpu_factory(index)` returns a reader with ok(), read(), name() and optionally
         driver_version(), cuda_version()."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {"gpus": [], "cpu": None, "ram_used": None, "ram_total": None, "disk_read_mb": None}
-        self.hist = {k: collections.deque(maxlen=HISTORY) for k in SERIES}
+        self.hist = {k: collections.deque(maxlen=HISTORY) for k in SERIES + HOST_SERIES}
         self.slot_hist = collections.deque(maxlen=HISTORY)     # per sample: each slot's tok/s
-        self.gpus = [(i, g) for i, g in ((i, gpu_factory(i)) for i in dict.fromkeys(gpu_indices or [0])) if g.ok()]
+        indices = list(gpu_indices or [0])
+        if gpu_factory is gpu_reader:
+            indices.extend(range(gpu_reader().device_count()))
+        self.gpus = [(i, g) for i, g in ((i, gpu_factory(i)) for i in sorted(set(indices))) if g.ok()]
+        self.gpu_owner_pids = gpu_owner_pids
+        self.ram_pids = ram_pids
+        self.dedicated = None
+        if os.name == "nt" and self.gpus and gpu_owner_pids is not None:
+            from serve.util.wddm import DedicatedMemory
+            try:
+                self.dedicated = DedicatedMemory(self.gpus)
+            except (AttributeError, OSError):
+                pass
         self.gpu_hist = {i: {k: collections.deque(maxlen=HISTORY) for k in GPU_SERIES} for i, _ in self.gpus}
         try:
             import psutil  # noqa: F401
@@ -225,6 +272,8 @@ class Telemetry:
             c = self.ps.disk_io_counters()
         except (OSError, RuntimeError):
             return None
+        if c is None:
+            return None
         t = time.time()
         prev, self._disk_prev = self._disk_prev, (t, c.read_bytes)
         if prev is None or t <= prev[0]:
@@ -232,13 +281,18 @@ class Telemetry:
         return (c.read_bytes - prev[1]) / (t - prev[0]) / 2**20
 
     def sample(self):
-        s = {"gpus": []}
+        s = {"gpus": [], "_gpu_sample_started": time.monotonic()}
         for i, g in self.gpus:
             try:
                 r = g.read()
             except Exception:  # noqa: BLE001 - telemetry must never take the server down
                 r = {}
             s["gpus"].append({"index": i, **{k: r.get(k) for k in GPU_KEYS}})
+        if self.dedicated is not None:
+            try:
+                s["_gpu_other_apps"] = self.dedicated.sample(self.gpu_owner_pids())
+            except Exception:  # noqa: BLE001 - optional Windows counters
+                pass
         s["cpu"] = s["ram_used"] = s["ram_total"] = None
         if self.ps:
             try:
@@ -251,6 +305,16 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"] = self._disk()
+        if self.ps and self.ram_pids is not None:
+            processes = {}
+            for role, pid in self.ram_pids().items():
+                try:
+                    info = self.ps.Process(pid).memory_info()
+                    processes[role] = {"rss": info.rss, "peak_rss": getattr(info, "peak_wset", None),
+                                       "private_commit": getattr(info, "private", None)}
+                except (self.ps.Error, OSError):
+                    continue
+            s["_ram_processes"] = processes
         if self.extra:
             try:
                 s.update(self.extra())
@@ -262,7 +326,7 @@ class Telemetry:
         """Make sample `s` the current reading and add it to the history."""
         with self.lock:
             self.now = s
-            for k in SERIES:
+            for k in SERIES + HOST_SERIES:
                 self.hist[k].append(_r2(s.get(k)))
             if "slot_tok_s" in s:
                 self.slot_hist.append([_r2(v) for v in s.get("slot_tok_s") or []])
@@ -279,10 +343,13 @@ class Telemetry:
 
     def snapshot(self):
         with self.lock:
-            now = {k: v for k, v in self.now.items() if k not in SERIES and k != "slot_tok_s"}
+            now = {k: v for k, v in self.now.items() if k not in SERIES and k != "slot_tok_s" and not k.startswith("_")}
             hist = {k: list(v) for k, v in self.hist.items()}
             # one series per slot, oldest first; a sample from before a slot existed is None
             n = max((len(x) for x in self.slot_hist), default=0)
             hist["slot_tok_s"] = [[x[j] if j < len(x) else None for x in self.slot_hist] for j in range(n)]
             hist["gpus"] = [{"index": i, **{k: list(v) for k, v in h.items()}} for i, h in self.gpu_hist.items()]
-            return {"now": now, "history": hist, "static": dict(self.static)}
+            return {"now": now, "history": hist, "static": dict(self.static),
+                    "gpu_sample_started": self.now.get("_gpu_sample_started", 0),
+                    "gpu_other_apps": self.now.get("_gpu_other_apps", {}),
+                    "ram_processes": self.now.get("_ram_processes", {})}

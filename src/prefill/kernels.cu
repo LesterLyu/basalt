@@ -604,6 +604,13 @@ __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict_
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = hf(x[i]);
 }
+__global__ void to_f16_strided_kernel(const float* __restrict__ x,uint16_t* __restrict__ y,
+                                      int rows,int cols,size_t stride) {
+    const int col=blockIdx.x*blockDim.x+threadIdx.x;
+    if(col>=cols)return;
+    for(int row=blockIdx.y;row<rows;row+=gridDim.y)
+        y[size_t(row)*cols+col]=hf(x[size_t(row)*stride+col]);
+}
 __global__ void round_f16_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         y[i] = __half2float(__float2half_rn(x[i]));
@@ -632,6 +639,12 @@ void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
     check("to_f16");
+}
+void to_f16_strided(const float* x,uint16_t* y,int rows,int cols,size_t stride,void* stream) {
+    if(rows<1 || cols<1 || stride<size_t(cols))return;
+    to_f16_strided_kernel<<<dim3((cols+255)/256,rows<256?rows:256),256,0,static_cast<cudaStream_t>(stream)>>>(
+        x,y,rows,cols,stride);
+    check("to_f16_strided");
 }
 void round_f16(const float* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;

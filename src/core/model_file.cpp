@@ -111,6 +111,7 @@ struct JsonParser {
     const char* end;
     const char* begin;
     std::string err;
+    size_t array_keep;
 
     bool fail(const char* what) {
         if (err.empty()) err = std::string(what) + " at byte " + std::to_string((size_t) (p - begin));
@@ -238,7 +239,7 @@ struct JsonParser {
             for (;;) {
                 Json child;
                 if (!value(child, depth + 1)) return false;
-                if (v.items.size() < Json::kJsonArrayKeep) v.items.push_back(std::move(child));
+                if (v.items.size() < array_keep) v.items.push_back(std::move(child));
                 ++v.count;
                 ws();
                 if (p < end && *p == ',') { ++p; continue; }
@@ -257,8 +258,8 @@ struct JsonParser {
 
 }  // namespace
 
-bool parse_json(const char* text, size_t n, Json& out, std::string& err) {
-    JsonParser ps{text, text + n, text, {}};
+bool parse_json(const char* text, size_t n, Json& out, std::string& err, size_t array_keep) {
+    JsonParser ps{text, text + n, text, {}, array_keep};
     out = Json{};
     if (!ps.value(out, 0)) { err = "json: " + ps.err; return false; }
     ps.ws();
@@ -376,15 +377,17 @@ MetaValue meta_value(const Json& j) {
 
 }  // namespace
 
-bool ModelFile::register_gguf_view(std::string& err) const {
-    const Json* kv = meta_.get("gguf_kv");
-    const Json* tensors = meta_.get("tensors");
-    const Section* gg = find("gguf");
+bool ModelFile::register_gguf_view(std::string& err, const std::string& prefix) const {
+    const Json* root = prefix.empty() ? &meta_ : meta_.get(prefix);
+    const Json* kv = root ? root->get("gguf_kv") : nullptr;
+    const Json* tensors = root ? root->get("tensors") : nullptr;
+    const Section* gg = find(prefix.empty() ? "gguf" : prefix + "/gguf");
     if (kv == nullptr || !kv->is_object() || tensors == nullptr || !tensors->is_object()) {
         err = path_ + ": meta has no gguf_kv / tensors";
         return false;
     }
     auto view = std::make_shared<VirtualGguf>();
+    view->source_path = path_;
     for (const auto& [k, v] : kv->members) view->meta.emplace(k, meta_value(v));
     for (const auto& [name, t] : tensors->members) {
         const Json* type_id = t.get("type_id");
@@ -407,7 +410,7 @@ bool ModelFile::register_gguf_view(std::string& err) const {
             }
         view->tensors.push_back(std::move(ti));
     }
-    gguf_register_virtual(path_, std::move(view));
+    gguf_register_virtual(prefix.empty() ? path_ : path_ + "#" + prefix, std::move(view));
     return true;
 }
 

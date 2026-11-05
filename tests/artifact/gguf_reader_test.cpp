@@ -36,7 +36,7 @@ void put_str(std::vector<uint8_t>& b, const std::string& s) {
 }
 
 // A GGUF v3 file of F32[8] tensors named `names`, laid out 32 bytes apart from a 32-byte-aligned data start.
-std::filesystem::path write_gguf(const std::vector<std::string>& names) {
+std::filesystem::path write_gguf(const std::vector<std::string>& names, bool pad = true) {
     std::vector<uint8_t> b;
     put<uint32_t>(b, 0x46554747u);   // "GGUF"
     put<uint32_t>(b, 3);
@@ -49,7 +49,7 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names) {
         put<uint32_t>(b, 0);         // F32
         put<uint64_t>(b, 32 * i);    // offset from data_start
     }
-    b.resize((b.size() + 31) / 32 * 32 + 32 * names.size(), 0);
+    if (pad) b.resize((b.size() + 31) / 32 * 32 + 32 * names.size(), 0);
     const auto path = std::filesystem::temp_directory_path() / "gguf_reader_test.gguf";
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize)b.size());
     return path;
@@ -58,6 +58,32 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names) {
 
 int main() {
     std::printf("gguf_reader_test\n");
+    {
+        basalt::TensorInfo t;
+        t.type = 19; t.shape = {5120, 2304, 384};
+        check(basalt::tensor_payload_bytes(t) == 884736000, "IQ1_S target expert tensor has its native byte count");
+        t.type = 39; t.shape = {5120, 2304, 128};
+        check(basalt::tensor_payload_bytes(t) == 802160640, "MXFP4 drafter expert tensor has its native byte count");
+        t.type = 19; t.shape = {255, 2304, 384};
+        check(basalt::tensor_payload_bytes(t) == 0, "partial quantization blocks remain refused");
+    }
+    {
+        const auto path = write_gguf({}, false);
+        bool opened = false;
+        try {
+            basalt::GgufFile g(path.string());
+            opened = g.tensors().empty() && g.data_start() == g.file_size() && g.file_size() == 24;
+        } catch (const std::exception&) {}
+        std::filesystem::remove(path);
+        check(opened, "metadata-only file without alignment padding opens with an empty payload");
+    }
+    {
+        const auto path = write_gguf({"x"}, false);
+        bool refused = false;
+        try { basalt::GgufFile g(path.string()); } catch (const std::exception&) { refused = true; }
+        std::filesystem::remove(path);
+        check(refused, "nonempty file without its data section remains refused");
+    }
     {
         const auto path = write_gguf({"blk.0.attn_q.weight", "blk.0.attn_k.weight"});
         std::string err;

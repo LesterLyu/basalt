@@ -1,4 +1,4 @@
-// include/basalt/kernels/iq_kernels.hpp - the i-quant formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+// include/basalt/kernels/iq_kernels.hpp - the i-quant formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
 // IQ4_NL) and Q2_0 on the GPU for the IQ2_XS / IQ3_XXS model files, and Q4_K / Q5_K / Q5_1 / Q8_0 for Unsloth's
 // UD-Q4_K_XL (gate/up Q4_K or Q5_K, down Q5_1 or Q8_0, a Q8_0 embedding).
 //
@@ -24,6 +24,8 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
+// Diagnostic CPU-format dot: native IQ1_S weights and one Q8_K activation row.
+void iq1s_q8k_rows(const void* w,const void* x_q8_k,float* y,int n_in,int n_out,bool fused,void* stream);
 
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.  `scale` (device, NVFP4 only): the
 /// matrix's FP32 scale, applied in fp32 before the fp16 rounding.
@@ -47,8 +49,12 @@ struct NativeExpertLayout {
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob (NVFP4: with its 16-byte FP32 scale tail)
+    float swiglu_limit = 0.f;
 };
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
+                                        float swiglu_limit = 0.f);
+/// Clamps gate above the limit and up to [-limit, limit] before SwiGLU; zero disables clamping.
+void native_swiglu_f32(const float* gate, const float* up, float* out, int64_t n, float limit, void* stream);
 /// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;

@@ -224,6 +224,59 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
     return d * sumi;
 }
 
+__device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq1_s* b = (const block_iq1_s*) vbq + kbx;
+    const uint16_t h = b->qh[iqs];
+    int dot = 0, sum = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int grid = iq1s_grid_gpu[b->qs[4 * iqs + j] | (((h >> (3 * j)) & 7) << 8)];
+        const int u0 = get_int_b4(bq8_1[iqs].qs, 2 * j);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, 2 * j + 1);
+        dot = ggml_cuda_dp4a(grid & 0x0f0f0f0f, u0, dot);
+        dot = ggml_cuda_dp4a((grid >> 4) & 0x0f0f0f0f, u1, dot);
+        sum = ggml_cuda_dp4a(u0, 0x01010101, sum);
+        sum = ggml_cuda_dp4a(u1, 0x01010101, sum);
+    }
+    const float delta = h & 0x8000 ? -1.f - IQ1S_DELTA : -1.f + IQ1S_DELTA;
+    const float d = __half2float(b->d) * __low2float(bq8_1[iqs].ds);
+    return d * ((dot + delta * sum) * (2 * ((h >> 12) & 7) + 1));
+}
+// Match the CPU dot: integer accumulation within each 256-value block,
+// followed by the original serial FP32 accumulation across blocks.
+template<bool fused>
+__global__ void iq1s_q8k_kernel(const block_iq1_s* w,const block_q8_K* x,float* y,int blocks,int rows) {
+    const int row=blockIdx.x*(blockDim.x/8)+threadIdx.x/8,part=threadIdx.x&7;
+    const unsigned mask=0xffu<<((threadIdx.x&31)&~7);
+    if(row>=rows)return;
+    const auto* weights=w+size_t(row)*blocks;
+    float total=0.f;
+    for(int b=0;b<blocks;++b) {
+        const float d=x[b].d;
+        if(d==0.f)continue;
+        const uint16_t h=weights[b].qh[part];
+        int dot=0;
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            const int grid=iq1s_grid_gpu[weights[b].qs[4*part+j]|(((h>>(3*j))&7)<<8)];
+            dot=ggml_cuda_dp4a(grid&0x0f0f0f0f,get_int_b4(x[b].qs,8*part+2*j),dot);
+            dot=ggml_cuda_dp4a((grid>>4)&0x0f0f0f0f,get_int_b4(x[b].qs,8*part+2*j+1),dot);
+        }
+        const int sum=int(x[b].bsums[2*part])+x[b].bsums[2*part+1];
+        const int scale=2*((h>>12)&7)+1;
+        int block=scale*(8*(dot-sum)+(h&0x8000?-sum:sum));
+        #pragma unroll
+        for(int delta=4;delta;delta>>=1)block+=__shfl_xor_sync(mask,block,delta,8);
+        if(!part) {
+            const float factor=__fmul_rn(__fmul_rn(__half2float(weights[b].d),d),IQ1S_DELTA);
+            if constexpr(fused)total=__fmaf_rn(factor,float(block),total);
+            else total=__fadd_rn(total,__fmul_rn(factor,float(block)));
+        }
+    }
+    if(!part)y[row]=total;
+}
+
 __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                     const int& kbx, const int& iqs) {
     const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
@@ -482,6 +535,23 @@ __device__ __forceinline__ float nvfp4_scale_dev(uint32_t x) {
     if (e == 0) return (float) m * (1.0f / 1024.0f);
     return __uint_as_float(((e + 119) << 23) | (m << 20));
 }
+__device__ __forceinline__ float mxfp4_scale_dev(uint32_t e) {
+    return __uint_as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23);
+}
+// The scale byte makes successive MXFP4 blocks unaligned; load codes as bytes.
+__device__ __forceinline__ int mxfp4_codes(const block_mxfp4* b, int part) {
+    const uint8_t* q = b->qs + 4 * part;
+    return (int) ((uint32_t) q[0] | ((uint32_t) q[1] << 8) | ((uint32_t) q[2] << 16) | ((uint32_t) q[3] << 24));
+}
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ y,
+                                                 const int& kbx, const int& iqs) {
+    const block_mxfp4* b = (const block_mxfp4*) vbq + kbx;
+    const int2 v = get_int_from_table_16(mxfp4_codes(b, iqs), kvalues_fp4);
+    const int dot = ggml_cuda_dp4a(v.y, get_int_b4(y->qs, iqs + 4),
+                                 ggml_cuda_dp4a(v.x, get_int_b4(y->qs, iqs), 0));
+    return __low2float(y->ds) * mxfp4_scale_dev(b->e) * (float) dot;
+}
+
 // NVFP4: one call per 16-value sub-block (iqs 0..3).  Sub-block s meets q8_1 block s/2, half s&1; its byte j holds
 // value j (low nibble) and value j + 8 (high nibble), so the low nibbles of a word meet activation word w and the
 // high ones word w + 2.  Integer sum per sub-block, scaled by d8 * d4 in float (the per-expert FP32 scale is applied
@@ -534,6 +604,8 @@ template<> struct Fmt<17> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_xs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<18> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_xxs_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<19> { static constexpr int qk = 256, ipb = 8, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<20> { static constexpr int qk = 32, ipb = 2, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<21> { static constexpr int qk = 256, ipb = 8, step = 2;
@@ -558,6 +630,8 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0,
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<39> { static constexpr int qk = 32, ipb = 4, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 4, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -583,9 +657,9 @@ __device__ __forceinline__ void tail_scale(float (&s)[NC], float sc) {
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
-#define GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(8) X(40)
-#define D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8) X(40)
-#define MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(40)
+#define GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(8) X(39) X(40)
+#define D_FMTS(X) X(16) X(19) X(20) X(23) X(42) X(7) X(6) X(8) X(39) X(40)
+#define MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(8) X(39) X(40)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -804,6 +878,38 @@ template<> struct Split<21> {   // IQ3_S
         return d * sumi;
     }
 };
+template<> inline constexpr bool kSplit<19> = true;
+template<> struct Split<19> {
+    struct W { int g[8]; int sc; float dw, delta; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_iq1_s* b = (const block_iq1_s*) vbq + kbx;
+        const uint16_t h = b->qh[iqs];
+        W r;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int grid = iq1s_grid_gpu[b->qs[4 * iqs + j] | (((h >> (3 * j)) & 7) << 8)];
+            r.g[2 * j] = grid & 0x0f0f0f0f;
+            r.g[2 * j + 1] = (grid >> 4) & 0x0f0f0f0f;
+        }
+        r.sc = 2 * ((h >> 12) & 7) + 1;
+        r.dw = __half2float(b->d);
+        r.delta = h & 0x8000 ? -1.f - IQ1S_DELTA : -1.f + IQ1S_DELTA;
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int dot = 0, sum = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int u = get_int_b4(bq8_1[iqs].qs, j);
+            dot = ggml_cuda_dp4a(r.g[j], u, dot);
+            sum = ggml_cuda_dp4a(u, 0x01010101, sum);
+        }
+        const float d = r.dw * __low2float(bq8_1[iqs].ds);
+        return d * ((dot + r.delta * sum) * r.sc);
+    }
+};
+
 template<> inline constexpr bool kSplit<29> = true;
 template<> struct Split<29> {   // IQ1_M
     struct W { int g[8]; float delta[4]; int sc0, sc1; float dw; };
@@ -1091,6 +1197,21 @@ template<> struct Split<8> {   // Q8_0
         for (int i = 0; i < VDR_Q8_0; ++i) sumi = ggml_cuda_dp4a(r.q[i], get_int_b4(bq8_1->qs, iqs + i), sumi);
         const float d8_1 = __low2float(bq8_1->ds);
         return r.d * d8_1 * ((float) sumi);
+    }
+};
+
+template<> inline constexpr bool kSplit<39> = true;
+template<> struct Split<39> {
+    struct W { int2 v; float d; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_mxfp4* b = (const block_mxfp4*) vbq + kbx;
+        return {get_int_from_table_16(mxfp4_codes(b, iqs), kvalues_fp4), mxfp4_scale_dev(b->e)};
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ y, int iqs) {
+        const int dot = ggml_cuda_dp4a(r.v.y, get_int_b4(y->qs, iqs + 4),
+                                     ggml_cuda_dp4a(r.v.x, get_int_b4(y->qs, iqs), 0));
+        return __low2float(y->ds) * r.d * (float) dot;
     }
 };
 
@@ -1878,12 +1999,19 @@ __global__ void __launch_bounds__(256, 2) mmvq_iq3s_mma_kernel(const uint8_t* __
 #endif
 }
 
+__device__ __forceinline__ float native_swiglu(float g, float u, float limit) {
+    if (limit > 0.f) {
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+    }
+    return __fmul_rn(g / (1.0f + __expf(-g)), u);
+}
+
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, float limit = 0.f) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    h[i] = native_swiglu(gate[i], up[i], limit);
 }
 
 template<int TD>
@@ -2162,12 +2290,11 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
-                                                                  block_q8_1* __restrict__ hq) {
+                                                                  block_q8_1* __restrict__ hq, float limit = 0.f) {
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
-        const float g = gate[i];
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = native_swiglu(gate[i], up[i], limit);
         q8_1_store(h, hq, i);
     }
 }
@@ -2243,6 +2370,33 @@ __device__ void dq_iq3_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 4] = cvt<dst_t>(d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f));
     }
 }
+template<typename dst_t>
+__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const int ib = tid % 8, part = tid / 8;
+    const block_mxfp4* b = (const block_mxfp4*) vx + ibs * 8 + ib;
+    const float d = mxfp4_scale_dev(b->e);
+    for (int j = 0; j < 4; ++j) {
+        const uint8_t q = b->qs[4 * part + j];
+        yy[32 * ib + 4 * part + j] = cvt<dst_t>(kvalues_fp4[q & 15] * d);
+        yy[32 * ib + 4 * part + j + 16] = cvt<dst_t>(kvalues_fp4[q >> 4] * d);
+    }
+}
+
+template<typename dst_t>
+__device__ void dq_iq1_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_iq1_s* b = (const block_iq1_s*) vx + ibs;
+    const int ib = tid % 8, il = tid / 8;
+    const uint16_t h = b->qh[ib];
+    const float d = __half2float(b->d) * (2 * ((h >> 12) & 7) + 1);
+    const float delta = h & 0x8000 ? -1.f - IQ1S_DELTA : -1.f + IQ1S_DELTA;
+    const uint32_t grid = iq1s_grid_gpu[b->qs[4 * ib + il] | (((h >> (3 * il)) & 7) << 8)];
+    dst_t* y = yy + 32 * ib + 8 * il;
+    for (int j = 0; j < 4; ++j) {
+        y[j] = cvt<dst_t>(d * (((grid >> (8 * j)) & 15) + delta));
+        y[j + 4] = cvt<dst_t>(d * (((grid >> (8 * j + 4)) & 15) + delta));
+    }
+}
+
 template<typename dst_t>
 __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_iq1_m* x = (const block_iq1_m*) vx;
@@ -2461,6 +2615,8 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 20: dq_iq4_nl(vx, ibs, y, tid); break;
         case 21: dq_iq3_s(vx, ibs, y, tid); break;
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
+        case 19: dq_iq1_s(vx, ibs, y, tid); break;
+        case 39: dq_mxfp4(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
@@ -2495,8 +2651,8 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8 || t == 40;
+    return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8 || t == 39 || t == 40;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -2698,6 +2854,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 20: return (size_t) (n / 32) * sizeof(block_iq4_nl);
         case 21: return (size_t) (n / 256) * sizeof(block_iq3_s);
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);
+        case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
@@ -2708,6 +2865,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 39: return (size_t) (n / 32) * sizeof(block_mxfp4);
         case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
@@ -2721,6 +2879,14 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     check("quantize_q8_1_rows");
 }
 
+void iq1s_q8k_rows(const void* w,const void* x,float* y,int n_in,int n_out,bool fused,void* stream) {
+    if(n_in<256 || n_in%256 || n_out<=0)return;
+    const auto s=static_cast<cudaStream_t>(stream);
+    const int blocks=n_in/256,grid=(n_out+31)/32;
+    if(fused)iq1s_q8k_kernel<true><<<grid,256,0,s>>>((const block_iq1_s*)w,(const block_q8_K*)x,y,blocks,n_out);
+    else iq1s_q8k_kernel<false><<<grid,256,0,s>>>((const block_iq1_s*)w,(const block_q8_K*)x,y,blocks,n_out);
+    check("iq1s_q8k_rows");
+}
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     const size_t rb = iq_row_bytes(t, n_in);
     cudaStream_t s = (cudaStream_t) stream;
@@ -2785,18 +2951,25 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit) {
     NativeExpertLayout L;
     L.gu_type = gu_type;
     L.d_type = d_type;
     L.n_embd = n_embd;
     L.n_ff = n_ff;
+    L.swiglu_limit = swiglu_limit;
     L.gu_row = iq_row_bytes(gu_type, n_embd);
     L.d_row = iq_row_bytes(d_type, n_ff);
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = 2 * L.up_off;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row + (gu_type == 40 ? kNvfp4Tail : 0);   // NVFP4's scale tail
     return L;
+}
+
+void native_swiglu_f32(const float* gate, const float* up, float* out, int64_t n, float limit, void* stream) {
+    if (n <= 0) return;
+    swiglu_entries_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(gate, up, out, n, limit);
+    check("native_swiglu_f32");
 }
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
@@ -2850,14 +3023,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const long long nh = (long long) cap_entries * L.n_ff;
     const bool sw_v1 = v1;
     if (sw_v1) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else if (chain) {
         launch_dependent(swiglu_q8_1_entries_pdl_kernel, dim3((unsigned) ((nh + 255) / 256)), s, (const float*) gate,
-                         (const float*) up, grp_start, n_groups, (int) L.n_ff, hq);
+                         (const float*) up, grp_start, n_groups, (int) L.n_ff, hq, L.swiglu_limit);
     } else {
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq);
+                                                                                (int) L.n_ff, hq, L.swiglu_limit);
     }
     check("native_expert_grouped/swiglu");
     }

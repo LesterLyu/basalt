@@ -26,7 +26,9 @@ def load_reference(tdir: pathlib.Path):
         tokens[i] = k
     merges = (tdir / "merges.txt").read_text(encoding="utf-8").split("\n")
     types = json.loads((tdir / "token_type.json").read_text())
-    return ST.Tokenizer(tokens, merges, types)
+    cfg = tdir / "tokenizer.json"
+    pre = json.loads(cfg.read_text(encoding="utf-8")).get("pre", "qwen35") if cfg.exists() else "qwen35"
+    return ST.Tokenizer(tokens, merges, types, pre)
 
 
 def corpus(tk, big):
@@ -102,7 +104,7 @@ def main():
                 f.write(raw + b"\n")
                 f.write((spans + "\n").encode())
                 f.write((",".join(map(str, ids)) + "\n").encode())
-        r = subprocess.run([exe, str(tdir), str(g)])
+        r = subprocess.run([exe, str(tdir), str(g), tk.pre])
     print("%d cases" % len(cases))
     return r.returncode
 

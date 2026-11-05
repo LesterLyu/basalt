@@ -344,8 +344,55 @@ static void test_control_escapes() {
     CHECK(!Grammar::parse("root ::= \"" + std::string(1, '\0') + "\"", err) && err.find("NUL") != std::string::npos);
 }
 
+static void test_deepseek_request() {
+    std::string err;
+    const std::string tools=R"("tools":[{"name":"ns.echo","parameters":{"type":"object",
+      "properties":{"mode":{"enum":["safe"]},"n":{"type":"integer","minimum":2,"maximum":7},
+      "raw":{"type":"string"}},"required":["mode","n"],"additionalProperties":false}},
+      {"name":"ping","parameters":{"type":"object","additionalProperties":false}}])";
+    const auto make=[&](const std::string& options) {
+        err.clear();
+        auto r=grammar_from_request("{\"kind\":\"tools\","+options+","+tools+"}",err,true);
+        if(!err.empty())std::printf("%s\n",err.c_str());
+        CHECK(r.grammar && err.empty());
+        return r;
+    };
+    const std::string open="<｜DSML｜ calls>\n",close="</｜DSML｜ calls>";
+    const std::string invoke="<｜DSML｜ invoke name=\"ns.echo\">\n",end="</｜DSML｜ invoke>\n";
+    const std::string n="<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n";
+    const std::string mode="<｜DSML｜ parameter name=\"mode\" string=\"true\">safe</｜DSML｜ parameter>\n";
+    const std::string raw="<｜DSML｜ parameter name=\"raw\" string=\"true\">/tmp//a 路径 /｜DSM</｜DSML｜ parameter>\n";
+    const std::string ping="<｜DSML｜ invoke name=\"ping\">\n"+end;
+    auto a=make(R"("tool_choice":"auto")");
+    if(!a.grammar)return;
+    GrammarState lazy(a.grammar,a.triggers);
+    CHECK(lazy.accept("I'll call it.\n<｜DS") && lazy.accept("ML｜ calls>\n"));
+    CHECK(!lazy.allows("<｜DSML｜ invoke name=\"unknown\""));
+    CHECK(lazy.accept(invoke+mode+n+raw+end+ping+close) && lazy.accepting());
+    CHECK(!lazy.allows(open+ping+close));
+
+    auto b=make(R"("tool_choice":{"name":"ns.echo"},"parallel_tool_calls":false)");
+    if(!b.grammar)return;
+    CHECK(ok(b.grammar,open+invoke+n+mode+end+close));
+    CHECK(!ok(b.grammar,open+invoke+n+end+close));
+    CHECK(!ok(b.grammar,open+invoke+n+n+mode+end+close));
+    CHECK(!ok(b.grammar,open+invoke+n+mode+raw+raw+end+close));
+    CHECK(!ok(b.grammar,open+invoke+n+mode+end+invoke+n+mode+end+close));
+    CHECK(!pre(b.grammar,"ordinary prose"));
+    CHECK(!pre(b.grammar,open+ping));
+    CHECK(!pre(b.grammar,open+invoke+"<｜DSML｜ parameter name=\"n\" string=\"false\">9"));
+    CHECK(!pre(b.grammar,open+invoke+"<｜DSML｜ parameter name=\"mode\" string=\"true\">unsafe"));
+
+    auto mixed=make(R"("tool_choice":"auto","final_schema":{"type":"object","properties":{"ok":{"const":true}},"required":["ok"],"additionalProperties":false})");
+    if(!mixed.grammar)return;
+    CHECK(ok(mixed.grammar,"\n{\"ok\":true}"));
+    CHECK(ok(mixed.grammar,open+ping+close));
+    CHECK(!pre(mixed.grammar,"{\"ok\":false"));
+}
+
 int main() {
     test_request();
+    test_deepseek_request();
     test_scalars();
     test_enum_const();
     test_object();

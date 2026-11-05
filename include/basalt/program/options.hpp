@@ -12,6 +12,7 @@ namespace basalt::program {
 
 struct Options {
     std::string model;                ///< --model: the .basalt file every loader reads from
+    std::string dspark_model;         ///< --dspark-model: optional separate DeepSeek draft
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
     int64_t max_context = 4096;

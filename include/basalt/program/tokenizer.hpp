@@ -23,7 +23,8 @@ public:
 
     /// `vocab_json` is {"token text": id}, `merges_txt` one "left right" pair per line, best rank first, `types_json`
     /// one type per id (3 control, 4 user-defined). False with `err` on a malformed table.
-    bool load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json, std::string& err);
+    bool load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json, std::string& err,
+              std::string_view pre = "qwen35");
     bool loaded() const { return !raw_.empty(); }
     size_t vocab_size() const { return raw_.size(); }
 
@@ -65,6 +66,7 @@ private:
     void memo_grow();
     static void build_literals(LiteralSet& set, const std::vector<Literal>& all);
 
+    bool joyai_ = false;
     std::vector<std::string> raw_;          // token id -> bytes
     int32_t byte_id_[256];                  // byte -> its single-byte token, or -1
     std::vector<Merge> merges_;             // open addressing, power-of-two size

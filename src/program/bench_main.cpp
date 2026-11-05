@@ -909,7 +909,8 @@ int main(int argc, char** argv) {
                 const Nvml::Snap s = nvml.snap(0);
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
-                r.checksum_bad = r.name == "struct" && r.d.generated != kStructTokens;
+                const bool qwen_count=!eng.info.count("architecture") || eng.info.at("architecture")=="qwen4exp";
+                r.checksum_bad = qwen_count && r.name == "struct" && r.d.generated != kStructTokens;
                 ++n_requests;
                 ++n_decode_requests;
                 basalt::log::raw("  run %d %-7s %.1f tok/s, %lld tokens\n", run, r.name.c_str(), tok_s(r.d), r.d.generated);
@@ -922,7 +923,8 @@ int main(int argc, char** argv) {
                 const auto& post = prefill_parts[2];
                 const size_t n_body = std::max<size_t>(1, (size_t) std::llround((double) body.size() * (double) depth / (double) kPrefillBase));
                 std::vector<int64_t> ids(pre);
-                std::uniform_int_distribution<int64_t> nonce(1000, 150000);
+                const int64_t vocab=eng.info.count("logit_bias")?std::atoll(eng.info.at("logit_bias").c_str()):150001;
+                std::uniform_int_distribution<int64_t> nonce(1000, std::max<int64_t>(1000,std::min<int64_t>(150000,vocab-1)));
                 for (int k = 0; k < 4; ++k) ids.push_back(nonce(rng));
                 ids.reserve(ids.size() + n_body + post.size());
                 for (size_t k = 0; k < n_body; ++k) ids.push_back(body[k % body.size()]);

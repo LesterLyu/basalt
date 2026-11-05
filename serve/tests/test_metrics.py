@@ -120,14 +120,14 @@ class Http(unittest.TestCase):
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
         self.assertEqual(set(m["live"]), {"state", "load", "queued", "slots", "queue", "prompt_tokens", "generated", "elapsed_s",
-                                          "tok_s", "prefill_tok_s_mean"})
+                                          "tok_s", "prefill_tok_s_mean", "phases", "drafts_accepted", "drafts_offered", "expert_routes"})
         self.assertEqual(m["live"]["queue"], [])
         self.assertEqual((m["live"]["state"], m["live"]["queued"]), ("idle", 0))
         self.assertEqual(m["requests"], [])
-        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
+        self.assertEqual(set(m["hardware"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb", "ram_breakdown"})
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus", "cpu", "ram_used"})
 
     def test_requests_have_an_id_and_the_path(self):
         paths = ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/chat/completions"]
@@ -151,6 +151,43 @@ class Http(unittest.TestCase):
         rows = self.call("/metrics")[1]["requests"]
         self.assertEqual(len(rows), 12)
         self.assertEqual(rows[0]["id"], f"r_{REQUESTS_SHOWN + 3:04d}")
+
+    def test_deepseek_decode_metrics_reach_slots_logs_and_history(self):
+        from serve.engine import modelfile  # exposes the packaged tokenizer on sys.path
+        from serve.deepseek import DeepSeekEngine
+
+        parser = DeepSeekEngine.__new__(DeepSeekEngine)
+        parser._parse_done("DONE 15 250 40 300 stop 2 4 3 experts=72,18,10")
+        routes = {"primary": 72, "helper": 18, "ram": 10}
+        self.engine.decode_progress = lambda: {"drafts_accepted": 2, "drafts_offered": 4, "expert_routes": routes}
+        generate = self.engine.generate
+        active = []
+
+        def measured(*args, **kwargs):
+            source = generate(*args, **kwargs)
+            try:
+                for i, token in enumerate(source):
+                    if i == 2:
+                        active.extend(self.svc.slot_table()[0])
+                        live = self.svc.metrics()["live"]
+                        self.assertEqual(live["expert_routes"], routes)
+                        self.assertEqual(live["drafts_offered"], 4)
+                        self.assertIn("thinking", live["phases"])
+                        self.assertIn("acc=50% hit=90.0% · thinking", self.svc.live_line(time.time()))
+                    yield token
+            finally:
+                source.close()
+                self.engine.last = parser.last
+
+        self.engine.generate = measured
+        self.ask("/v1/chat/completions")
+        self.assertEqual(active[0]["expert_routes"], routes)
+        self.assertEqual(active[0]["phase"], "thinking")
+        self.assertEqual((active[0]["drafts_accepted"], active[0]["drafts_offered"]), (2, 4))
+        last = self.call("/metrics")[1]["requests"][0]
+        self.assertEqual(last["expert_routes"], routes)
+        self.assertEqual(last["hit_rate"], 0.9)
+        self.assertIsNone(last["pcie_share"])
 
     def test_best_keeps_the_fastest_big_enough_request(self):
         rows = [{"id": "r_0001", "time": 1.0, "output_tokens": 300, "decode_tok_s": 100.0, "prompt_tokens": 9000,
@@ -251,6 +288,63 @@ class FakeGpu:
 
 
 class PerGpu(unittest.TestCase):
+    def test_host_allocations_are_separate_from_working_sets(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok")
+        allocations = {"resident_experts": 80, "pinned_experts": 40, "expert_homes": 12}
+        engine.ram_usage = lambda: allocations
+        svc = Service(engine, tok, ChatTemplate(TEMPLATE))
+        svc.telemetry = mock.Mock()
+        svc.telemetry.snapshot.return_value = {
+            "now": {"gpus": [], "ram_used": 100, "ram_total": 128}, "history": {}, "static": {},
+            "ram_processes": {"engine": {"rss": 77, "private_commit": 110}}}
+        hw = svc.metrics()["hardware"]
+        self.assertEqual(hw["ram_used"], 100)
+        self.assertEqual(hw["ram_breakdown"], {
+            "engine_allocations": allocations, "processes": {"engine": {"rss": 77, "private_commit": 110}}})
+
+    def test_breakdown_uses_physical_cards_and_waits_for_vision_sample(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=16384)
+        engine.vram_usage = lambda: {0: {"experts": 70}, 1: {"expert_helper": 30, "dspark": 20}}
+        vision = mock.Mock()
+        vision.vram_usage.return_value = (0, 10, 3.0)
+        svc = Service(engine, tok, ChatTemplate(TEMPLATE), vision=vision)
+        svc.engine_gpu_indices = [1, 0]
+        readings = [{"index": 0, "mem_used": 100, "mem_reserved": 10}, {"index": 1, "mem_used": 110}]
+        snap = {"now": {"gpus": readings}, "static": {}, "history": {}, "gpu_sample_started": 2.0}
+        svc.telemetry = mock.Mock()
+        svc.telemetry.snapshot.return_value = snap
+        gpu0, gpu1 = [g["vram_breakdown"] for g in svc.metrics()["hardware"]["gpus"]]
+        self.assertEqual(gpu0["components"], {"expert_helper": 30, "dspark": 20, "vision": 10, "system_reserved": 10})
+        self.assertIsNone(gpu0["unattributed"])
+        self.assertEqual(gpu1, {"components": {"experts": 70}, "unattributed": 40})
+        snap["gpu_sample_started"] = 4.0
+        self.assertEqual(svc.metrics()["hardware"]["gpus"][0]["vram_breakdown"]["unattributed"], 30)
+        self.assertNotIn("vram_breakdown", readings[0])
+
+    def test_other_apps_partitions_only_reconciled_vram(self):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, "ok", max_context=16384)
+        engine.vram_usage = lambda: {0: {"mmq_buffers": 30, "dense_prefill": 20}, 1: {"expert_helper": 80}}
+        svc = Service(engine, tok, ChatTemplate(TEMPLATE))
+        svc.engine_gpu_indices = [0, 1]
+        svc.telemetry = mock.Mock()
+        svc.telemetry.snapshot.return_value = {
+            "now": {"gpus": [{"index": 0, "mem_used": 100, "mem_reserved": 10},
+                             {"index": 1, "mem_used": 100}]}, "history": {}, "static": {},
+            "gpu_other_apps": {0: 15, 1: 30}}
+        gpu0, gpu1 = [g["vram_breakdown"] for g in svc.metrics()["hardware"]["gpus"]]
+        self.assertEqual(gpu0["components"], {"mmq_buffers": 30, "dense_prefill": 20,
+                                              "system_reserved": 10, "other_apps": 15})
+        self.assertEqual(gpu0["unattributed"], 25)
+        self.assertEqual(gpu1, {"components": {"expert_helper": 80, "other_apps": 20}, "unattributed": 0})
+
+        engine.vram_usage = lambda: {}
+        gpu0 = svc.metrics()["hardware"]["gpus"][0]["vram_breakdown"]
+        self.assertEqual(gpu0, {"components": {"system_reserved": 10},
+                                "unattributed": None, "pending_engine": True})
+
     def telemetry(self, indices, factories=None):
         factories = factories or {}
         return Telemetry(gpu_indices=indices, gpu_factory=lambda i: factories.get(i) or FakeGpu(i))
@@ -276,7 +370,7 @@ class PerGpu(unittest.TestCase):
         self.assertEqual(snap["static"]["gpus"], [{"index": 0, "name": "Card 0"}, {"index": 1, "name": "Card 1"}])
         self.assertEqual((snap["static"]["driver"], snap["static"]["cuda"]), ("610.57.04", "13.3"))
         self.assertEqual(set(snap["static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus", "cpu", "ram_used"})
         self.assertEqual(set(snap["now"]), {"gpus", "cpu", "ram_used", "ram_total", "disk_read_mb"})
 
     def test_history_keeps_the_speeds_slots_and_cards(self):
@@ -286,7 +380,7 @@ class PerGpu(unittest.TestCase):
         for _ in range(70):
             tel.record(tel.sample())
         snap = tel.snapshot()
-        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+        self.assertEqual(set(snap["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus", "cpu", "ram_used"})
         self.assertEqual(len(snap["history"]["tok_s"]), 60)
         self.assertEqual(snap["history"]["tok_s"][-1], 12.35)
         self.assertEqual(snap["history"]["slot_tok_s"], [[1.23] * 60, [0.0] * 60])     # one series per slot

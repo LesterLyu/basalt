@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include "basalt/log.hpp"
 
 namespace basalt::prefill::mmq {
@@ -92,12 +93,13 @@ __global__ void q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __restrict
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
-                              bool interleaved, const float4* __restrict__ tail, const int32_t* __restrict__ bounds, int n) {
+                              bool interleaved, const float4* __restrict__ tail, const int32_t* __restrict__ bounds, int n, float limit) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i % n_ff;
     const float* row = gu + r * 2 * n_ff;
     float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
+    if(limit>0) {g=fminf(g,limit);u=fminf(fmaxf(u,-limit),limit);}
     if (tail == nullptr) {
         h[i] = g / (1.0f + __expf(-g)) * u;
         return;
@@ -125,6 +127,7 @@ bool built() { return true; }
 bool supported(int t) {
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
@@ -177,13 +180,27 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
 }
+void quantize_swiglu(const float* x,void* xq,int t,int64_t cols,int64_t rows,float limit,void* stream) {
+    if(rows<=0)return;
+    if(!(limit>0))throw std::invalid_argument("positive clamped SwiGLU limit required");
+    const int64_t ld=2*cols;
+    quantize_mmq_q8_1_cuda(x,nullptr,xq,(ggml_type)t,cols,ld,rows*ld,rows*ld,pad512(cols),rows,1,1,
+                          (cudaStream_t)stream,limit);
+    ck(cudaGetLastError(),"quantize_swiglu");
+}
 
 Context::Context() {
     int dev = 0;
     cudaGetDevice(&dev);
-    ctx_ = new ggml_backend_cuda_context(dev);
+    auto ctx = std::make_unique<ggml_backend_cuda_context>(dev);
+    ctx->pool(dev); // construct the pool, but allocate no device memory until a product needs it
+    ctx_ = ctx.release();
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
+size_t Context::reserved_bytes() const {
+    const auto& ctx = *static_cast<const ggml_backend_cuda_context*>(ctx_);
+    return ctx.pools[ctx.device]->reserved_bytes();
+}
 
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
@@ -195,11 +212,12 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, opt};
+                        p.max_rows, opt, p.stream_k_sms};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
         case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
+        case GGML_TYPE_IQ1_S: mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
         case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
@@ -270,11 +288,11 @@ void gather_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
 }
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream, const float* tail,
-            const int32_t* bounds, int n) {
+            const int32_t* bounds, int n, float limit) {
     if (rows <= 0) return;
     if (bounds == nullptr || n <= 0) tail = nullptr;
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved,
-                                                                           (const float4*) tail, bounds, n);
+                                                                           (const float4*) tail, bounds, n, limit);
     ck(cudaGetLastError(), "swiglu");
 }
 

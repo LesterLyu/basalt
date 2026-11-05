@@ -156,10 +156,16 @@ void act_quant_any(const float* x, int n, ActQ& a) {
 }
 
 
-bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_parse_text(const std::string& text, int64_t n_layers, int64_t n_expert, ExpertLayout& out,
+                             std::string& err, ExpertGeometry geometry) {
+    if (n_layers <= 0 || n_expert <= 0 || geometry.n_embd <= 0 || geometry.n_ff <= 0) {
+        err = "expert layout: dimensions must be positive";
+        return false;
+    }
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
+    L.n_embd = geometry.n_embd;
     if (text.empty()) {
         err = "the expert layout is empty";
         return false;
@@ -201,7 +207,8 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, geometry.n_embd, geometry.n_ff, f, err, geometry.buffers)) return false;
+        f.swiglu_limit = geometry.swiglu_limit;
         if (f.bytes != blob) {
             err = "expert layout: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -221,8 +228,13 @@ bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t 
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
-    g_layout = L;
+    out = std::move(L);
     return true;
+}
+
+bool expert_layout_load_text(const std::string& text, int64_t n_layers, int64_t n_expert, std::string& err,
+                            ExpertGeometry geometry) {
+    return expert_layout_parse_text(text, n_layers, n_expert, g_layout, err, geometry);
 }
 
 }  // namespace basalt::kernels::cpu

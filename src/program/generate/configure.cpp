@@ -1,5 +1,6 @@
 #include "context.hpp"
 #include "run.hpp"
+#include "deepseek.hpp"
 
 namespace basalt::program::generate {
 
@@ -21,6 +22,13 @@ int run(int argc, char** argv) {
         if (!model_file.open(o.model, merr) || !model_file.load_meta(merr) || !model_file.register_gguf_view(merr)) {
             return fatal_start_error("--model: " + merr);
         }
+        const auto* kv=model_file.meta().get("gguf_kv");
+        const auto* arch=kv?kv->get("general.architecture"):nullptr;
+        if(arch && arch->is_string() && arch->s=="deepseek41") {
+            if(!ppl_base.empty() || !ppl_out.empty())return fatal_start_error("DeepSeek quality harness is not connected");
+            return run_deepseek(o);
+        }
+        if(!o.dspark_model.empty())return fatal_start_error("--dspark-model requires a DeepSeek target");
         basalt::core::model_sources(model_file, srcs);
         if (srcs.dense.empty() || srcs.dense_index.empty() || srcs.experts.empty() || srcs.experts_layout.empty() ||
             srcs.hc8.empty()) {

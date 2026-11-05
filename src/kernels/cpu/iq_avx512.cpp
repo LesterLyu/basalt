@@ -207,6 +207,42 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
+template<int NT>
+void iq2_exact_rows(const uint8_t* weights,size_t stride,int n,const void* const* act,float* const* out,int r0,int r1) {
+    const block_q8_K* x[NT];
+    for(int t=0;t<NT;++t)x[t]=static_cast<const block_q8_K*>(act[t]);
+    const auto zero=_mm512_setzero_si512();
+    for(int row=r0;row<r1;++row) {
+        __m256 accum[NT];
+        for(int t=0;t<NT;++t)accum[t]=_mm256_setzero_ps();
+        const auto* weights_row=weights+size_t(row)*stride;
+        for(int b=0;b<n/QK_K;++b) {
+            const auto* blk=weights_row+size_t(b)*Fmt<16>::bytes;
+            __m512i acci[NT];
+            for(int t=0;t<NT;++t)acci[t]=zero;
+            for(int j=0;j<4;++j) {
+                __m512i grid,scales;__mmask64 signs;
+                Fmt<16>::decode(blk,j,grid,signs,scales);
+                for(int t=0;t<NT;++t) {
+                    const auto q=_mm512_loadu_si512(x[t][b].qs+64*j);
+                    const auto signed_q=_mm512_mask_sub_epi8(q,signs,zero,q);
+                    acci[t]=_mm512_dpwssd_epi32(acci[t],_mm512_maddubs_epi16(grid,signed_q),scales);
+                }
+            }
+            const float d=h2f(u16(blk));
+            for(int t=0;t<NT;++t) {
+                const auto same_lanes=_mm256_add_epi32(_mm512_castsi512_si256(acci[t]),_mm512_extracti64x4_epi64(acci[t],1));
+                accum[t]=_mm256_fmadd_ps(_mm256_set1_ps(d*x[t][b].d),_mm256_cvtepi32_ps(same_lanes),accum[t]);
+            }
+        }
+        for(int t=0;t<NT;++t) {
+            auto s=_mm_add_ps(_mm256_extractf128_ps(accum[t],1),_mm256_castps256_ps128(accum[t]));
+            s=_mm_add_ps(s,_mm_movehl_ps(s,s));
+            s=_mm_add_ss(s,_mm_movehdup_ps(s));
+            out[t][row]=0.125f*_mm_cvtss_f32(s);
+        }
+    }
+}
 
 template <int TY>
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
@@ -301,6 +337,14 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
+    }
+}
+void iq2xxs512_rows_exact(const uint8_t* w,size_t stride,int n,const void* const* act,int nt,float* const* out,int r0,int r1) {
+    switch(nt) {
+#define IQ2_EXACT_WIDTH(N) case N: iq2_exact_rows<N>(w,stride,n,act,out,r0,r1);break;
+    IQ2_EXACT_WIDTH(1) IQ2_EXACT_WIDTH(2) IQ2_EXACT_WIDTH(3)
+    IQ2_EXACT_WIDTH(4) IQ2_EXACT_WIDTH(5) IQ2_EXACT_WIDTH(6)
+#undef IQ2_EXACT_WIDTH
     }
 }
 

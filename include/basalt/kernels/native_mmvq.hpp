@@ -131,4 +131,9 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 
+// Q5_K/Q6_K matrices shared across token rows; each row is contiguous by group.
+// Every group retains the single-column accumulation and output-lane order.
+void native_mmvq_grouped(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int groups, void* stream,int tokens=1);
+
 } // namespace basalt::kernels

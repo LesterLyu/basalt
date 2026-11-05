@@ -69,7 +69,9 @@ inline size_t pair_slot(uint64_t key, uint64_t mask) { return (size_t) (((key * 
 }  // namespace
 
 bool Tokenizer::load(std::string_view vocab_json, std::string_view merges_txt, std::string_view types_json,
-                     std::string& err) {
+                     std::string& err, std::string_view pre) {
+    if(pre!="qwen35" && pre!="joyai-llm") {err="unsupported pre-tokenizer";return false;}
+    joyai_=pre=="joyai-llm";
     raw_.clear();
     merges_.clear();
     memo_.clear();
@@ -299,7 +301,8 @@ void Tokenizer::memo_grow() {
 }
 
 bool Tokenizer::encode_plain(std::string_view text, std::vector<int32_t>& out, std::string& err) {
-    tokenizer::pretok_qwen35(text.data(), text.size(), ends_);
+    if(joyai_)tokenizer::pretok_joyai(text.data(),text.size(),ends_);
+    else tokenizer::pretok_qwen35(text.data(), text.size(), ends_);
     size_t begin = 0;
     for (const size_t end : ends_) {
         const char* p = text.data() + begin;

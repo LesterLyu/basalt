@@ -122,7 +122,8 @@ def vision_config(mf: ModelFile, engine_bin: str, sidecar: bool = True) -> dict:
 
 
 def model_config(path: str, engine_bin: str, vision: bool | str = False,
-                 engine_words: list[str] | None = None, vision_max_tokens: int | None = None) -> dict:
+                 engine_words: list[str] | None = None, vision_max_tokens: int | None = None,
+                 deepseek_mmproj: str | None = None) -> dict:
     """The engine settings the file implies; `engine_words` follow its arguments as given (the engine's parser lets a
     later flag win), `vision` (a GPU number as a string, or "cpu") adds the sidecar and "dynamic" the in-engine
     encoder (ValueError if it cannot be set up)."""
@@ -135,8 +136,21 @@ def model_config(path: str, engine_bin: str, vision: bool | str = False,
     args += words
     cdir.mkdir(parents=True, exist_ok=True)
     cfg = {"engine_bin": os.path.abspath(engine_bin), "args": args, "model_name": meta.get("name") or "basalt",
-           "sampling": sampling_defaults(meta), "log": str(cdir / "engine.log"),
+           "architecture": meta.get("architecture"), "sampling": sampling_defaults(meta), "log": str(cdir / "engine.log"),
            "tokenizer": str(extract_tokenizer(mf))}
+    if vision and cfg["architecture"] == "deepseek41":
+        if not str(vision).isdigit() or not deepseek_mmproj or not Path(deepseek_mmproj).is_file():
+            raise ValueError("DeepSeek vision needs --vision GPU and --deepseek-mmproj FILE")
+        exe = Path(engine_bin).with_name("basalt-deepseek-vision" + Path(engine_bin).suffix)
+        if not exe.is_file():
+            raise ValueError(f"DeepSeek vision sidecar missing: {exe}")
+        if vision_max_tokens is not None and not 8 <= vision_max_tokens <= 8192:
+            raise ValueError("DeepSeek vision-max-tokens must be between 8 and 8192")
+        cfg["vision"] = {"vision_bin": str(exe), "mmproj": os.path.abspath(deepseek_mmproj),
+                         "mode": vision, "gpu": True, "whole_image_tokens": vision_max_tokens}
+        exp = flag_value(args, "--exp")
+        args += ["--exp", (exp + "," if exp else "") + "ds-vision=1"]
+        return cfg
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:
         v["mode"] = vision

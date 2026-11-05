@@ -189,7 +189,7 @@ target_link_libraries(basalt-overlap PRIVATE core kernels ${_gpu_runtime_target}
 # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
 # kernels link `artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
-add_library(kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
+add_library(kernels STATIC src/kernels/cuda/deepseek41_ops.cu src/kernels/cuda/deepseek41_attention.cu src/kernels/cuda/deepseek41_execution.cu src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                         src/kernels/cuda/s_gemv.cu
                         src/kernels/cuda/router_top10.cu
                         src/kernels/cuda/quantize_act.cu
@@ -282,6 +282,9 @@ set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/nat
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
 # ---- engine -----------------------------------------------------
+add_library(deepseek41 STATIC src/deepseek41/packed_weights.cpp src/deepseek41/engram.cpp src/deepseek41/cpu_experts.cpp src/deepseek41/device_model.cpp src/deepseek41/trace.cpp
+    src/deepseek41/model.cpp src/deepseek41/model_kv.cpp src/deepseek41/model_batch.cpp src/deepseek41/model_batch_experts.cpp src/deepseek41/model_attention.cpp src/deepseek41/model_experts.cpp src/deepseek41/model_draft.cpp src/deepseek41/prefill_experts.cpp src/deepseek41/model_prefill.cpp src/deepseek41/prefill_index.cpp)
+target_link_libraries(deepseek41 PUBLIC engine kernels_cpu artifact kernels prefill ${CMAKE_DL_LIBS})
 # The COMPOSED layer lives here and not in `core`, because it calls kernels and `kernels`
 # already links `core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
 # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
@@ -346,6 +349,11 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME direct_upload_test COMMAND direct_upload_test)
   set_tests_properties(direct_upload_test PROPERTIES TIMEOUT 60)
   add_executable(peer_copy_test tests/core/peer_copy_test.cpp)
+  add_executable(peer_geometry_test tests/core/peer_geometry_test.cpp)
+  target_link_libraries(peer_geometry_test PRIVATE engine)
+  basalt_embed_manifest(peer_geometry_test)
+  basalt_gpu_test(NAME peer_geometry_test COMMAND peer_geometry_test)
+  set_tests_properties(peer_geometry_test PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
   target_link_libraries(peer_copy_test PRIVATE core)
   basalt_embed_manifest(peer_copy_test)
   basalt_gpu_test(NAME peer_copy_test COMMAND peer_copy_test)
@@ -376,6 +384,21 @@ if(BUILD_TESTING)
   basalt_cpu_test(NAME layout_check_test COMMAND layout_check_test)
   # the expert layout text: real models' layouts and the refusals
   add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
+  add_executable(deepseek41_weights_test tests/core/deepseek41_weights_test.cpp)
+  add_executable(deepseek41_packed_test tests/core/deepseek41_packed_test.cpp)
+  add_executable(deepseek41_cpu_test tests/core/deepseek41_cpu_test.cpp)
+  add_executable(deepseek41_model_test tests/core/deepseek41_model_test.cpp)
+  add_executable(deepseek41_slots_test tests/core/deepseek41_slots_test.cpp)
+  target_link_libraries(deepseek41_slots_test PRIVATE deepseek41)
+  add_executable(deepseek41_projection_test tests/core/deepseek41_projection_test.cpp)
+  target_link_libraries(deepseek41_projection_test PRIVATE deepseek41)
+  target_link_libraries(deepseek41_model_test PRIVATE deepseek41 spec)
+  target_link_libraries(deepseek41_cpu_test PRIVATE deepseek41)
+  basalt_cpu_test(NAME deepseek41_cpu_test COMMAND deepseek41_cpu_test)
+  target_link_libraries(deepseek41_packed_test PRIVATE deepseek41)
+  basalt_cpu_test(NAME deepseek41_packed_test COMMAND deepseek41_packed_test)
+  target_link_libraries(deepseek41_weights_test PRIVATE artifact)
+  basalt_cpu_test(NAME deepseek41_weights_test COMMAND deepseek41_weights_test)
   target_link_libraries(expert_layout_test PRIVATE engine)
   basalt_cpu_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
   set_tests_properties(expert_layout_test PROPERTIES TIMEOUT 60)
@@ -494,6 +517,8 @@ target_link_libraries(prefill PUBLIC engine ${_gpu_blas_target} ${_gpu_runtime_t
 add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/program/probe_rates.cpp
                        src/program/generate/helpers.cpp
                        src/program/generate/configure.cpp
+                       src/program/generate/deepseek.cpp
+                       src/program/generate/deepseek_session.cpp
                        src/program/generate/model.cpp
                        src/program/generate/layer_plan.cpp
                        src/program/generate/weights.cpp
@@ -542,7 +567,7 @@ add_executable(basalt src/program/generate.cpp src/program/engine_local.cpp src/
                        src/program/cli/report.cpp)
 set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
-target_link_libraries(basalt PRIVATE engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
+target_link_libraries(basalt PRIVATE deepseek41 engine engine_session grammar tokenizer prefill spec ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
 # `basalt serve` runs the Python server from the source tree; the engine reads its expert profiles from data/profiles
 target_compile_definitions(basalt PRIVATE BASALT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -1324,7 +1349,7 @@ if(BUILD_TESTING)
 endif()
 # MMQ (ggml-cuda) for the prompt path's experts: the kernel, one instance per format the packs use, and the
 # activation quantizer; mmq_host.cu holds its few host symbols
-set(_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k q6_k nvfp4)
+set(_mmq_types q2_0 iq1_s iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 q5_1 q4_k q5_k q6_k nvfp4)
 # the Q2_0 pack's prompt experts on the engine's own int8 kernels (moe_fused.cu)
 add_library(mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
             src/prefill/mmq/mmq_host.cu src/prefill/mmq/quantize.cu)
@@ -1340,6 +1365,11 @@ if(MSVC)
 endif()
 target_link_libraries(mmq PUBLIC ggml_quants ${_gpu_runtime_target})
 target_link_libraries(prefill PUBLIC mmq)
+if(BUILD_TESTING)
+  add_executable(prefill_mmq_iq1s_test tests/cuda/prefill_mmq_iq1s_test.cpp)
+  target_link_libraries(prefill_mmq_iq1s_test PRIVATE mmq kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME prefill_mmq_iq1s_test COMMAND prefill_mmq_iq1s_test)
+endif()
 # the FP4 block-scaled tensor-core experts (need the a-variant of the architecture)
 add_library(fp4 STATIC src/prefill/fp4/moe_fp4.cu)
 set_target_properties(fp4 PROPERTIES CUDA_ARCHITECTURES 120a-real)
@@ -1408,6 +1438,29 @@ if(BUILD_TESTING)
   set_tests_properties(prefill_fp4_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 add_executable(native_expert_parity tests/kernels/native_expert_parity.cpp)
+add_executable(iq1s_parity tests/kernels/iq1s_parity.cpp)
+add_executable(mxfp4_parity tests/kernels/mxfp4_parity.cpp)
+add_executable(native_swiglu_parity tests/kernels/native_swiglu_parity.cpp)
+add_executable(deepseek41_ops_test tests/kernels/deepseek41_ops_test.cpp)
+add_executable(deepseek41_attention_test tests/kernels/deepseek41_attention_test.cpp)
+target_include_directories(deepseek41_attention_test PRIVATE ${_gpu_include_directories})
+target_link_libraries(deepseek41_attention_test PRIVATE deepseek41 kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME deepseek41_attention_test COMMAND deepseek41_attention_test)
+target_include_directories(deepseek41_ops_test PRIVATE ${_gpu_include_directories})
+target_link_libraries(deepseek41_ops_test PRIVATE kernels artifact ${_gpu_runtime_target})
+basalt_gpu_test(NAME deepseek41_ops_test COMMAND deepseek41_ops_test)
+target_include_directories(native_swiglu_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(native_swiglu_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
+basalt_cpu_test(NAME native_swiglu_parity_cpu COMMAND native_swiglu_parity --cpu)
+basalt_gpu_test(NAME native_swiglu_parity COMMAND native_swiglu_parity)
+target_include_directories(mxfp4_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(mxfp4_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
+basalt_cpu_test(NAME mxfp4_parity_cpu COMMAND mxfp4_parity --cpu)
+basalt_gpu_test(NAME mxfp4_parity COMMAND mxfp4_parity)
+target_include_directories(iq1s_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(iq1s_parity PRIVATE kernels kernels_cpu ${_gpu_runtime_target})
+basalt_cpu_test(NAME iq1s_parity_cpu COMMAND iq1s_parity --cpu)
+basalt_gpu_test(NAME iq1s_parity COMMAND iq1s_parity)
 target_include_directories(native_expert_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(native_expert_parity PRIVATE kernels kernels_cpu artifact ${_gpu_runtime_target})
 add_executable(native_expert_bench tests/kernels/native_expert_bench.cpp)

@@ -26,7 +26,7 @@ from serve.api.responses import ResponsesError
 from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed, peer_of, remote_reason
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
-from serve.api.structured import StructuredOutputError, anthropic_format, check_format, prepare_tool_format
+from serve.api.structured import StructuredOutputError, anthropic_format, check_format, format_validator, prepare_tool_format
 from serve.util.text import stop_strings
 from serve.tool_output import ToolOutputError
 
@@ -267,6 +267,7 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 "numeric_reasoning": bool(getattr(svc.template, "numeric_effort", False)),
                                  "loaded": svc.loaded(), "loading": svc.loading, "service": "basalt"})
             elif path == "/status":
                 if not self._authorized():                  # it shows the last answer's tail
@@ -542,7 +543,7 @@ def make_handler(svc: Service):
                 self._json(404, responses_error_body(text, "invalid_request_error", "model", "model_not_found"))
 
         def _openai(self, req):
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, numeric_effort=getattr(svc.template, "numeric_effort", False))
             tools, force = forced_call(req.get("tool_choice"), tools)   # a bad choice is a 400 before streaming
             check_format(req.get("response_format"))
             svc.require_grammar(req.get("response_format"))
@@ -550,7 +551,8 @@ def make_handler(svc: Service):
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
             req[BIAS_KEY] = checked_bias(req, svc.engine)     # a bad logit_bias is a 400 before streaming
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               req.get("response_format"))
+                                               req.get("response_format"), parallel=req.get("parallel_tool_calls"))
+            force = svc.grammar_force(force, req[GRAMMAR_KEY])
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
@@ -600,7 +602,10 @@ def make_handler(svc: Service):
             def events():
                 yield from asm.start()
                 done = None
-                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+                patch_tools = {key for key, (ns, name, kind) in asm.names.items()
+                               if name == "apply_patch" and kind == "custom" and ns in (None, "functions")}
+                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                       patch_tools=patch_tools):
                     if kind == "ping":
                         yield None
                     elif kind == "event":
@@ -681,7 +686,7 @@ def make_handler(svc: Service):
                 tools, force = forced_call(req.get("tool_choice"), tools)
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
-            kw = responses_api.template_kwargs(req)
+            kw = responses_api.template_kwargs(req, numeric_effort=getattr(svc.template, "numeric_effort", False))
             validator = None
             try:
                 fmt = responses_api.text_format(req)
@@ -689,9 +694,16 @@ def make_handler(svc: Service):
                 svc.require_grammar(fmt)
                 if structured and tools:
                     messages, validator = prepare_tool_format(fmt, messages)
+                if structured and getattr(svc.template, "native_grammar", False):
+                    validator = format_validator(fmt, required=True)
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), fmt)
+            try:
+                req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), fmt,
+                                                   parallel=req.get("parallel_tool_calls"))
+            except ValueError as e:
+                raise ResponsesError(str(e), "tools") from None
+            force = svc.grammar_force(force, req[GRAMMAR_KEY])
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
@@ -725,14 +737,16 @@ def make_handler(svc: Service):
 
         def _count_tokens(self, req):
             """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(
+                req, svc.anthropic_think_unasked, numeric_effort=getattr(svc.template, "numeric_effort", False))
             tools, _ = forced_call(req.get("tool_choice"), tools)   # same 400 as the request itself ("none": no tools)
             stop_strings(req)                                 # same 400 as the request itself
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(
+                req, svc.anthropic_think_unasked, numeric_effort=getattr(svc.template, "numeric_effort", False))
             tools, force = forced_call(req.get("tool_choice"), tools)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             response_format = anthropic_format(req)            # structured outputs
@@ -741,6 +755,7 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
             req[GRAMMAR_KEY] = svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
+            force = svc.grammar_force(force, req[GRAMMAR_KEY])
             svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
             stop_strings(req)                                 # likewise a bad stop

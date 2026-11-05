@@ -132,6 +132,17 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
        "cublasGemmEx");
 }
 
+void Gemm::f32_emulated(const float* X,const float* W,float* Y,int64_t T,int64_t N,int64_t K) {
+    const auto handle=static_cast<cublasHandle_t>(handle_);
+    if(!emulation_ready_) {
+        ck(cublasSetEmulationStrategy(handle,CUBLAS_EMULATION_STRATEGY_EAGER),"cublasSetEmulationStrategy");
+        emulation_ready_=true;
+    }
+    const float alpha=1.f,beta=0.f;
+    ck(cublasGemmEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,int(N),int(T),int(K),&alpha,W,CUDA_R_32F,int(K),
+                    X,CUDA_R_32F,int(K),&beta,Y,CUDA_R_32F,int(N),CUBLAS_COMPUTE_32F_EMULATED_16BFX9,
+                    CUBLAS_GEMM_DEFAULT),"cublas FP32 BF16x9");
+}
 void Gemm::bf16_w(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
     basalt::kernels::Hc8View v;
     if (basalt::kernels::hc8_view(W, v) && v.owned) {

@@ -10,6 +10,8 @@ namespace basalt::program::tokenizer {
 enum CptFlag : uint16_t {
     kNumber = 0x0002,       // \p{N}
     kLetter = 0x0004,       // \p{L}
+    kPunctuation = 0x0020,  // \p{P}
+    kSymbol = 0x0040,       // \p{S}
     kMark = 0x0010,         // \p{M}
     kWhitespace = 0x0100,   // \s
 };
@@ -20,5 +22,6 @@ const uint16_t* cpt_flag_table();
 
 /// Splits `text` (UTF-8) into the pieces the qwen35 pre-tokenizer yields and appends each piece's end byte offset.
 void pretok_qwen35(const char* text, size_t size, std::vector<size_t>& ends);
+void pretok_joyai(const char* text, size_t size, std::vector<size_t>& ends);
 
 }  // namespace basalt::program::tokenizer

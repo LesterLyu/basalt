@@ -18,6 +18,11 @@ inline constexpr size_t kNativeActBytes = 4096;
 /// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
 inline constexpr size_t kNativeHBytes = 1024;
 
+struct NativeBufferLimits {
+    size_t activation = kNativeActBytes;
+    size_t intermediate = kNativeHBytes;
+};
+
 /// One layer's native expert geometry.
 struct NativeFmt {
     int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
@@ -28,12 +33,14 @@ struct NativeFmt {
     size_t bytes = 0;                   ///< the whole blob
     size_t tail = 0;                    ///< NVFP4: the blob's last 16 bytes, FP32 {s_gate, s_up, s_down, 0}
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+    float swiglu_limit = 0.f;
 };
 
 /// Whether this build has the ggml dot-product path.
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when there is no dot product for a type.
-bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
+                NativeBufferLimits limits = {});
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);

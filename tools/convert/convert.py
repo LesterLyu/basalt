@@ -41,7 +41,10 @@ Options
   --no-vision        leave out the vision projector
   --force            overwrite --out
 
-Every mode writes a version 2 file; its `hc8` section is computed from the file's own hyper-connection matrices
+DeepSeek GGUFs use --dspark FILE instead of the Qwen drafter and vision options. Their original quantization
+is preserved in target and dspark/ sections; this experimental packaging does not enable the execution graph.
+
+Every mode writes a version 2 file; a Qwen file's `hc8` section is computed from its own hyper-connection matrices
 (tools/convert/hc8.py). Sections are listed in include/basalt/core/model_format.hpp. Everything is streamed.
 """
 from __future__ import annotations
@@ -579,6 +582,7 @@ def main():
                          "else from the checkpoint or the GGUF")
     ap.add_argument("--gguf", action="append", metavar="FILE",
                     help="the model's GGUF: shard 1 of a split model (the others are found beside it), or repeat per shard")
+    ap.add_argument("--dspark", metavar="FILE", help="DeepSeek DSpark GGUF, preserved in the same .basalt file")
     ap.add_argument("--mmproj", help="vision projector GGUF (required unless --no-vision)")
     ap.add_argument("--out", required=True, help="the .basalt file to write")
     ap.add_argument("--mtp-source", metavar="DIR", help="the drafter's BF16 tensors written by tools/convert/mtp_fetch.py fetch")
@@ -598,6 +602,20 @@ def main():
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     a = ap.parse_args()
+    if a.gguf:
+        from gguf_reader import GGUFFile
+        if GGUFFile(Path(a.gguf[0])).metadata.get("general.architecture") == "deepseek41":
+            if any((a.sections_from, a.checkpoint, a.mmproj, a.mtp_source, a.mtp_dense, a.draft_vocab,
+                    a.compat_bf16, a.dense_q8_0, a.requant_dense_q6k)):
+                ap.error("deepseek41 takes --gguf, --dspark, --out, --name and --force")
+            import deepseek41
+            try:
+                deepseek41.convert(a)
+            except (S.ConvertError, OSError, ValueError) as e:
+                die(str(e))
+            return
+    if a.dspark:
+        ap.error("--dspark requires a deepseek41 --gguf")
     if a.requant_dense_q6k:
         if a.sections_from or a.gguf or a.dense_q8_0:
             ap.error("--requant-dense-q6k takes only --checkpoint, --out, --workers and --force")

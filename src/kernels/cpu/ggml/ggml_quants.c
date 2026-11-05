@@ -997,6 +997,23 @@ void dequantize_row_iq3_s(const block_iq3_s * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+void dequantize_row_iq1_s(const block_iq1_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    for (int64_t i = 0; i < k / QK_K; ++i) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const uint16_t h = x[i].qh[ib];
+            const float dl = d * (2 * ((h >> 12) & 7) + 1);
+            const float delta = h & 0x8000 ? -IQ1S_DELTA : IQ1S_DELTA;
+            for (int j = 0; j < 4; ++j) {
+                const int idx = x[i].qs[4 * ib + j] | (((h >> (3 * j)) & 7) << 8);
+                const int8_t * grid = (const int8_t *) (iq1s_grid + idx);
+                for (int l = 0; l < 8; ++l) *y++ = dl * (grid[l] + delta);
+            }
+        }
+    }
+}
+
 void dequantize_row_iq1_m(const block_iq1_m * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
@@ -1129,6 +1146,21 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
     }
 }
 
+// GGUF MXFP4 uses a halved E8M0 scale with the doubled E2M1 table, including subnormals.
+void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP4 == 0);
+    for (int64_t i = 0; i < k / QK_MXFP4; ++i) {
+        const uint32_t e = x[i].e;
+        const uint32_t bits = e < 2 ? 0x00200000u << e : (e - 1) << 23;
+        float d;
+        memcpy(&d, &bits, sizeof d);
+        for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+            y[i * QK_MXFP4 + j] = kvalues_fp4[x[i].qs[j] & 15] * d;
+            y[i * QK_MXFP4 + j + 16] = kvalues_fp4[x[i].qs[j] >> 4] * d;
+        }
+    }
+}
+
 // UE4M3 scale as ggml decodes it: half the value (kvalues_fp4 is doubled), 0x7F (NaN) as 0, bit 7 ignored (so 0xFF
 // is NaN too, as in the SIMD and CUDA decoders).
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
@@ -1233,7 +1265,9 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     TYPE(GGML_TYPE_IQ3_S, "iq3_s", QK_K, block_iq3_s, dequantize_row_iq3_s, NULL),
     TYPE(GGML_TYPE_IQ2_S, "iq2_s", QK_K, block_iq2_s, dequantize_row_iq2_s, NULL),
     TYPE(GGML_TYPE_IQ4_XS, "iq4_xs", QK_K, block_iq4_xs, dequantize_row_iq4_xs, NULL),
+    TYPE(GGML_TYPE_IQ1_S, "iq1_s", QK_K, block_iq1_s, dequantize_row_iq1_s, NULL),
     TYPE(GGML_TYPE_IQ1_M, "iq1_m", QK_K, block_iq1_m, dequantize_row_iq1_m, NULL),
+    TYPE(GGML_TYPE_MXFP4, "mxfp4", QK_MXFP4, block_mxfp4, dequantize_row_mxfp4, NULL),
     TYPE(GGML_TYPE_NVFP4, "nvfp4", QK_NVFP4, block_nvfp4, dequantize_row_nvfp4, quantize_row_nvfp4_ref),
 #undef TYPE
 };

@@ -23,8 +23,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -104,6 +106,10 @@ public:
                 std::string& err, float* out = nullptr);
     /// Waits for the launched share and writes its rows into `out` (row i = entry i, n_embd floats).
     bool finish(float* out, std::string& err);
+    /// Diagnostic: reuse the single-token direct-output submissions without changing expert kernels.
+    void set_single_token_graphs(bool enabled) { single_token_graphs_enabled_ = enabled; }
+    uint64_t single_token_graph_launches() const { return single_token_graph_launches_; }
+    size_t single_token_graph_shapes() const { return single_token_graphs_.size(); }
 
     /// Adaptive tier: swap up to `max_swaps` experts routed at least twice that neither the primary (`res0`, slot
     /// or -1) nor the peer holds into the peer's least-used slots.  Copies run on the peer's refill stream; a
@@ -150,6 +156,7 @@ private:
     bool p2p_ = false;
     uint64_t available_bytes_ = 0;
     int64_t n_layers_ = 0, n_expert_ = 0;
+    int64_t n_embd_ = 0;
     ExpertCache cache_;
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
@@ -177,6 +184,14 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    struct SingleTokenGraph {
+        cudaGraphExec_t exec = nullptr;
+        const float* input = nullptr;
+        float* output = nullptr;
+    };
+    std::map<std::tuple<int, int, int64_t, int64_t, float, int, int>, SingleTokenGraph> single_token_graphs_;
+    bool single_token_graphs_enabled_ = false;
+    uint64_t single_token_graph_launches_ = 0;
 };
 
 }  // namespace basalt::core

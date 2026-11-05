@@ -26,7 +26,7 @@ struct PackVocab {
 /// tokenizer/token_type.json (one type per id: 3 control, 4 user-defined added token, 5 unused, 6 byte). Ids from
 /// 0 to n_vocab - 1; an id without an entry has no text. `end_ids` are the tokens that finish generation.
 bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, size_t n_vocab,
-                     const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err);
+                     const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err, bool deepseek = false);
 
 class Guard {
 public:
@@ -35,7 +35,7 @@ public:
     /// Starts a request. `grammar_json` is the request's "grammar" object. `prompt` ends where generation starts: an
     /// open thinking block there defers the grammar until the block is closed. False with `err` on an unusable grammar.
     /// A request whose grammar is null (tool_choice "none") leaves the guard off.
-    bool begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err);
+    bool begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err, bool deepseek = false);
     bool on() const { return on_; }
 
     /// Feeds out[0..rows) in order and returns the first row the grammar does not allow, or -1. The state has then
@@ -59,6 +59,7 @@ private:
     std::vector<uint8_t> mask_;
     bool on_ = false;
     bool thinking_ = false;
+    bool deepseek_ = false;
     int64_t windows_ = 0, misses_ = 0, ns_ = 0;
 };
 

@@ -124,7 +124,7 @@ def main() -> int:
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
                 a.model, a.engine_bin, vision=vision_arg,
-                vision_max_tokens=a.vision_max_tokens,
+                vision_max_tokens=a.vision_max_tokens, deepseek_mmproj=a.deepseek_mmproj,
                 engine_words=file_engine + cli_engine).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
@@ -162,6 +162,11 @@ def main() -> int:
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError:
         fail(f"port {a.port} is in use (--port N)")
+    deepseek = cfg.get("architecture") == "deepseek41"
+    if deepseek:
+        from serve.deepseek import DeepSeekEngine, DeepSeekTemplate, DeepSeekTokenizer, DeepSeekVision
+        a.grammar = False
+    engine_class = DeepSeekEngine if deepseek else ProcessEngine
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
@@ -176,7 +181,11 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        if deepseek:
+            meta = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
+            tok = DeepSeekTokenizer(tokens, merges, types, meta["pre"], meta["special_ids"])
+        else:
+            tok = ST.Tokenizer(tokens, merges, types)
     if not a.mock_engine:
         vision = None
         env = child_env(cfg)
@@ -194,7 +203,7 @@ def main() -> int:
             if mode == "dynamic":
                 vision = EngineVision(cfg["vision"])
             else:
-                vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                vision = (DeepSeekVision if deepseek else Vision)(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                                 env=vision_env(env, mode))
         print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if lazy:
@@ -203,17 +212,17 @@ def main() -> int:
             threading.Thread(target=tail_file, args=(logs, cfg["log"], "eng"), daemon=True).start()
         else:
             ProcessEngine.stderr_sink = lambda line: logs.add("eng", line)
-        known_flags = engine_flags_of(cfg["engine_bin"])
+        known_flags = engine_flags_of(cfg["engine_bin"], deepseek=deepseek)
         has_grammar = known_flags is not None and "--grammar" in known_flags
         if a.grammar and not has_grammar:
-            print(tagged("warning", "grammar is on but this engine has no --grammar; requests go without one"), flush=True)
+            print(tagged("warning", "grammar is on but this engine cannot enforce it for the selected model"), flush=True)
         gwords = grammar_words(known_flags)
         cdir = flag_value(engine_args(cfg), "--conversation-cache-dir")
         cmib = flag_value(engine_args(cfg), "--conversation-cache-disk-mib") or "0"
         if cdir and cmib != "0":
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         # always built unloaded: the load itself (below) is the lazy path's, started here instead of by a request
-        engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
+        engine = engine_class(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
         if isinstance(vision, EngineVision):
             vision.attach(engine)
     else:
@@ -221,10 +230,13 @@ def main() -> int:
             "Thinking about it.</think>\n\nHello from the mock engine."], batch=a.parallel or 0), None, dict(a.sampling_launch)
     # the model's exported template, else the bundled one
     tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
+    template = DeepSeekTemplate() if deepseek else ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
+    svc = Service(engine, tok, template,
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
                   grammar_engine=bool(a.mock_engine or has_grammar))
+    if deepseek:
+        svc.stop_ids = {1}
     svc.logs = logs
     svc.image_sources = image_sources
     if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
@@ -259,7 +271,10 @@ def main() -> int:
     svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
     svc.answer_room = a.answer_room
     svc.thinking_loop_tokens = a.thinking_loop_tokens
-    svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
+    svc.engine_gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])
+    svc.gpu_indices = svc.engine_gpu_indices
+    if deepseek and (card := getattr(vision, "vram_gpu", None)) is not None:
+        svc.gpu_indices = list(dict.fromkeys([*svc.gpu_indices, card]))
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()

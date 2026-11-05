@@ -35,7 +35,7 @@ const std::unordered_map<uint32_t, uint8_t>& char_to_byte() {
 }  // namespace
 
 bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, size_t n_vocab,
-                     const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err) {
+                     const std::vector<int32_t>& end_ids, PackVocab& out, std::string& err, bool deepseek) {
     std::vector<int8_t> types(n_vocab, -1);
     {
         Scan sc{types_json};
@@ -63,8 +63,10 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
             if (id < 0 || (size_t) id >= n_vocab) continue;
             const int ty = types[(size_t) id];
             std::string& b = bytes[(size_t) id];
-            if (ty == 3 || ty == 5 || ty == 6) continue;   // control, unused and byte entries never appear as text
-            if (ty == 4) {
+            const bool ds_control = deepseek && ty == 3 &&
+                (key == "<think>" || key == "</think>" || key.find("｜DSML｜") != std::string::npos);
+            if ((ty == 3 && !ds_control) || ty == 5 || ty == 6) continue;
+            if (ty == 4 || ds_control) {
                 b = key;   // an added token keeps its literal text
                 if (key == "<think>") out.think_open = (int32_t) id;
                 else if (key == "</think>") out.think_close = (int32_t) id;
@@ -83,10 +85,11 @@ bool vocab_from_pack(std::string_view vocab_json, std::string_view types_json, s
     return true;
 }
 
-bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err) {
+bool Guard::begin(const std::string& grammar_json, const int64_t* prompt, size_t n_prompt, std::string& err, bool deepseek) {
+    deepseek_ = deepseek;
     on_ = false;
     windows_ = misses_ = ns_ = 0;
-    RequestGrammar rg = grammar_from_request(grammar_json, err);
+    RequestGrammar rg = grammar_from_request(grammar_json, err, deepseek);
     if (!err.empty()) return false;
     if (!rg.grammar) return true;
     st_ = GrammarState(rg.grammar, rg.triggers);
@@ -128,6 +131,11 @@ int Guard::scan(const int32_t* out, int rows) {
 void Guard::mask_bias(const std::vector<float>& user_bias, std::vector<float>& bias) {
     const auto t0 = std::chrono::steady_clock::now();
     st_.fill_mask(*pv_.vocab, mask_);
+    if (deepseek_ && !st_.active()) {
+        // A token can include the trigger and an invalid continuation in the same piece.
+        for (size_t id = 0; id < mask_.size(); ++id)
+            if (!st_.allows(pv_.vocab->bytes(int32_t(id)), int32_t(id))) mask_[id] = 0;
+    }
     const size_t n = mask_.size();
     bias.resize(n);
     const bool u = user_bias.size() == n;

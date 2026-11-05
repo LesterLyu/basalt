@@ -18,18 +18,21 @@ from serve.util.console import tagged
 MIN_SLOT_CONTEXT = 256          # the least context a slot is given when --max-context is shared
 ENGINE_DEFAULT_CONTEXT = 4096     # the engine's context without --max-context
 PARALLEL_MAX = 8                            # the engine's batch slots
-CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the config file
+CONFIG_PATHS = ("model", "tokenizer", "image-dir", "deepseek-mmproj")  # relative to the config file
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
 
 
-def engine_flags_of(engine_bin: str) -> set[str] | None:
+def engine_flags_of(engine_bin: str, *, deepseek=False) -> set[str] | None:
     """The long flags the engine binary accepts; None when it cannot be read."""
     try:
         with open(engine_bin, "rb") as f:
             data = f.read()
     except OSError:
         return None
-    return {m.decode() for m in re.findall(rb"(?<![\x21-\x7e])--[a-z0-9][a-z0-9-]*(?![\x21-\x7e])", data)}
+    flags = {m.decode() for m in re.findall(rb"(?<![\x21-\x7e])--[a-z0-9][a-z0-9-]*(?![\x21-\x7e])", data)}
+    if deepseek and b"deepseek_grammar=%d" not in data:
+        flags.discard("--grammar")
+    return flags
 
 
 def server_options(ap: argparse.ArgumentParser) -> dict:
@@ -405,6 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="treat requests from this machine as remote too, so they get only data: URLs and what "
                          "--image-url-host and --image-dir allow. For a server behind anything on this machine that "
                          "forwards other people's requests")
+    ap.add_argument("--deepseek-mmproj", help="DeepSeek-V4.1 GGUF visual projector (with --vision GPU)")
     ap.add_argument("--vision-max-tokens", type=int, default=None, metavar="N",
                     help="maximum visual tokens per image with GPU-numbered or cpu vision (at least 8; default 4096); "
                          "larger images keep more detail and reserve more encoder memory at startup")
