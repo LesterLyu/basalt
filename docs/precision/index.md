@@ -12,3 +12,5 @@ Each model has one page for what it computes in and what each rounding costs. Th
   its experts dequantized to BF16, not a true BF16 model).
 - [How quality is measured](quality.md): the gate, the BF16 references, the lossy routing flags, greedy identity and reproduction
   commands.
+
+- [Windows transport identity](windows-transport.md): historical greedy checks for file loading and host registration.
