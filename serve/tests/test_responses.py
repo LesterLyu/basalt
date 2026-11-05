@@ -322,7 +322,7 @@ class ToolsWithStructuredOutput(Server):
             for stream in (False, True):
                 with self.subTest(format=fmt["type"], stream=stream):
                     self.scripts('</think>\n\n{"n": 3}')
-                    code, result = self.post({"model": "qwen3.8-flash-next", "input": "a number", "tools": TOOLS,
+                    code, result = self.post({"model": "basalt", "input": "a number", "tools": TOOLS,
                                               "text": {"format": fmt}, "stream": stream})
                     self.assertEqual(code, 200, result)
                     response = result[-1]["response"] if stream else result
@@ -332,7 +332,7 @@ class ToolsWithStructuredOutput(Server):
                     self.assertIn("exec_command", prompt)
                     self.assertIn("final answer", prompt)
                     grammar = self.engine.requests[-1][1]["_grammar"]
-                    self.assertEqual(grammar["kind"], "tools")
+                    self.assertEqual(grammar["kind"], fmt["type"])
                     self.assertEqual(grammar["tools"][0]["function"]["name"], "exec_command")
 
     def test_tool_round_trip_validates_only_the_final_answer(self):
@@ -341,7 +341,7 @@ class ToolsWithStructuredOutput(Server):
                 self.scripts(CALL, '</think>\n\n{"n": 3}')
                 user = {"role": "user", "content": "Read a.txt and return its number."}
                 request = {"tools": TOOLS, "text": {"format": self.fmt}, "stream": stream}
-                code, result = self.post({"model": "qwen3.8-flash-next", **request, "input": [user]})
+                code, result = self.post({"model": "basalt", **request, "input": [user]})
                 self.assertEqual(code, 200, result)
                 response = result[-1]["response"] if stream else result
                 self.assertEqual(response["status"], "completed")
@@ -350,7 +350,7 @@ class ToolsWithStructuredOutput(Server):
                 self.assertEqual((call["type"], call["status"]), ("function_call", "completed"))
                 if stream:
                     self.assertNotIn("response.output_text.delta", [e["type"] for e in result])
-                code, result = self.post({"model": "qwen3.8-flash-next", **request, "input": [user, *response["output"],
+                code, result = self.post({"model": "basalt", **request, "input": [user, *response["output"],
                     {"type": "function_call_output", "call_id": call["call_id"], "output": "3"}]})
                 self.assertEqual(code, 200, result)
                 response = result[-1]["response"] if stream else result
@@ -359,7 +359,7 @@ class ToolsWithStructuredOutput(Server):
     def test_custom_tool_turn_does_not_need_a_final_json_answer(self):
         self.scripts('</think>\n\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n'
                      '*** Begin Patch\n</parameter>\n</function>\n</tool_call>')
-        code, result = self.post({"model": "qwen3.8-flash-next", "input": "use the tool", "text": {"format": self.fmt},
+        code, result = self.post({"model": "basalt", "input": "use the tool", "text": {"format": self.fmt},
                                  "tools": [{"type": "custom", "name": "apply_patch"}], "stream": True})
         self.assertEqual(code, 200, result)
         self.assertEqual(result[-1]["type"], "response.completed")
@@ -371,10 +371,10 @@ class ToolsWithStructuredOutput(Server):
         self.scripts(CALL, '</think>\n\n{"n":"wrong"}')
         request = {"tools": TOOLS, "text": {"format": self.fmt}}
         user = {"role": "user", "content": "Read a.txt and return its number."}
-        code, response = self.post({"model": "qwen3.8-flash-next", **request, "input": [user]})
+        code, response = self.post({"model": "basalt", **request, "input": [user]})
         self.assertEqual(code, 200, response)
         call = response["output"][-1]
-        code, result = self.post({"model": "qwen3.8-flash-next", **request, "input": [user, *response["output"],
+        code, result = self.post({"model": "basalt", **request, "input": [user, *response["output"],
             {"type": "function_call_output", "call_id": call["call_id"], "output": "3"}]})
         self.assertEqual((code, result["error"]["code"]), (502, "structured_output_failed"))
 
@@ -384,7 +384,7 @@ class ToolsWithStructuredOutput(Server):
             for stream in (False, True):
                 with self.subTest(answer=answer, stream=stream):
                     self.scripts('</think>\n\n' + answer)
-                    code, result = self.post({"model": "qwen3.8-flash-next", "input": "a number", "tools": TOOLS,
+                    code, result = self.post({"model": "basalt", "input": "a number", "tools": TOOLS,
                                               "text": {"format": self.fmt}, "stream": stream})
                     if stream:
                         self.assertEqual(code, 200)
@@ -397,7 +397,7 @@ class ToolsWithStructuredOutput(Server):
     def test_cut_off_tool_call_stays_incomplete(self):
         self.scripts(CALL)
         prefix = CALL[:CALL.index("cat a.txt") + 3]
-        code, result = self.post({"model": "qwen3.8-flash-next", "input": "read the file", "tools": TOOLS,
+        code, result = self.post({"model": "basalt", "input": "read the file", "tools": TOOLS,
                                  "text": {"format": self.fmt}, "stream": True,
                                  "max_output_tokens": len(self.tok.encode(prefix, parse_special=True))})
         self.assertEqual(code, 200, result)
@@ -477,7 +477,7 @@ class ToolRoundTrip(Server):
             with self.subTest(lite=lite, stream=stream):
                 self.engine.scripts = [self.tok.encode(script, parse_special=True)]
                 self.engine.script = self.engine.scripts[0]
-                request = {"model": "qwen3.8-flash-next", "input": [{"role": "user", "content": "edit"}], "stream": stream}
+                request = {"model": "basalt", "input": [{"role": "user", "content": "edit"}], "stream": stream}
                 if lite:
                     request["input"].append({"type": "additional_tools", "tools": [tool]})
                 else:

@@ -45,7 +45,7 @@ class RepairHttp(Server):
     script = ['</think>\n' + BAD, CALL]
 
     def ask(self, stream, **extra):
-        return self.post({"model": "qwen3.8-flash-next", "input": "Read the local fixture.",
+        return self.post({"model": "basalt", "input": "Read the local fixture.",
                           "tools": [TOOL], "max_output_tokens": 2048, "stream": stream, **extra})
 
     def test_repair_returns_a_real_call_in_both_modes(self):
@@ -137,7 +137,7 @@ class RepairHttp(Server):
                     self.engine.turns = 0
                     self.engine.scripts = [self.tok.encode('</think>\n' + BAD) + list(self.svc.stop_ids),
                                            self.tok.encode(BAD if failure else CALL) + list(self.svc.stop_ids)]
-                    body = dict(fields, model='qwen3.8-flash-next', max_tokens=2048, stream=stream)
+                    body = dict(fields, model='basalt', max_tokens=2048, stream=stream)
                     conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
                     try:
                         conn.request('POST', path, json.dumps(body).encode(), {'Content-Type': 'application/json'})

@@ -726,7 +726,7 @@ class ParallelService(unittest.TestCase):
         self.start(2, reuse=True, slot_cache=True, slot0_solo=True, solo_any=True)
 
         def response(text, key):
-            body = {"model": "qwen3.8-flash-next", "input": text, "max_output_tokens": 16,
+            body = {"model": "basalt", "input": text, "max_output_tokens": 16,
                     "reasoning": {"effort": "none"}, "prompt_cache_key": key}
             req = urllib.request.Request(self.base + "/v1/responses", data=json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json"})
