@@ -145,9 +145,11 @@ class Vision(Tmp):
 
     def test_windows_sidecar_executable_suffix(self):
         path = self.build(vision=True)
+        engine = self.engine_bin.with_suffix(".exe")
+        engine.write_text("")
         side = self.engine_bin.parent / "basalt-vision.exe"
         side.write_text("")
-        cfg = modelfile.model_config(path, str(self.engine_bin), vision="1")
+        cfg = modelfile.model_config(path, str(engine), vision="1")
         self.assertEqual(cfg["vision"]["vision_bin"], str(side.resolve()))
 
     def test_sidecar_beside_the_engine_bin_and_sections_unpacked(self):

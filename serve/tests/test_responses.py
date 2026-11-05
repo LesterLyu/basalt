@@ -330,7 +330,7 @@ class ToolsWithStructuredOutput(Server):
                     self.assertIn("exec_command", prompt)
                     self.assertIn("final answer", prompt)
                     grammar = self.engine.requests[-1][1]["_grammar"]
-                    self.assertEqual(grammar["kind"], "tools")
+                    self.assertEqual(grammar["kind"], fmt["type"])
                     self.assertEqual(grammar["tools"][0]["function"]["name"], "exec_command")
 
     def test_tool_round_trip_validates_only_the_final_answer(self):
