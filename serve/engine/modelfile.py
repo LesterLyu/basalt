@@ -92,7 +92,7 @@ class ModelSpec:
     engine_words: tuple[str, ...] = ()
 
 
-def model_config(spec: ModelSpec, engine_bin: str) -> dict:
+def model_config(spec: ModelSpec, engine_bin: str, vision_max_tokens: int | None = None) -> dict:
     """The engine settings a model implies; its `engine_words` follow its arguments as given (the engine's parser lets
     a later flag win), its `vision` adds the sidecar or, "dynamic", the in-engine encoder (ValueError if it cannot be
     set up)."""
@@ -121,6 +121,8 @@ def model_config(spec: ModelSpec, engine_bin: str) -> dict:
     if v:
         v["mode"] = vision
         v["gpu"] = vision != "cpu"
+        if vision_max_tokens is not None:
+            v["max_tokens"] = vision_max_tokens
         cfg["vision"] = v
         # dynamic: the engine encodes, opening the projector inside the model file itself; else the sidecar's
         # embeddings come in with each image
