@@ -14,10 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.api.responses import (ENCRYPTED_PREFIX, ResponsesError, input_messages, request_tools,  # noqa: E402
                              template_kwargs, text_format)
+from serve.api.structured import jsonschema_modules  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.handler import serve  # noqa: E402
 from serve.service import Service  # noqa: E402
 from serve.util.text import ByteTokenizer  # noqa: E402
+
+HAVE_JSONSCHEMA = jsonschema_modules() is not None
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ChatTemplate(ROOT / "serve/chat_template.jinja")
@@ -114,6 +117,18 @@ class Parsing(unittest.TestCase):
         self.assertEqual(names["apply_patch"], (None, "apply_patch", "custom"))
         self.assertEqual(skipped, ["web_search"])
         self.assertIsNone(request_tools({"tools": TOOLS, "tool_choice": "none"})[0])
+
+    def test_unqualified_names_resolve_only_unambiguous_namespace_tools(self):
+        def namespace(name, kind="custom"):
+            return {"type": "namespace", "name": name, "tools": [{"type": kind, "name": "apply_patch"}]}
+
+        _, names, _ = request_tools({"tools": [namespace("functions")]})
+        self.assertEqual(names["apply_patch"], ("functions", "apply_patch", "custom"))
+        _, names, _ = request_tools({"tools": [namespace("first"), namespace("second")]})
+        self.assertNotIn("apply_patch", names)
+        for tools in ([namespace("functions"), {"type": "function", "name": "apply_patch"}],
+                      [{"type": "function", "name": "apply_patch"}, namespace("functions")]):
+            self.assertEqual(request_tools({"tools": tools})[1]["apply_patch"], (None, "apply_patch", "function"))
 
     def test_a_function_schema_that_is_not_an_object_is_refused(self):
         for bad in ("x", ["a"], 5, True):
@@ -290,6 +305,104 @@ class OverHttp(Server):
         self.assertEqual(self.svc.history[-1]["path"], "/v1/responses")
 
 
+class ToolsWithStructuredOutput(Server):
+    fmt = {"type": "json_schema", "name": "num", "strict": True,
+           "schema": {"type": "object", "properties": {"n": {"type": "integer"}},
+                      "required": ["n"], "additionalProperties": False}}
+
+    def scripts(self, *answers):
+        self.engine.scripts = [self.tok.encode(answer + "<|im_end|>", parse_special=True)
+                               for answer in answers]
+        self.engine.script, self.engine.turns = self.engine.scripts[0], 0
+
+    def test_final_json_with_available_tools(self):
+        for fmt in (self.fmt, {"type": "json_object"}):
+            for stream in (False, True):
+                with self.subTest(format=fmt["type"], stream=stream):
+                    self.scripts('</think>\n\n{"n": 3}')
+                    code, result = self.post({"model": "qwen3.8-flash-next", "input": "a number", "tools": TOOLS,
+                                              "text": {"format": fmt}, "stream": stream})
+                    self.assertEqual(code, 200, result)
+                    response = result[-1]["response"] if stream else result
+                    self.assertEqual(response["status"], "completed")
+                    self.assertEqual(response["output"][-1]["content"][0]["text"], '{"n":3}')
+                    prompt = self.tok.decode(self.engine.last_prompt)
+                    self.assertIn("exec_command", prompt)
+                    self.assertIn("final answer", prompt)
+                    grammar = self.engine.requests[-1][1]["_grammar"]
+                    self.assertEqual(grammar["kind"], "tools")
+                    self.assertEqual(grammar["tools"][0]["function"]["name"], "exec_command")
+
+    def test_tool_round_trip_validates_only_the_final_answer(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.scripts(CALL, '</think>\n\n{"n": 3}')
+                user = {"role": "user", "content": "Read a.txt and return its number."}
+                request = {"tools": TOOLS, "text": {"format": self.fmt}, "stream": stream}
+                code, result = self.post({"model": "qwen3.8-flash-next", **request, "input": [user]})
+                self.assertEqual(code, 200, result)
+                response = result[-1]["response"] if stream else result
+                self.assertEqual(response["status"], "completed")
+                self.assertNotIn("message", [item["type"] for item in response["output"]])
+                call = response["output"][-1]
+                self.assertEqual((call["type"], call["status"]), ("function_call", "completed"))
+                if stream:
+                    self.assertNotIn("response.output_text.delta", [e["type"] for e in result])
+                code, result = self.post({"model": "qwen3.8-flash-next", **request, "input": [user, *response["output"],
+                    {"type": "function_call_output", "call_id": call["call_id"], "output": "3"}]})
+                self.assertEqual(code, 200, result)
+                response = result[-1]["response"] if stream else result
+                self.assertEqual(response["output"][-1]["content"][0]["text"], '{"n":3}')
+
+    def test_custom_tool_turn_does_not_need_a_final_json_answer(self):
+        self.scripts('</think>\n\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n'
+                     '*** Begin Patch\n</parameter>\n</function>\n</tool_call>')
+        code, result = self.post({"model": "qwen3.8-flash-next", "input": "use the tool", "text": {"format": self.fmt},
+                                 "tools": [{"type": "custom", "name": "apply_patch"}], "stream": True})
+        self.assertEqual(code, 200, result)
+        self.assertEqual(result[-1]["type"], "response.completed")
+        self.assertEqual(result[-1]["response"]["output"][-1]["type"], "custom_tool_call")
+        self.assertNotIn("response.output_text.delta", [e["type"] for e in result])
+
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is required for schema validation")
+    def test_invalid_final_answer_after_a_tool_result_still_fails(self):
+        self.scripts(CALL, '</think>\n\n{"n":"wrong"}')
+        request = {"tools": TOOLS, "text": {"format": self.fmt}}
+        user = {"role": "user", "content": "Read a.txt and return its number."}
+        code, response = self.post({"model": "qwen3.8-flash-next", **request, "input": [user]})
+        self.assertEqual(code, 200, response)
+        call = response["output"][-1]
+        code, result = self.post({"model": "qwen3.8-flash-next", **request, "input": [user, *response["output"],
+            {"type": "function_call_output", "call_id": call["call_id"], "output": "3"}]})
+        self.assertEqual((code, result["error"]["code"]), (502, "structured_output_failed"))
+
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is required for schema validation")
+    def test_invalid_final_answers_with_tools_fail_without_streaming_text(self):
+        for answer in ('not JSON', '{"n":"wrong"}', '{"n":3,"extra":true}', '{"n":3,"n":4}'):
+            for stream in (False, True):
+                with self.subTest(answer=answer, stream=stream):
+                    self.scripts('</think>\n\n' + answer)
+                    code, result = self.post({"model": "qwen3.8-flash-next", "input": "a number", "tools": TOOLS,
+                                              "text": {"format": self.fmt}, "stream": stream})
+                    if stream:
+                        self.assertEqual(code, 200)
+                        self.assertEqual(result[-1]["type"], "response.failed")
+                        self.assertEqual(result[-1]["response"]["error"]["code"], "structured_output_failed")
+                        self.assertNotIn("response.output_text.delta", [e["type"] for e in result])
+                    else:
+                        self.assertEqual((code, result["error"]["code"]), (502, "structured_output_failed"))
+
+    def test_cut_off_tool_call_stays_incomplete(self):
+        self.scripts(CALL)
+        prefix = CALL[:CALL.index("cat a.txt") + 3]
+        code, result = self.post({"model": "qwen3.8-flash-next", "input": "read the file", "tools": TOOLS,
+                                 "text": {"format": self.fmt}, "stream": True,
+                                 "max_output_tokens": len(self.tok.encode(prefix, parse_special=True))})
+        self.assertEqual(code, 200, result)
+        self.assertEqual(result[-1]["type"], "response.incomplete")
+        self.assertEqual(result[-1]["response"]["output"][-1]["status"], "incomplete")
+
+
 class ToolRoundTrip(Server):
     script = [CALL, ANSWER]
 
@@ -351,6 +464,36 @@ class ToolRoundTrip(Server):
                                           "output": "2"}]})
         self.assertEqual([c["function"]["name"] for c in msgs[1]["tool_calls"]],
                          ["multi_agent_v1.spawn_agent", "apply_patch"])
+
+    def test_unqualified_namespaced_patch_preserves_custom_payload_and_replay(self):
+        patch = "*** Begin Patch\n*** Add File: test.txt\n+hello\n*** End Patch"
+        script = ("</think>\n\n<tool_call>\n<function=apply_patch>\n<parameter=input>\n" + patch +
+                  "\n</parameter>\n</function>\n</tool_call><|im_end|>")
+        tool = {"type": "namespace", "name": "functions", "tools": [
+            {"type": "custom", "name": "apply_patch", "description": "Edit files."}]}
+        for lite, stream in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(lite=lite, stream=stream):
+                self.engine.scripts = [self.tok.encode(script, parse_special=True)]
+                self.engine.script = self.engine.scripts[0]
+                request = {"model": "qwen3.8-flash-next", "input": [{"role": "user", "content": "edit"}], "stream": stream}
+                if lite:
+                    request["input"].append({"type": "additional_tools", "tools": [tool]})
+                else:
+                    request["tools"] = [tool]
+                code, result = self.post(request)
+                self.assertEqual(code, 200, result)
+                response = result[-1]["response"] if stream else result
+                custom = response["output"][-1]
+                self.assertEqual((custom["type"], custom["namespace"], custom["name"], custom["input"]),
+                                 ("custom_tool_call", "functions", "apply_patch", patch))
+                if stream:
+                    deltas = [e["delta"] for e in result if e["type"] == "response.custom_tool_call_input.delta"]
+                    self.assertEqual("".join(deltas), patch)
+                    self.assertFalse(any("function_call_arguments" in e["type"] for e in result))
+                messages = input_messages({"input": [{"role": "user", "content": "edit"}, custom,
+                    {"type": "custom_tool_call_output", "call_id": custom["call_id"], "output": "ok"}]})
+                self.assertEqual(messages[1]["tool_calls"][0]["function"],
+                                 {"name": "functions.apply_patch", "arguments": {"input": patch}})
 
 
 if __name__ == "__main__":
