@@ -38,6 +38,7 @@ int resident_load(Context& context) {
     // bytes are the file's bytes and the placement is the same, so the answers are the plain mmap mode's; the
     // share-of-pinned figure above (which sizes the prompt path) is left as the mmap mode's for the same reason.
     if (o.resident_cpu_experts) {
+        src.release_mapped_cache();
         // the RAM copy is sized from the available RAM: without a reading the experts would silently stay in the file
         if (basalt::core::detail::HostMemory hm; !basalt::core::detail::host_available_memory(hm))
             return fatal_start_error(

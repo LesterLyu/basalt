@@ -18,6 +18,9 @@ namespace basalt::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
+/// Remaining portable registration allowance across the visible devices, when the OS reports their budgets.
+/// A known exhausted allowance returns true with limit=0. Does not divide an allocation by the device count.
+bool host_pin_budget(uint64_t& limit, std::string& why);
 
 struct PinnedArena {
     void* base = nullptr;
@@ -36,12 +39,13 @@ struct PinnedArena {
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
     /// slices of different sizes (one per layer of a native pack), given as their start offsets followed by the end of
     /// the last one.  `slice_starts` holds the registered ones.
+    /// `max_pinned_bytes`: optional cap on CUDA registration. 0 uses the OS budget and driver result.
     /// `shared_file`: use a file-backed MAP_SHARED mapping instead of anonymous memory.
     /// `shared_hash` identifies the model that is allowed to populate that backing.  The file carries a small
     /// header and is refused when its stored hash does not match.  Empty `shared_file` preserves the existing
     /// allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
-                const std::string& shared_file = {}, uint64_t shared_hash = 0);
+                const std::string& shared_file = {}, uint64_t shared_hash = 0, uint64_t max_pinned_bytes = 0);
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
