@@ -16,6 +16,15 @@ The AVX2 flag supplies the CPU router warm-up's intrinsics on MSVC, where GCC's
 per-function target attribute is unavailable. Scalar half conversion uses the portable
 vector spelling of the same F16C conversion.
 
+## DeepSeek full CUDA lock (opt-in)
+
+Set `BASALT_DS_FULL_CUDA_LOCK=1` before starting the engine to allocate its resident expert
+tier as CUDA-pinned system memory. The driver must support host NUMA virtual memory.
+Only the primary GPU maps the entire tier; the helper keeps its own experts and exchanges
+them through one portable expert-sized buffer. The usual RAM headroom and placement rules
+still apply. If allocation fails, startup reports the layer and stops.
+Unset the variable to use the normal registration and working-set policy.
+
 ## Direct reads and resident memory
 
 GPU-cache fills read expert blobs concurrently into pinned staging buffers and upload them
@@ -48,6 +57,10 @@ Automatic peer sizing takes the smaller of CUDA's allocation allowance and the m
 driver's physical free memory, after accounting for its scratch allocations. The query uses
 the device's PCI bus ID; an unavailable management driver retains CUDA's budget. This startup
 snapshot bounds the expert tier but does not reserve memory against later allocations by other apps.
+
+Native session RAM spans use the same device-aware portable registration allowance as the full arena.
+Whole spans beyond that allowance stay resident through the working-set lock. The native peer's capacity query
+also uses physical headroom, so its reserve is applied after other applications' local VRAM usage.
 
 Before sizing the resident copy, the loader drops the clean expert view left by the GPU fill.
 Each copied layer drops its view again. `VirtualUnlock` trims unlocked file pages without

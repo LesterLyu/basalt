@@ -5,7 +5,9 @@
 #include "basalt/core/device.hpp"
 
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/vmm.hpp"
 #include <optional>
+#include <stdexcept>
 
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/file.hpp"
@@ -488,7 +490,14 @@ bool ExpertTier::load_ram(std::string& err) {
         if (host_pinned)
             basalt::log::info("basalt deepseek41", "RAM expert tier: %.2f GiB CUDA-pinned through host VMM", host_pinned / 1073741824.0);
         int unpinned = 0;
-        for (const core::RamPin& p : ram_pins_) unpinned += p.registered_bytes == 0;
+        uint64_t registered = 0, locked = 0;
+        for (const core::RamPin& p : ram_pins_) {
+            unpinned += p.registered_bytes == 0;
+            registered += p.registered_bytes;
+            locked += p.locked_bytes;
+        }
+        basalt::log::info("basalt deepseek41", "RAM expert tier: %.1f GiB registered, %.1f GiB locked",
+                          (double) registered / 1073741824.0, (double) locked / 1073741824.0);
         if (unpinned > 0)
             basalt::log::warn("basalt deepseek41", "RAM expert tier: %d of %d layers not pinned, locked: %s", unpinned, n_layers_,
                               ram_pins_[(size_t) n_layers_ - 1].lock_note.c_str());
@@ -878,7 +887,9 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     const int32_t place = spare_[(size_t) layer];
     spare_[(size_t) layer] = -1;
     const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;
-    peer_moves_.push_back({layer, e, peer_owner_[(size_t) slot], slot, place, ram_[(size_t) layer] + (size_t) place * bytes, src, bytes});
+    auto* out = ram_[(size_t) layer] + (size_t) place * bytes;
+    PeerMove move{layer, e, peer_owner_[(size_t) slot], slot, place, out, src, bytes};
+    peer_moves_.push_back(move);
     peer_owner_[(size_t) slot] = e;
     ++promoted_;
     return true;
