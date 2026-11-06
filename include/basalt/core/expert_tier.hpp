@@ -362,6 +362,8 @@ private:
     const ExpertTierSpec s_;
     core::ExpertCache cache_;
     int device_ = 0;
+    bool profile_peer_exchange_ = false;
+    uint64_t peer_exchanges_ = 0, peer_read_ns_ = 0, peer_write_ns_ = 0;
     int n_layers_ = 0, n_expert_ = 0;
     int64_t per_layer_ = 0;                 ///< VRAM slots per layer in the base arena (their mean, with layer_weights)
     std::vector<int64_t> base_lo_;          ///< [layer] its first base arena slot; [n_layers] the arena's size

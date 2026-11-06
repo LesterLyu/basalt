@@ -2,6 +2,7 @@
 #include "basalt/log.hpp"
 #include "basalt/core/expert_tier.hpp"
 #include "basalt/core/memory_usage.hpp"
+#include <cstdlib>
 
 #include "basalt/core/device.hpp"
 #include "basalt/core/exact_slots.hpp"
@@ -87,6 +88,8 @@ ExpertTier::~ExpertTier() {
 
 bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err) {
     cudaGetDevice(&device_);
+    const char* profile = std::getenv("BASALT_DS_PROFILE_PEER_EXCHANGE");
+    profile_peer_exchange_ = s_.name == "deepseek41" && profile && profile[0] == '1' && profile[1] == '\0';
     n_layers_ = s_.n_layers;
     n_expert_ = s_.n_expert;
     uint64_t one_each = 0, one_each_ram = 0;   // bytes of one slot in every layer, of one RAM place in every layer
@@ -1038,15 +1041,27 @@ void ExpertTier::mark_gap(cudaStream_t main) {
 void ExpertTier::issue_peer(int layer, int pieces) {
     const uint64_t P = core::policy::kPieceBytes;
     // the slot's bytes out first, then the incoming expert's in: the stream keeps the order
+    const auto copy_start = [&] {
+        return profile_peer_exchange_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    };
+    const auto elapsed = [&](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    };
     const auto piece = [&](PeerMove& m) {
+        const auto start = copy_start();
         if (m.out_off < m.bytes) {
             peer_for(m.layer)->slot_out(m.slot, m.to, m.out_off, std::min(P, m.bytes - m.out_off));
+            if (profile_peer_exchange_) peer_read_ns_ += elapsed(start);
             m.out_off += P;
             return;
         }
         peer_for(m.layer)->slot_in(m.slot, m.from, m.in_off, std::min(P, m.bytes - m.in_off));
         m.in_off += P;
-        if (m.in_off >= m.bytes) m.in_mark = peer_for(m.layer)->mark_in();   // that card's own mark
+        if (profile_peer_exchange_) peer_write_ns_ += elapsed(start);
+        if (m.in_off >= m.bytes) {
+            m.in_mark = peer_for(m.layer)->mark_in();
+            if (profile_peer_exchange_) ++peer_exchanges_;
+        }
     };
     for (PeerMove& m : peer_moves_)
         if (m.layer == layer)
@@ -1572,6 +1587,9 @@ bool ExpertTier::await_reads(std::string& err) { return reads_.wait(err); }
 void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }
 
 void ExpertTier::report(const char* tag) const {
+    if (profile_peer_exchange_)
+        basalt::log::info(s_.area.c_str(), "peer exchange %s: count=%llu d2h_submit_ms=%.3f h2d_submit_ms=%.3f",
+                          tag, (unsigned long long) peer_exchanges_, peer_read_ns_ / 1e6, peer_write_ns_ / 1e6);
     const int64_t n = hits_ + cpu_ + fetched_ + peer_hits_;
     if (n == 0) return;
     basalt::log::info(s_.area.c_str(), "TIER %s: %lld lookups: %.1f%% VRAM, %.1f%% second card, %.1f%% bus copy, %.1f%% CPU (file %.1f%%); promoted %lld, dropped %lld", tag,
