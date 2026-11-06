@@ -369,6 +369,8 @@ bool ExpertTier::load_ram(std::string& err) {
     if (mode && std::strcmp(mode, "1") == 0 && cover_ > 0) {
         host_vmm_bytes_.resize(n_layers_);
         if (peer_) {
+            const char* profile = std::getenv("BASALT_DS_PROFILE_PEER_EXCHANGE");
+            profile_peer_exchange_ = profile && std::strcmp(profile, "1") == 0;
             size_t largest = 0;
             for (const auto& l : m_.pack().experts) largest = std::max(largest, (size_t) l.blob_bytes);
             if (cudaHostAlloc(&peer_exchange_stage_, largest, cudaHostAllocPortable) != cudaSuccess) {
@@ -773,17 +775,33 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     if (peer_exchange_stage_) {
         // The helper has no mapping of the large RAM tier. Only this one expert crosses its portable buffer.
         auto* stage = peer_exchange_stage_;
+        using Clock = std::chrono::steady_clock;
+        const auto stamp = [this]() { return profile_peer_exchange_ ? Clock::now() : Clock::time_point{}; };
+        const auto start = stamp();
         int prev;
         if (cudaGetDevice(&prev) != cudaSuccess || cudaSetDevice(peer_->device()) != cudaSuccess)
             throw std::runtime_error("deepseek41: cannot select helper for expert exchange");
+        const auto read = stamp();
         auto rc = cudaMemcpy(stage, peer_->slot_address(slot), bytes, cudaMemcpyDeviceToHost);
+        const auto host = stamp();
+        auto write = host;
         if (rc == cudaSuccess) {
             std::memcpy(out, stage, bytes);
             std::memcpy(stage, src, bytes);
+            write = stamp();
             rc = cudaMemcpy(const_cast<uint8_t*>(peer_->slot_address(slot)), stage, bytes, cudaMemcpyHostToDevice);
         }
+        const auto restore = stamp();
         auto restored = cudaSetDevice(prev);
         if (rc != cudaSuccess || restored != cudaSuccess) throw std::runtime_error("deepseek41: staged helper exchange failed");
+        if (profile_peer_exchange_) {
+            const auto ns = [](Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); };
+            peer_exchange_ns_ += ns(stamp() - start);
+            peer_read_ns_ += ns(host - read);
+            peer_host_ns_ += ns(write - host);
+            peer_write_ns_ += ns(restore - write);
+            ++peer_exchanges_;
+        }
     } else peer_->exchange_slot(slot, out, src, bytes);
     peer_moves_.push_back({layer, e, peer_owner_[(size_t) slot], slot, place});
     peer_owner_[(size_t) slot] = e;
@@ -972,6 +990,10 @@ void ExpertTier::grow() {
 void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }
 
 void ExpertTier::report(const char* tag) const {
+    if (profile_peer_exchange_)
+        basalt::log::info("basalt deepseek41", "peer exchange %s: count=%llu host_elapsed_ms=%.3f d2h_ms=%.3f memcpy_ms=%.3f h2d_ms=%.3f",
+                         tag, (unsigned long long) peer_exchanges_, peer_exchange_ns_ / 1e6,
+                         peer_read_ns_ / 1e6, peer_host_ns_ / 1e6, peer_write_ns_ / 1e6);
     const int64_t n = hits_ + cpu_ + fetched_ + peer_hits_;
     if (n == 0) return;
     basalt::log::info("basalt deepseek41", "TIER %s: %lld lookups: %.1f%% VRAM, %.1f%% second card, %.1f%% bus copy, %.1f%% CPU (file %.1f%%); promoted %lld, dropped %lld, swapped %lld", tag,
