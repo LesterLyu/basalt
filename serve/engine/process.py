@@ -497,6 +497,8 @@ class ProcessEngine:
         if err:
             return f"{status}, last error in its log: {err}"
         last = next((x for x in reversed(lines) if x.startswith("basalt")), "")
+        if rc is None and os.name == "nt":
+            status += "; check Windows Application events for the exception code"
         return f"{status}, last log line: {last}" if last else f"{status}, nothing in its log"
 
     def alive(self) -> bool:
