@@ -106,6 +106,7 @@ struct CommonOptions {
     /// of the drafter's drafts, where the draft policy expects it to pay (basalt/spec/draft_policy.hpp).  Read by the models
     /// that take --suffix-draft; 0 = the drafter only.
     int suffix_draft = 3;
+    bool gpu_single_miss = false;      ///< fetch a lone RAM expert for the main GPU
     std::string spec_oracle;
     int draft_experts = 32;            ///< --draft-experts N: the drafter's routed experts each stage keeps (0: all)
     int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)

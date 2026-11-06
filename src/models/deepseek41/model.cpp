@@ -115,6 +115,7 @@ int64_t DsModel::keep_positions(int64_t backed) const {
 core::ExpertTierSpec DsModel::tier_spec() const {
     const Geometry& g = pack_.geo;
     core::ExpertTierSpec s;
+    s.gpu_single_miss = tiers_.gpu_single_miss;
     s.area = "basalt deepseek41";
     s.name = "deepseek41";
     s.n_layers = g.n_layers;

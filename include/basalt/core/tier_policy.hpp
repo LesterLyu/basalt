@@ -219,7 +219,8 @@ inline std::vector<int64_t> layer_slots(int64_t per_layer, const std::vector<flo
 
 /// Misses of a layer go half to the CPU (rounded up) and the rest to the bus; the file-backed ones can only go to the
 /// CPU. Returns how many of the `pinned` misses the bus fetches, given `file` file-backed misses.
-inline int bus_count(int pinned, int file) {
+inline int bus_count(int pinned, int file, bool gpu_single_miss = false) {
+    if (gpu_single_miss && pinned == 1 && file == 0) return 1;
     const int m = pinned + file;
     const int cpu = (m + 1) / 2 > file ? (m + 1) / 2 : file;
     const int n = m - cpu;

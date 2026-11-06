@@ -115,6 +115,7 @@ void usage() {
                  "                       and 6 with a DSpark or DFly2 one; 0 without a drafter)\n"
                  "  --draft-experts N    a DSpark drafter keeps each stage's N most routed experts by the shipped ranking\n"
                  "                       (32, 64, 96 or 128; default 32; 0 = all)\n"
+                 "  --ds-gpu-single-miss  try the main GPU for a lone RAM expert miss (default: CPU)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"
                  "                       (docs/precision/qwen38-flash-next.md#relaxed-drafting).\n"

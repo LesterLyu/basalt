@@ -1141,7 +1141,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     const auto eligible = [&](int i) { return !lk.dropped[i] && pinned(layer, lk.experts[i]) && (s_.admit_uses == 0 || lk.again[i]); };
     for (int i = 0; i < lk.k; ++i)
         if (!lk.dev[i] && !lk.peer[i] && !lk.dropped[i]) ++(eligible(i) ? np : nf);
-    int left = core::policy::bus_count(np, nf);
+    int left = core::policy::bus_count(np, nf, s_.gpu_single_miss);
     // A second card fetches some over its own link into a scratch slot and computes them there. Their main card slots are
     // claimed all the same, filled behind the window's work as a promotion is, so every expert's place is the one the
     // main card's link alone would have given it.

@@ -68,6 +68,7 @@ struct ExpertTierSpec {
     /// CPU uses that earn a slot (policy::count_use) for every placement; 0: the repeat-miss rule with RAM holding all
     /// experts and kPromoteUses with the file's, the way the first model ran them.
     int admit_uses = 0;
+    bool gpu_single_miss = false;
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
     int claims_per_row = 0;
