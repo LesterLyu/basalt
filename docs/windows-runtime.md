@@ -24,6 +24,8 @@ Only the primary GPU maps the entire tier; the helper keeps its own experts and 
 them through one portable expert-sized buffer. The usual RAM headroom and placement rules
 still apply. If allocation fails, startup reports the layer and stops.
 Unset the variable to use the normal registration and working-set policy.
+For diagnostics, also set `BASALT_DS_PROFILE_PEER_EXCHANGE=1` to time helper exchanges.
+By default the engine neither times these exchanges nor prints their timing summary.
 
 ## Direct reads and resident memory
 
