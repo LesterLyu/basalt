@@ -1,5 +1,6 @@
 // src/core/ram_load.cpp - the shared RAM expert loader: unbuffered reads on a thread pool, then the pin.
 #include "basalt/core/ram_load.hpp"
+#include "basalt/core/pinned.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 
@@ -248,7 +249,7 @@ RamPin pin_ram(void* base, uint64_t register_bytes, uint64_t lock_bytes, const s
     p.sliced = true;
     std::string why;
     uint64_t seg = 0;
-    if (platform::pin_budget(seg, why) && seg < register_bytes) {
+    if (host_pin_budget(seg, why) && seg < register_bytes) {
         p.capped = true;
         p.cap = seg;
         p.cap_why = std::move(why);
@@ -290,7 +291,7 @@ std::vector<RamPin> pin_ram_spans(const std::vector<uint8_t*>& spans, const std:
     uint64_t budget = 0, total = 0;
     std::string why;
     for (uint64_t b : bytes) total += ram_padded(b);
-    const bool limited = platform::pin_budget(budget, why) && budget < total;
+    const bool limited = host_pin_budget(budget, why) && budget < total;
     std::vector<RamPin> pins(spans.size());
     uint64_t pinned = 0;
     for (size_t i = 0; i < spans.size(); ++i) {

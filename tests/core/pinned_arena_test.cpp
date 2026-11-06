@@ -1,4 +1,6 @@
 #include "basalt/core/pinned.hpp"
+#include "basalt/core/ram_load.hpp"
+#include "basalt/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 
@@ -45,6 +47,21 @@ int main() {
               "small uncapped arena was not registered as one range");
     }
     clean_error("whole arena destruction left a CUDA error");
+    {
+        std::vector<uint8_t*> spans{basalt::core::alloc_ram(slice), basalt::core::alloc_ram(slice)};
+        check(spans[0] && spans[1], "RAM span allocation failed");
+        if (spans[0] && spans[1]) {
+            const auto pins = basalt::core::pin_ram_spans(spans, {slice, slice}, false);
+            check(pins.size() == spans.size(), "RAM span pin ownership differs");
+            for (size_t i = 0; i < spans.size(); ++i) {
+                check(pins[i].registered_bytes + pins[i].locked_bytes == slice,
+                      "RAM span was neither registered nor resident");
+                basalt::core::unpin_ram(spans[i], pins[i]);
+            }
+        }
+        for (uint8_t* span : spans) basalt::platform::free_aligned(span);
+    }
+    clean_error("RAM span lifecycle left a CUDA error");
     int current = -1;
     check(cudaGetDevice(&current) == cudaSuccess && current == device, "registration changed the caller's device");
     std::puts(failures ? "pinned_arena_test: FAIL" : "pinned_arena_test: ok");

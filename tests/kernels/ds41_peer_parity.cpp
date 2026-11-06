@@ -76,7 +76,7 @@ T* dalloc(size_t n) {
     return (T*) p;
 }
 
-const char* nm(int t) { return t == GGML_TYPE_IQ2_XXS ? "IQ2_XXS" : t == GGML_TYPE_IQ2_XS ? "IQ2_XS" : t == GGML_TYPE_IQ1_M ? "IQ1_M" : "?"; }
+const char* nm(int t) { return t == GGML_TYPE_IQ1_S ? "IQ1_S" : t == GGML_TYPE_IQ2_XXS ? "IQ2_XXS" : t == GGML_TYPE_IQ2_XS ? "IQ2_XS" : t == GGML_TYPE_IQ1_M ? "IQ1_M" : "?"; }
 
 void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaStream_t s) {
     std::mt19937 rng(700 + gu * 7 + d);
@@ -133,6 +133,11 @@ void one_pair(int gu, int d, bool bench, const float* h_x, float* h_rows, cudaSt
         ++g_fail;
         return;
     }
+    int before = -1, after = -1;
+    ck(cudaGetDevice(&before), "device before peer budget");
+    check(peer.room() > 0, "peer has no available memory");
+    ck(cudaGetDevice(&after), "device after peer budget");
+    check(before == after, "peer budget changed the caller's device");
     if (!peer.open_slots(std::vector<int64_t>(NB, (int64_t) L.bytes), err)) {
         std::printf("FAIL: slots: %s\n", err.c_str());
         ++g_fail;
@@ -207,8 +212,9 @@ int main(int argc, char** argv) {
     for (int i = 0; i < H; ++i) h_x[i] = nd(rng);
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
-    // the format pairs a GSQ-RCO pack mixes
-    const int pairs[][2] = {{GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_M},   {GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M},
+    // the format pairs the native packs mix
+    const int pairs[][2] = {{GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_S},   {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS},
+                            {GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_M},   {GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M},
                             {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS}, {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS}, {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ1_M},
                             {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS},  {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS}};
     for (const auto& p : pairs) one_pair(p[0], p[1], bench, h_x, h_rows, s);

@@ -84,6 +84,48 @@ uint64_t granularity() {
     return (uint64_t) g;
 }
 
+uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
+    mapped = 0;
+    const Fns& v = fns();
+    int dev = current_device(), supported = 0, node = -1;
+    CUdevice cu;
+    if (!bytes || !v.ok || v.device_get(&cu, dev) != CUDA_SUCCESS ||
+        v.attribute(&supported, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) != CUDA_SUCCESS ||
+        !supported || v.attribute(&node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, cu) != CUDA_SUCCESS) return nullptr;
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location = {CU_MEM_LOCATION_TYPE_HOST_NUMA, node < 0 ? 0 : node};
+    size_t g = 0;
+    if (v.granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS ||
+        !g || bytes > SIZE_MAX - (g - 1)) return nullptr;
+    size_t n = (bytes + g - 1) / g * g;
+    CUdeviceptr p = 0;
+    CUmemGenericAllocationHandle h;
+    if (v.reserve(&p, n, 0, 0, 0) != CUDA_SUCCESS) return nullptr;
+    if (v.create(&h, n, &prop, 0) == CUDA_SUCCESS) {
+        auto result = v.map(p, n, 0, h, 0);
+        v.release(h);  // the mapping now owns the physical allocation
+        if (result == CUDA_SUCCESS) {
+            CUmemAccessDesc a[] = {{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE},
+                {{CU_MEM_LOCATION_TYPE_DEVICE, dev}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}};
+            if (v.set_access(p, n, a, 2) == CUDA_SUCCESS) {
+                mapped = n;
+                return reinterpret_cast<uint8_t*>(p);
+            }
+            v.unmap(p, n);
+        }
+    }
+    v.address_free(p, n);
+    return nullptr;
+}
+
+void free_host(uint8_t* ptr, uint64_t mapped) {
+    if (!ptr) return;
+    auto p = reinterpret_cast<CUdeviceptr>(ptr);
+    fns().unmap(p, mapped);
+    fns().address_free(p, mapped);
+}
+
 uint8_t* reserve(uint64_t bytes) {
     const Fns& v = fns();
     CUdeviceptr va = 0;

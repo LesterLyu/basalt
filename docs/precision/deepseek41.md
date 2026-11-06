@@ -34,6 +34,9 @@ All activations between stages are fp32. A decode kernel's output does not depen
   A different RAM tier size can change the text.
 - **Clamped SwiGLU** (routed and shared): gate capped, up clamped to ±limit, `silu(gate) * up` in fp32.
 
+Windows host-registration and peer-capacity checks change transport and placement, not weight bytes or kernel arithmetic.
+The peer kernel parity check compares the same expert on both cards; changing placement still has the rounding effects above.
+
 ## Prompt path
 
 Prompt chunks run MMQ products (q8_1, int8 mma, fp32 accumulation). Against decode they change numerics:
