@@ -188,7 +188,8 @@ inline float iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* y) {
         __m512i acc = zero;
         alignas(64) uint16_t ix[32];
         _mm512_store_si512((void*) ix, idx16);
-        for (int j = 0; j < 4; ++j) {
+        const auto part = [&]<int group>(int runtime = 0) {
+            const int j = group >= 0 ? group : runtime;
             const uint16_t* q = ix + 8 * j;
             const __m512i g = _mm512_set_epi64((long long) iq1s_grid[q[7]], (long long) iq1s_grid[q[6]], (long long) iq1s_grid[q[5]],
                                                (long long) iq1s_grid[q[4]], (long long) iq1s_grid[q[3]], (long long) iq1s_grid[q[2]],
@@ -199,6 +200,14 @@ inline float iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* y) {
             const __m512i lsj = _mm512_permutexvar_epi16(_mm512_add_epi16(c0, _mm512_set1_epi16((short) (2 * j))), ls512);
             // (the permute index: lanes 0-15 -> word 2j, lanes 16-31 -> word 2j + 1)
             acc = _mm512_add_epi32(acc, _mm512_madd_epi16(dot, lsj));
+        };
+        if constexpr (platform::kUnrollIq1sGroups) {
+            part.template operator()<0>();
+            part.template operator()<1>();
+            part.template operator()<2>();
+            part.template operator()<3>();
+        } else {
+            for (int j = 0; j < 4; ++j) part.template operator()<-1>(j);
         }
         const __m256i sumi = _mm256_add_epi32(_mm512_castsi512_si256(acc), _mm512_extracti64x4_epi64(acc, 1));
         // the delta term: sum over the 8 groups of bsums pair * sign * scale (exact integers)
