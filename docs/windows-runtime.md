@@ -16,15 +16,15 @@ The AVX2 flag supplies the CPU router warm-up's intrinsics on MSVC, where GCC's
 per-function target attribute is unavailable. Scalar half conversion uses the portable
 vector spelling of the same F16C conversion.
 
-## DeepSeek full CUDA lock (opt-in)
+## DeepSeek resident expert memory
 
-Set `BASALT_DS_FULL_CUDA_LOCK=1` before starting the engine to allocate its resident expert
-tier as CUDA-pinned system memory. The driver must support host NUMA virtual memory.
-Only the primary GPU maps the entire tier; the helper keeps its own experts and exchanges
-them through one portable expert-sized buffer. The usual RAM headroom and placement rules
-still apply. If allocation fails, startup reports the layer and stops.
-Unset the variable to use the normal registration and working-set policy.
-For diagnostics, also set `BASALT_DS_PROFILE_PEER_EXCHANGE=1` to time helper exchanges.
+On native Windows the engine automatically allocates the resident RAM expert tier as
+CUDA-pinned system memory using host NUMA virtual memory. Only the primary GPU maps
+the entire tier; helper transfers use the RAM slots directly. If any layer cannot be
+mapped, the engine releases the mappings before allocating ordinary RAM and registering
+what it can. Expert placement and RAM headroom are unchanged. Linux and WSL use ordinary
+RAM registration.
+For diagnostics, set `BASALT_DS_PROFILE_PEER_EXCHANGE=1` to time helper exchanges.
 By default the engine neither times these exchanges nor prints their timing summary.
 
 ## Direct reads and resident memory
