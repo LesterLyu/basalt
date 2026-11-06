@@ -881,7 +881,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     int np = 0, nf = 0;
     for (int i = 0; i < lk.k; ++i)
         if (!lk.dev[i] && !lk.peer[i]) ++(pinned(layer, lk.experts[i]) ? np : nf);
-    int left = policy::bus_count(np, nf);
+    int left = policy::bus_count(np, nf, m_.tiers().gpu_single_miss);
     int started = 0;
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
         if (lk.dev[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only

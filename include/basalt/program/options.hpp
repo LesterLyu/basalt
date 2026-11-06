@@ -85,6 +85,7 @@ struct CommonOptions {
     /// 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for the exactness test).
     int spec = 0;
     bool spec_given = false;           ///< --spec on the command line
+    bool gpu_single_miss = false;      ///< DeepSeek: fetch a lone RAM expert for the main GPU
     std::string spec_oracle;
     int draft_experts = 32;            ///< --draft-experts N: the drafter's routed experts each stage keeps (0: all)
     int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)
