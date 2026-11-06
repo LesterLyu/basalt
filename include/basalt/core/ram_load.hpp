@@ -51,6 +51,10 @@ std::vector<std::vector<RamRun>> ram_arena_runs(const RamGrid& grid, uint8_t* ba
 std::vector<std::vector<RamRun>> ram_layer_runs(const RamGrid& grid, const std::vector<uint8_t*>& spans,
                                                 const std::vector<int32_t>& slots, const std::vector<int32_t>& sunk);
 
+/// Build the runs for one layer once its destination is allocated.
+std::vector<RamRun> ram_layer_group(const RamGrid& grid, int64_t layer, uint8_t* span,
+                                    const std::vector<int32_t>& slots, const std::vector<int32_t>& sunk);
+
 struct RamLoad {
     int fd = -1;              ///< open on the file the runs' positions refer to
     bool unbuffered = true;   ///< read around the OS file cache where the platform can
@@ -60,6 +64,9 @@ struct RamLoad {
     LoadProgress* progress = nullptr;   ///< the caller finishes it, once the pin is done too
     std::vector<std::vector<RamRun>> groups;
 
+    /// Optionally build a layer on its reader thread (groups supplies the count). Sink blobs in
+    /// deferred groups must fit in chunk.
+    std::function<bool(int64_t, std::vector<RamRun>&, std::string&)> prepare_group;
     /// Before a group that will not be read unbuffered.
     std::function<void(int64_t group, const std::vector<RamRun>& runs)> read_ahead;
     /// Places what the unbuffered reads did not (`done` bytes did land); default: reads `fd`.

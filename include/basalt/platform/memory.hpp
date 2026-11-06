@@ -11,6 +11,14 @@
 
 namespace basalt::platform {
 
+// Windows CUDA copies can use a host NUMA allocation as a host endpoint even when only
+// the primary GPU maps it. Other platforms retain the portable staging path.
+#if defined(_WIN32)
+inline constexpr bool kDirectHostVmmExchange = true;
+#else
+inline constexpr bool kDirectHostVmmExchange = false;
+#endif
+
 struct LockResult {
     bool ok = false;
     uint64_t locked_bytes = 0;   ///< may be less than requested; the rest stays pageable

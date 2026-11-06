@@ -1,5 +1,6 @@
 // src/core/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
 #include "basalt/core/load_progress.hpp"
+#include <stdexcept>
 #include "basalt/core/peer_experts.hpp"
 
 #include "basalt/kernels/cpu/expert_layout.hpp"
@@ -271,8 +272,9 @@ void PeerExperts::read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes) {
 void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes) {
     On on(device_);
     uint8_t* blob = const_cast<uint8_t*>(cache_.device_slot(slot));
-    cudaMemcpyAsync(out, blob, bytes, cudaMemcpyDeviceToHost, refill_);
-    cudaMemcpyAsync(blob, in, bytes, cudaMemcpyHostToDevice, refill_);
+    auto rc = cudaMemcpyAsync(out, blob, bytes, cudaMemcpyDeviceToHost, refill_);
+    if (rc == cudaSuccess) rc = cudaMemcpyAsync(blob, in, bytes, cudaMemcpyHostToDevice, refill_);
+    if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc));
 }
 
 bool PeerExperts::read_wait(std::string& err) {

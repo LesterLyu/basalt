@@ -222,7 +222,6 @@ private:
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
     std::vector<uint64_t> host_vmm_bytes_;  ///< nonempty only for primary-only pinned system allocations
-    uint8_t* peer_exchange_stage_ = nullptr;  ///< one portable expert for transfers on the helper
     bool profile_peer_exchange_ = false;
     uint64_t peer_exchanges_ = 0, peer_exchange_ns_ = 0, peer_read_ns_ = 0, peer_host_ns_ = 0, peer_write_ns_ = 0;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
@@ -249,7 +248,9 @@ private:
     int64_t swapped_ = 0;
     platform::MappedFile file_;             ///< the experts section
     PromptHost host_;
+    struct PeerSubmitter;
     std::unique_ptr<core::PeerExperts> peer_;
+    std::unique_ptr<PeerSubmitter> peer_submitter_;
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share

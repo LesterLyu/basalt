@@ -54,24 +54,30 @@ std::vector<std::vector<RamRun>> ram_arena_runs(const RamGrid& grid, uint8_t* ba
 std::vector<std::vector<RamRun>> ram_layer_runs(const RamGrid& grid, const std::vector<uint8_t*>& spans,
                                                 const std::vector<int32_t>& slots, const std::vector<int32_t>& sunk) {
     std::vector<std::vector<RamRun>> groups((size_t) grid.n_layers);
-    for (int64_t l = 0; l < grid.n_layers; ++l) {
-        const uint64_t blob = grid.blob_bytes[(size_t) l];
-        for (int64_t e = 0; e < grid.n_expert; ++e) {
-            const size_t i = (size_t) l * (size_t) grid.n_expert + (size_t) e;
-            if (slots[i] >= 0)
-                add_ram_blob(groups[(size_t) l], spans[(size_t) l] + (size_t) slots[i] * blob, grid.file_pos(l, e), blob, e, blob);
-            if (!sunk.empty() && sunk[i] >= 0) {
-                RamRun r;
-                r.file_pos = grid.file_pos(l, e);
-                r.bytes = blob;
-                r.blob_bytes = blob;
-                r.first = e;
-                r.count = 1;
-                groups[(size_t) l].push_back(r);
-            }
+    for (int64_t l = 0; l < grid.n_layers; ++l)
+        groups[(size_t) l] = ram_layer_group(grid, l, spans[(size_t) l], slots, sunk);
+    return groups;
+}
+
+std::vector<RamRun> ram_layer_group(const RamGrid& grid, int64_t l, uint8_t* span,
+                                    const std::vector<int32_t>& slots, const std::vector<int32_t>& sunk) {
+    std::vector<RamRun> runs;
+    const uint64_t blob = grid.blob_bytes[(size_t) l];
+    for (int64_t e = 0; e < grid.n_expert; ++e) {
+        const size_t i = (size_t) l * (size_t) grid.n_expert + (size_t) e;
+        if (slots[i] >= 0)
+            add_ram_blob(runs, span + (size_t) slots[i] * blob, grid.file_pos(l, e), blob, e, blob);
+        if (!sunk.empty() && sunk[i] >= 0) {
+            RamRun r;
+            r.file_pos = grid.file_pos(l, e);
+            r.bytes = blob;
+            r.blob_bytes = blob;
+            r.first = e;
+            r.count = 1;
+            runs.push_back(r);
         }
     }
-    return groups;
+    return runs;
 }
 
 bool read_ram_runs(const RamLoad& L, RamLoadStats& stats, std::string& err) {
@@ -118,12 +124,21 @@ bool read_ram_runs(const RamLoad& L, RamLoadStats& stats, std::string& err) {
         for (;;) {
             const int64_t g = next.fetch_add(1);
             if (g >= n_groups || failed.load()) return;
-            const std::vector<RamRun>& runs = L.groups[(size_t) g];
+            std::string e;
+            std::vector<RamRun> prepared;
+            if (L.prepare_group && !L.prepare_group(g, prepared, e)) {
+                fail(e);
+                return;
+            }
+            const auto& runs = L.prepare_group ? prepared : L.groups[(size_t) g];
             if (L.read_ahead && (direct < 0 || !platform::read_ahead_enabled())) L.read_ahead(g, runs);
             bool fell_back = false;
-            std::string e;
             for (const RamRun& r : runs) {
                 if (r.dst == nullptr) {   // one blob for a sink, through the staging
+                    if (r.bytes > stage_bytes - 2 * kAlign) {
+                        fail("expert exceeds the read staging capacity");
+                        return;
+                    }
                     take_stage();
                     if (stage == nullptr) {
                         fail("no memory for the expert staging");
