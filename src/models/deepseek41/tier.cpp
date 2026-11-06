@@ -24,6 +24,8 @@
 #include <cstring>
 #include <mutex>
 #include <random>
+#include <deque>
+#include <exception>
 #include <thread>
 #include <vector>
 
@@ -52,6 +54,53 @@ constexpr uint64_t kPrereadBytes = 12ull << 30;  // file-backed experts read ahe
 constexpr int kRankLayers = 40, kRankExperts = 384;
 }  // namespace
 
+// The helper's async copies can block the submitting Windows thread. Queue the submissions,
+// then fence the refill stream before publishing the new expert homes.
+struct ExpertTier::PeerSubmitter {
+    struct Move { int slot; uint8_t* out; const uint8_t* in; uint64_t bytes; };
+    core::PeerExperts& peer;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Move> queue;
+    bool stop = false, busy = false;
+    std::exception_ptr error;
+    std::thread thread;
+
+    explicit PeerSubmitter(core::PeerExperts& p) : peer(p), thread([this] { run(); }) {}
+    ~PeerSubmitter() {
+        { std::lock_guard lock(mutex); stop = true; }
+        cv.notify_all();
+        thread.join();
+    }
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            cv.wait(lock, [&] { return stop || !queue.empty(); });
+            if (queue.empty()) return;
+            Move job = queue.front();
+            queue.pop_front();
+            busy = true;
+            lock.unlock();
+            std::exception_ptr failure;
+            try { peer.exchange_slot(job.slot, job.out, job.in, job.bytes); }
+            catch (...) { failure = std::current_exception(); }
+            lock.lock();
+            busy = false;
+            if (failure) { error = failure; queue.clear(); cv.notify_all(); return; }
+            if (queue.empty()) cv.notify_all();
+        }
+    }
+    void submit(Move m) {
+        { std::lock_guard lock(mutex); if (error) std::rethrow_exception(error); queue.push_back(m); }
+        cv.notify_all();
+    }
+    void wait() {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return queue.empty() && !busy; });
+        if (error) std::rethrow_exception(error);
+    }
+};
+
 ExpertTier::ExpertTier(const DsModel& model) : m_(model) {}
 
 ExpertTier::~ExpertTier() {
@@ -65,6 +114,7 @@ ExpertTier::~ExpertTier() {
         cv_.notify_all();
         worker_.join();
     }
+    peer_submitter_.reset();   // drain outstanding submissions before freeing their RAM destinations
     report("final");
     if (copy_stream_) issue(-1, kAllPieces);
     if (peer_ && !peer_moves_.empty()) {
@@ -87,7 +137,6 @@ ExpertTier::~ExpertTier() {
         if (!host_vmm_bytes_.empty()) core::vmm::free_host(ram_[l], host_vmm_bytes_[l]);
         else platform::free_aligned(ram_[l]);
     }
-    if (peer_exchange_stage_) cudaFreeHost(peer_exchange_stage_);
     platform::free_aligned(act_);
 }
 
@@ -245,6 +294,12 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     pool_ = std::make_unique<kernels::cpu::ExpertPool>(workers, m_.tiers().pool_affinity_given ? m_.tiers().pool_affinity : kernels::cpu::PoolAffinity::All);
 
     if (!load_ram(err)) return false;
+    if constexpr (platform::kDirectHostVmmExchange) {
+        if (peer_ && !host_vmm_bytes_.empty() && !profile_peer_exchange_) {
+            peer_submitter_ = std::make_unique<PeerSubmitter>(*peer_);
+            basalt::log::info("basalt deepseek41", "helper expert exchange: dedicated submission thread");
+        }
+    }
     if (homes_.main == 0) seed_copies(per_layer_);
     promoted_ = 0;
     grow();
@@ -445,20 +500,6 @@ bool ExpertTier::load_ram(std::string& err) {
     }
     // the layout: one span per layer, each with its swap spare
     std::vector<uint64_t> span_bytes((size_t) n_layers_, 0);
-    const char* mode = std::getenv("BASALT_DS_FULL_CUDA_LOCK");
-    if (mode && std::strcmp(mode, "1") == 0 && cover_ > 0) {
-        host_vmm_bytes_.resize(n_layers_);
-        if (peer_) {
-            const char* profile = std::getenv("BASALT_DS_PROFILE_PEER_EXCHANGE");
-            profile_peer_exchange_ = profile && std::strcmp(profile, "1") == 0;
-            size_t largest = 0;
-            for (const auto& l : m_.pack().experts) largest = std::max(largest, (size_t) l.blob_bytes);
-            if (cudaHostAlloc(&peer_exchange_stage_, largest, cudaHostAllocPortable) != cudaSuccess) {
-                err = "deepseek41: cannot allocate portable helper exchange buffer";
-                return false;
-            }
-        }
-    }
     core::RamGrid grid;
     grid.n_layers = n_layers_;
     grid.n_expert = n_expert_;
@@ -469,20 +510,12 @@ bool ExpertTier::load_ram(std::string& err) {
         grid.blob_bytes.push_back(el.blob_bytes);
         if (cover_ <= 0) continue;
         span_bytes[(size_t) l] = el.blob_bytes * (uint64_t) (cover_ + 1);
-        ram_[(size_t) l] = host_vmm_bytes_.empty() ? core::alloc_ram(span_bytes[l])
-            : core::vmm::alloc_host(span_bytes[l], host_vmm_bytes_[l]);
-        if (ram_[(size_t) l] == nullptr) {
-            err = host_vmm_bytes_.empty() ? "deepseek41: cannot allocate the RAM expert tier"
-                : "deepseek41: cannot allocate the full CUDA-pinned RAM tier at layer " + std::to_string(l);
-            return false;
-        }
     }
     core::RamLoad load;
     load.fd = m_.experts_fd();
     load.stage_pinned = true;
     load.threads = 8;
     load.progress = ram_load ? &*ram_load : nullptr;
-    load.groups = core::ram_layer_runs(grid, ram_, ram_idx_, device_home);
     load.sink = [&](int64_t l, const core::RamRun& r, const uint8_t* bytes, std::string& e) {
         const size_t idx = (size_t) l * n_expert_ + (size_t) r.first;
         const int32_t home = device_home[idx];
@@ -496,9 +529,60 @@ bool ExpertTier::load_ram(std::string& err) {
         return true;
     };
     core::RamLoadStats read;
-    if (!core::read_ram_runs(load, read, err)) {
-        err = "deepseek41: loading the expert tiers: " + err;
-        return false;
+    bool loaded = false;
+    if constexpr (platform::kDirectHostVmmExchange) {
+        if (cover_ > 0) {
+            // Map each layer on its reader thread so earlier layers can be filled while
+            // Windows backs the rest. No second arena or extra file staging.
+            host_vmm_bytes_.resize(n_layers_);
+            std::atomic<bool> map_failed{false};
+            load.groups.resize(n_layers_);
+            load.chunk = std::max(load.chunk, max_blob);
+            load.prepare_group = [&](int64_t l, std::vector<core::RamRun>& runs, std::string& e) {
+                if (cudaSetDevice(m_.device()) != cudaSuccess ||
+                    !(ram_[l] = core::vmm::alloc_host(span_bytes[l], host_vmm_bytes_[l]))) {
+                    map_failed.store(true);
+                    e = "could not map a host expert layer";
+                    return false;
+                }
+                runs = core::ram_layer_group(grid, l, ram_[l], ram_idx_, device_home);
+                return true;
+            };
+            loaded = core::read_ram_runs(load, read, err);
+            load.prepare_group = {};
+            if (!loaded) {
+                if (!map_failed.load()) return false;
+                // All readers have joined. Drop partial mappings before the ordinary
+                // allocation; GPU homes are refilled with the same immutable weights.
+                for (int l = 0; l < n_layers_; ++l) {
+                    core::vmm::free_host(ram_[l], host_vmm_bytes_[l]);
+                    ram_[l] = nullptr;
+                }
+                host_vmm_bytes_.clear();
+                basalt::log::warn("basalt deepseek41", "host VMM unavailable; using normal RAM registration");
+                if (ram_load) ram_load.emplace("ram", ram_bytes);
+                if (main_load) main_load.emplace(core::LoadProgress::cuda(0), main_bytes);
+                if (peer_load) peer_load.emplace(core::LoadProgress::cuda(peer_->device()), peer_bytes);
+                err.clear();
+            } else if (peer_) {
+                const char* profile = std::getenv("BASALT_DS_PROFILE_PEER_EXCHANGE");
+                profile_peer_exchange_ = profile && std::strcmp(profile, "1") == 0;
+            }
+        }
+    }
+    if (!loaded) {
+        for (int l = 0; cover_ > 0 && l < n_layers_; ++l) {
+            ram_[l] = core::alloc_ram(span_bytes[l]);
+            if (!ram_[l]) {
+                err = "deepseek41: cannot allocate the RAM expert tier";
+                return false;
+            }
+        }
+        load.groups = core::ram_layer_runs(grid, ram_, ram_idx_, device_home);
+        if (!core::read_ram_runs(load, read, err)) {
+            err = "deepseek41: loading the expert tiers: " + err;
+            return false;
+        }
     }
     if (!host_vmm_bytes_.empty()) {
         uint64_t n = 0;
@@ -645,7 +729,10 @@ void ExpertTier::land(int layer) {
             peer_moves_[keep++] = m;
             continue;
         }
-        peer_->read_until(m.in_mark, err);
+        if (peer_submitter_) {
+            peer_submitter_->wait();
+            if (!peer_->read_wait(err)) throw std::runtime_error(err);
+        } else if (!peer_->read_until(m.in_mark, err)) throw std::runtime_error(err);
         apply(m);
     }
     peer_moves_.resize(keep);
@@ -661,7 +748,8 @@ void ExpertTier::land_all() {
     claims_ = 0;
     if (peer_moves_.empty()) return;
     std::string err;
-    peer_->read_wait(err);
+    if (peer_submitter_) peer_submitter_->wait();
+    if (!peer_->read_wait(err)) throw std::runtime_error(err);
     for (const PeerMove& m : peer_moves_) apply(m);
     peer_moves_.clear();
 }
@@ -906,9 +994,11 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;
     auto* out = ram_[(size_t) layer] + (size_t) place * bytes;
     PeerMove move{layer, e, peer_owner_[(size_t) slot], slot, place, out, src, bytes};
-    if (peer_exchange_stage_) {
-        // The helper has no mapping of the large RAM tier. Only this one expert crosses its portable buffer.
-        auto* stage = peer_exchange_stage_;
+    if (peer_submitter_) {
+        peer_submitter_->submit({slot, out, src, bytes});
+        move.out_off = move.in_off = bytes;
+        move.in_mark = 0;
+    } else if (!host_vmm_bytes_.empty()) {
         using Clock = std::chrono::steady_clock;
         const auto stamp = [this]() { return profile_peer_exchange_ ? Clock::now() : Clock::time_point{}; };
         const auto start = stamp();
@@ -916,23 +1006,18 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
         if (cudaGetDevice(&prev) != cudaSuccess || cudaSetDevice(peer_->device()) != cudaSuccess)
             throw std::runtime_error("deepseek41: cannot select helper for expert exchange");
         const auto read = stamp();
-        auto rc = cudaMemcpy(stage, peer_->slot_address(slot), bytes, cudaMemcpyDeviceToHost);
-        const auto host = stamp();
-        auto write = host;
-        if (rc == cudaSuccess) {
-            std::memcpy(out, stage, bytes);
-            std::memcpy(stage, src, bytes);
-            write = stamp();
-            rc = cudaMemcpy(const_cast<uint8_t*>(peer_->slot_address(slot)), stage, bytes, cudaMemcpyHostToDevice);
-        }
+        auto rc = cudaMemcpy(out, peer_->slot_address(slot), bytes, cudaMemcpyDeviceToHost);
+        const auto write = stamp();
+        if (rc == cudaSuccess)
+            rc = cudaMemcpy(const_cast<uint8_t*>(peer_->slot_address(slot)), src, bytes, cudaMemcpyHostToDevice);
         const auto restore = stamp();
         auto restored = cudaSetDevice(prev);
-        if (rc != cudaSuccess || restored != cudaSuccess) throw std::runtime_error("deepseek41: staged helper exchange failed");
+        if (rc != cudaSuccess || restored != cudaSuccess)
+            throw std::runtime_error("deepseek41: direct helper exchange failed");
         if (profile_peer_exchange_) {
             const auto ns = [](Clock::duration d) { return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count(); };
             peer_exchange_ns_ += ns(stamp() - start);
-            peer_read_ns_ += ns(host - read);
-            peer_host_ns_ += ns(write - host);
+            peer_read_ns_ += ns(write - read);
             peer_write_ns_ += ns(restore - write);
             ++peer_exchanges_;
         }

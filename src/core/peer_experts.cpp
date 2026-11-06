@@ -308,12 +308,14 @@ void PeerExperts::exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, u
 
 void PeerExperts::slot_out(int32_t slot, uint8_t* out, uint64_t off, uint64_t n) {
     On on(device_);
-    cudaMemcpyAsync(out + off, cache_.device_slot(slot) + off, n, cudaMemcpyDeviceToHost, refill_);
+    const auto rc = cudaMemcpyAsync(out + off, cache_.device_slot(slot) + off, n, cudaMemcpyDeviceToHost, refill_);
+    if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc));
 }
 
 void PeerExperts::slot_in(int32_t slot, const uint8_t* in, uint64_t off, uint64_t n) {
     On on(device_);
-    cudaMemcpyAsync(const_cast<uint8_t*>(cache_.device_slot(slot)) + off, in + off, n, cudaMemcpyHostToDevice, refill_);
+    const auto rc = cudaMemcpyAsync(const_cast<uint8_t*>(cache_.device_slot(slot)) + off, in + off, n, cudaMemcpyHostToDevice, refill_);
+    if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc));
 }
 
 int64_t PeerExperts::mark_in() {

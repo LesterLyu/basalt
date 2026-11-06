@@ -112,13 +112,13 @@ void arena_case(uint64_t base, uint64_t blob, bool unbuffered, int threads) {
     basalt::platform::free_aligned(mem);
 }
 
-void span_case(uint64_t base, uint64_t blob) {
+void span_case(uint64_t base, uint64_t blob, bool deferred = false) {
     const RamGrid g = make_grid(base, blob);
     File f(grid_end(g) + 4096);
     std::vector<uint8_t*> spans;
     std::vector<int32_t> slots((size_t) (g.n_layers * g.n_expert), -1), sunk(slots.size(), -1);
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        spans.push_back(alloc_ram(g.blob_bytes[(size_t) l] * (uint64_t) g.n_expert));
+        spans.push_back(deferred ? nullptr : alloc_ram(g.blob_bytes[(size_t) l] * (uint64_t) g.n_expert));
         int32_t next = 0;
         for (int64_t e = 0; e < g.n_expert; ++e) {
             const size_t i = (size_t) (l * g.n_expert + e);
@@ -129,7 +129,17 @@ void span_case(uint64_t base, uint64_t blob) {
     RamLoad L;
     L.fd = f.fd;
     L.threads = 3;
-    L.groups = ram_layer_runs(g, spans, slots, sunk);
+    if (deferred) {
+        L.groups.resize((size_t) g.n_layers);
+        L.prepare_group = [&](int64_t l, std::vector<RamRun>& runs, std::string&) {
+            spans[l] = alloc_ram(g.blob_bytes[l] * (uint64_t) g.n_expert);
+            if (!spans[l]) return false;
+            runs = ram_layer_group(g, l, spans[l], slots, sunk);
+            return true;
+        };
+    } else {
+        L.groups = ram_layer_runs(g, spans, slots, sunk);
+    }
     std::vector<uint8_t> got(slots.size(), 0);
     L.sink = [&](int64_t l, const RamRun& r, const uint8_t* bytes, std::string& e) {
         if (std::memcmp(bytes, f.bytes.data() + g.file_pos(l, r.first), (size_t) r.bytes) != 0) {
@@ -212,6 +222,7 @@ int main() {
         }
     span_case(0, 4096 * 4);
     span_case(1000, 4096 * 2 + 100);
+    span_case(1000, 4096 * 2 + 100, true);
     fallback_case();
     std::printf(fails == 0 ? "ram_load_test: ok\n" : "ram_load_test: %d failures\n", fails);
     return fails == 0 ? 0 : 1;
