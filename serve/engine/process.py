@@ -465,6 +465,8 @@ class ProcessEngine:
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("basalt", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself
             return f"the engine exited (code {rc}), last log line: {last}"
+        if os.name == "nt":
+            return "engine stopped; check Windows Application events for the exception code"
         return "probably out of RAM (sudo dmesg | grep -i 'out of memory')"
 
     def alive(self) -> bool:
