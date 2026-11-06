@@ -47,6 +47,10 @@ int main() {
     for (int p = 0; p <= 6; ++p)
         for (int f = 0; f <= 6 - p; ++f) {
             const int b = bus_count(p, f);
+            const int half = (p + f) / 2;
+            CHECK(b == (p < half ? p : half));
+            CHECK(bus_count(p, f, false) == b);
+            CHECK(bus_count(p, f, true) == ((p == 1 && f == 0) ? 1 : b));
             CHECK(b >= 0 && b <= p);
             CHECK(p + f - b >= f);   // the CPU always takes every file-backed miss
         }

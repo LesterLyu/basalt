@@ -364,6 +364,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.drafter_device = o.drafter_device;
         lreq.profile_dir = basalt::platform::install_root() + "/data/profiles";
         lreq.draft_experts = o.draft_experts;
+        lreq.gpu_single_miss = o.gpu_single_miss;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
         const basalt::model::Result r = adapter->load(lreq, loaded);
