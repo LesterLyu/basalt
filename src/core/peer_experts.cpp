@@ -276,7 +276,18 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
 uint64_t PeerExperts::room() const {
     On on(device_);
     size_t free_b = 0, total_b = 0;
-    return cudaMemGetInfo(&free_b, &total_b) == cudaSuccess ? (uint64_t) free_b : 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    char bus[32] = {};
+    uint64_t physical = 0;
+    if (cudaDeviceGetPCIBusId(bus, sizeof bus, device_) == cudaSuccess &&
+        basalt::platform::gpu_physical_free(bus, physical)) {
+        const uint64_t available = std::min<uint64_t>(free_b, physical);
+        basalt::log::info("basalt peer", "CUDA free %.0f MiB, physical headroom %.0f MiB, available %.0f MiB",
+                          (double) free_b / 1048576.0, (double) physical / 1048576.0,
+                          (double) available / 1048576.0);
+        return available;
+    }
+    return (uint64_t) free_b;
 }
 
 bool PeerExperts::open_slots(const std::vector<int64_t>& slot_bytes, std::string& err) {

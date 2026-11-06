@@ -32,7 +32,7 @@ namespace basalt::core {
 
 void ExpertTier::memory_usage(MemoryUsage& usage) const {
     if (!usage.claim(this)) return;
-    usage.device(plan_device_, "experts", cache_.mapped_bytes() + ext_.mapped_bytes());
+    usage.device(device_, "experts", cache_.mapped_bytes() + ext_.mapped_bytes());
     for (const auto& peer : peers_)
         usage.device(peer->device(), "expert_helper", peer->cache().mapped_bytes());
     for (const auto& alloc : ram_allocations_)
@@ -86,6 +86,7 @@ ExpertTier::~ExpertTier() {
 }
 
 bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err) {
+    cudaGetDevice(&device_);
     n_layers_ = s_.n_layers;
     n_expert_ = s_.n_expert;
     uint64_t one_each = 0, one_each_ram = 0;   // bytes of one slot in every layer, of one RAM place in every layer
