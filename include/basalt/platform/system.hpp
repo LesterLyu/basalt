@@ -36,6 +36,9 @@ bool keep_full_speed();
 /// Whether the GPU driver pages device memory out to system memory when a card is full, so that an allocation past
 /// the end succeeds and the work using it stalls, instead of failing the allocation.
 bool gpu_memory_pages();
+/// Unallocated physical device memory from the management driver, addressed by PCI bus id. False with bytes=0
+/// when the driver cannot answer. Independent of the caller's CUDA allocation budget.
+bool gpu_physical_free(const std::string& pci_bus_id, uint64_t& bytes);
 
 /// Puts the three standard streams in binary mode where the C runtime defaults them to text, which would turn each
 /// "\n" the serve protocol writes into "\r\n" and fold a "\r\n" in a request to "\n". For a process whose standard

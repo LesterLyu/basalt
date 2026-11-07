@@ -81,6 +81,10 @@ void QfnRequest::decode_stats_begin() {
     dec_timing = basalt::core::diagnostics().decode_timing;
 
     ds0 = dec_snap();
+    stage0[0] = runtime_.ver.ms_stage_inputs;
+    stage0[1] = runtime_.ver.ms_stage_residency;
+    stage0[2] = runtime_.ver.ms_stage_peer;
+    stage0[3] = runtime_.ver.ms_stage_ple;
     dt_run = 0;
     dt_commit = 0;
     dt_draft = 0;

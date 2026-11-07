@@ -484,7 +484,7 @@ endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/elastic_array.cpp src/core/file_reads.cpp src/core/graph.cpp src/core/weights.cpp src/core/loader.cpp
-                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp)
+                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp src/core/prompt_stage.cpp src/core/peer_copy.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -637,6 +637,13 @@ if(BUILD_TESTING)
   basalt_gpu_test(NAME host_registration_test COMMAND host_registration_test)
   set_tests_properties(host_registration_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
+  add_executable(peer_copy_test tests/core/peer_copy_test.cpp)
+  target_link_libraries(peer_copy_test PRIVATE core)
+  basalt_embed_manifest(peer_copy_test)
+  basalt_gpu_test(NAME peer_copy_test COMMAND peer_copy_test)
+  set_tests_properties(peer_copy_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endif()
+
 if(BASALT_MODEL_QWEN4EXP)
 # the learned expert profile (--expert-profile-save): its order and file format (CPU only)
 if(BUILD_TESTING)

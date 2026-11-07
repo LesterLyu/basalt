@@ -108,12 +108,7 @@ std::string Verifier::dm_note() const {
     s += ", host flag " + std::to_string(rd(h_flag_));
     if (d->pdev >= 0) {
         const uint32_t w = rd(d->h_w + 0), done = rd(d->h_w + 16);
-        std::string st = "not launched";
-        if (d->peer_live) {
-            const OnDevice on(d->pdev);
-            const cudaError_t q = cudaStreamQuery(d->ps);
-            st = q == cudaErrorNotReady ? "running" : q == cudaSuccess ? "finished" : cudaGetErrorString(q);
-        }
+        const char* st = d->peer_live ? "launched (stream not queried)" : "not launched";
         s += "; peer card: rung for ring " + std::to_string(w & 0xffffu) + ((w >> 28) & 1u ? " (with entries)" : "") +
              ", finished ring " + std::to_string(done) + ", its kernel " + st;
         const std::string ab = basalt::kernels::dec_moe_peer_diag(d->h_w + 32);

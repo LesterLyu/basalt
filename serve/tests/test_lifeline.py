@@ -62,19 +62,23 @@ class Flags(unittest.TestCase):
     def test_the_child_setup_makes_a_group_sets_the_death_signal_and_chains(self):
         calls = []
         then = mock.Mock()
-        with mock.patch.object(os, "setpgid", lambda *a: calls.append(("setpgid", a))), \
+        sigkill = getattr(signal, "SIGKILL", 9)
+        with mock.patch.object(os, "setpgid", lambda *a: calls.append(("setpgid", a)), create=True), \
+                mock.patch.object(signal, "SIGKILL", sigkill, create=True), \
                 mock.patch.object(lifeline, "_prctl", lambda *a: calls.append(("prctl", a))), \
                 mock.patch.object(os, "getppid", return_value=77):
             lifeline._child_setup(77, then)()
         self.assertEqual(calls, [("setpgid", (0, 0)),
-                                 ("prctl", (lifeline.PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0))])
+                                 ("prctl", (lifeline.PR_SET_PDEATHSIG, int(sigkill), 0, 0, 0))])
         then.assert_called_once_with()
 
     def test_a_parent_that_already_died_kills_the_child(self):
-        with mock.patch.object(os, "setpgid"), mock.patch.object(lifeline, "_prctl"), \
+        sigkill = getattr(signal, "SIGKILL", 9)
+        with mock.patch.object(os, "setpgid", create=True), \
+                mock.patch.object(signal, "SIGKILL", sigkill, create=True), mock.patch.object(lifeline, "_prctl"), \
                 mock.patch.object(os, "getppid", return_value=1), mock.patch.object(os, "kill") as kill:
             lifeline._child_setup(77)()
-        kill.assert_called_once_with(os.getpid(), signal.SIGKILL)
+        kill.assert_called_once_with(os.getpid(), sigkill)
 
     def test_the_job_object_is_a_no_op_off_windows(self):
         if os.name == "nt":

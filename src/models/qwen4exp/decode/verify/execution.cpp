@@ -111,6 +111,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     gm.mark(12);
     gs_split_ = dm_ != nullptr && gs_mixl_ != nullptr;
     if (gs_split_ && !gs_live_ && !gs_move(true, err)) return false;
+    ms_stage_inputs += ms_since(t0);
     if (dm_ != nullptr) {   // this window's residency, then the peer window ahead of CUDA0's
         if (!dm_begin(err, &gm)) return false;
     }
@@ -176,7 +177,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
-            ms_host += ms_since(tp);
+            const double elapsed = ms_since(tp);
+            ms_host += elapsed;
+            ms_stage_ple += elapsed;
         }
         ar_handoff();
     } else {
@@ -188,7 +191,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
         *(volatile uint32_t*) (h_flag_ + 8) = 1;
-        ms_host += ms_since(tp);
+        const double elapsed = ms_since(tp);
+        ms_host += elapsed;
+        ms_stage_ple += elapsed;
     }
     fl_.ple_early = ple_early;
     }
@@ -285,7 +290,9 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return -1;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             _mm_sfence();
-            ms_host += ms_since(tp);
+            const double elapsed = ms_since(tp);
+            ms_host += elapsed;
+            ms_stage_ple += elapsed;
         }
         *flag = want;
         if (dm_ != nullptr && dm_->warm != nullptr && l + 1 < le_) {   // the next layer's warm-up
