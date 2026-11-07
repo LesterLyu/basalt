@@ -88,3 +88,17 @@ Reference: [quality](quality.md#the-bf16-reference). Two cards, 400 W + 180 W, 2
 
 Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 200 tokens after it match `--no-prompt-skip` closely
 (KL mean 6.2e-4 between the two runs).
+## Optional routed expert replacements
+
+`--expert-overlay FILE` loads a Basalt sidecar tied to the exact base pack header. The sidecar contains
+`overlay.base-header`, a text `overlay.layout` starting with `BASALT_DS_EXPERTS_V1` and rows
+`layer expert gate_up_type down_type offset bytes`, and the contiguous `experts` section (gate, up, down).
+Only the listed target experts change. The router, shared experts and DSpark weights keep their original precision.
+The primary GPU holds one copy across slots; this reduces memory available to the ordinary expert cache.
+The window and prompt paths use the replacement format before applying router weights. Disk KV reuse is disabled
+for an overlay. Removing the flag restores the base weights.
+
+Q2_K overlay rows use the shared upstream Q2_K dot product. The former overlay-only dot is removed; its
+accumulation order differs, so bitwise identity with that implementation is not assumed. Overlay quality and
+interleaved DSpark parity after this integration have not been remeasured. Each slot owns its captured drafter
+body graph because that graph binds its ring addresses; the head graphs and weights remain shared.

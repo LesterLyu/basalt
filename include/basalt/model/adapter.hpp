@@ -95,6 +95,7 @@ struct LoadRequest {
     int drafter_device = -1;          ///< diagnostic: the CUDA device it runs on (-1: the main card)
     std::string profile_dir;          ///< the engine's data/profiles, where a model finds the files its name keys
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
+    std::string expert_overlay;       ///< optional target expert replacement pack
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     bool gpu_single_miss = false;     ///< DeepSeek: fetch a lone RAM expert for the main GPU
 };

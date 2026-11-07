@@ -13,14 +13,66 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <sstream>
 
 namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
+    if (overlay_device_) cudaFree(overlay_device_);
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (embd_fd_ >= 0) platform::close_fd(embd_fd_);
     if (experts_fd_ >= 0) platform::close_fd(experts_fd_);
+}
+
+bool DsModel::load_overlay(const std::string& path, std::string& err) {
+    core::ModelFile file;
+    if (!file.open(path, err)) return false;
+    auto layout = file.range("overlay.layout"), header = file.range("overlay.base-header"), data = file.range("experts");
+    if (!layout.bytes || layout.bytes > 4*1024*1024 || header.bytes != core::kHeaderBytes || !data.bytes) {
+        err = "missing or invalid overlay section"; return false;
+    }
+    std::vector<uint8_t> ref, actual(core::kHeaderBytes), text;
+    if (!file.read("overlay.base-header", ref, err) ||
+        !core::read_range_at(core::FileRange(path_, 0, core::kHeaderBytes), 0, actual.data(), actual.size(), err) ||
+        !file.read("overlay.layout", text, err)) return false;
+    if (ref != actual) { err = "overlay belongs to a different base pack"; return false; }
+    std::istringstream in(std::string(text.begin(), text.end()));
+    std::string magic; in >> magic;
+    if (magic != "BASALT_DS_EXPERTS_V1") {err = "unknown overlay format"; return false;}
+    const auto& g = geo();
+    overlay_.resize((size_t) g.n_layers*g.n_expert);
+    std::vector<std::pair<size_t,uint64_t>> entries;
+    uint64_t cursor = 0;
+    while (in >> std::ws && !in.eof()) {
+        int l,e,gu,d; uint64_t off,bytes;
+        if (!(in >> l >> e >> gu >> d >> off >> bytes) || l<0 || l>=g.n_layers || e<0 || e>=g.n_expert ||
+            off!=cursor || !bytes || bytes>data.bytes-cursor ||
+            !((gu==19 || gu==16 || gu==17 || gu==22) && (d==10 || d==16 || d==17 || d==18 || d==19 || d==22))) {
+            err="invalid overlay entry or unsupported format"; return false;
+        }
+        const size_t key=(size_t)l*g.n_expert+e;
+        auto& ent=overlay_[key];
+        if (ent.layout.bytes) {err="duplicate overlay expert"; return false;}
+        ent.layout=kernels::native_expert_layout(gu,d,g.n_embd,g.n_ff_exp);
+        if (ent.layout.bytes!=bytes) {err="overlay expert size does not match quantization"; return false;}
+        entries.emplace_back(key,off); cursor+=bytes;
+    }
+    if (cursor!=data.bytes || entries.empty()) {err="incomplete overlay layout"; return false;}
+    if (cudaMalloc(&overlay_device_,cursor)!=cudaSuccess) {err="not enough device memory for expert overlay";return false;}
+    std::vector<uint8_t> chunk(8<<20);
+    for (uint64_t at=0;at<cursor;) {
+        const size_t n=(size_t)std::min<uint64_t>(chunk.size(),cursor-at);
+        if (!core::read_range_at(data,at,chunk.data(),n,err)) return false;
+        if (cudaMemcpy((uint8_t*)overlay_device_+at,chunk.data(),n,cudaMemcpyHostToDevice)!=cudaSuccess) {
+            err="cannot upload expert overlay";return false;
+        }
+        at+=n;
+    }
+    for (auto [i,off]:entries) overlay_[i].blob=(uint8_t*)overlay_device_+off;
+    overlay_bytes_=cursor;
+    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB on GPU %d",entries.size(),cursor/1073741824.,device_);
+    return true;
 }
 
 bool DsModel::load(const std::string& path, std::string& err) {

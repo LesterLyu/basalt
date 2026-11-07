@@ -581,6 +581,8 @@ public:
         constexpr int kRows = ExpertTier::kMaxK;   // routed outputs of a window: tokens x slots
         constexpr size_t kPlanBytes = std::max(sizeof(ExpertPlan), sizeof(WindowPlan));
         share_g_.assign((size_t) g_.n_layers * (kMaxK + 1), nullptr);
+        if (m_.has_overlay() && !alloc(&overlay_scratch_, kernels::gated_mlp_scratch_bytes(1, g_.n_ff_exp)))
+            return oom(err);
         if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
             !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp)) ||
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
@@ -761,6 +763,7 @@ public:
         WindowRowPtrs rp{};
         for (int r = 0; r < T * K; ++r)
             rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
+        if (m_.has_overlay()) apply_overlay(il,T,K,h_ids_,rp.p,stream);
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
@@ -892,6 +895,7 @@ public:
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
+        if (m_.has_overlay()) apply_overlay(il,1,K,lk.experts,rp.p,stream);
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
@@ -932,6 +936,17 @@ private:
         *p = v;
         return true;
     }
+    void apply_overlay(int layer, int rows, int k, const int32_t* ids, const float** result, void* stream) {
+        const auto stride = kernels::native_q8_1_bytes(g_.n_embd, 1);
+        for (int i=0; i<rows*k; ++i) {
+            const auto* v = m_.replacement(layer, ids[i]);
+            if (!v) continue;
+            float* dst = ex_rows_ + (size_t)i*g_.n_embd;
+            const void* x = (const uint8_t*)ex_xq_ + (i/k)*stride;
+            kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[layer],v->blob,1,1,x,overlay_scratch_,dst,stream);
+            result[i] = dst;
+        }
+    }
     static bool oom(std::string& err) {
         err = "out of device memory for the attention state";
         return false;
@@ -958,6 +973,7 @@ private:
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;
     void* ex_plan2_ = nullptr;
+    void* overlay_scratch_ = nullptr;
     bool ids_read_ = false;   ///< this layer took the mapped ids and has not cleared them yet
     float* ex_rows_ = nullptr;
     ExpertPlan* h_plan_ = nullptr;

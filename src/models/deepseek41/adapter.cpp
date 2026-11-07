@@ -33,6 +33,8 @@ public:
         auto m = std::make_unique<DsModel>();
         std::string err;
         if (!m->load(req.paths.front(), err)) return {model::Status::Error, "deepseek41: " + err};
+        if (!req.expert_overlay.empty() && !m->load_overlay(req.expert_overlay, err))
+            return {model::Status::Error, "deepseek41: expert overlay: " + err};
         if (!m->resolve_context(req.max_context, err)) return {model::Status::Error, err};
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
@@ -81,6 +83,7 @@ public:
         else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
+        else if (a == "--expert-overlay") o.expert_overlay = args.next("--expert-overlay");
         else if (a == "--ds-gpu-single-miss") o.gpu_single_miss = true;
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
@@ -92,6 +95,10 @@ public:
 
     // A context the pack refuses is refused with the flags, before anything loads; the memory check needs the card.
     std::optional<int> finish_flags(program::CommonOptions& o) const override {
+        if (!o.expert_overlay.empty() && o.conversation_cache_disk_mib > 0) {
+            basalt::log::error("basalt deepseek41", "disk conversation cache must be off with --expert-overlay");
+            return 2;
+        }
         if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {
             basalt::log::error("basalt deepseek41", "--draft-experts %d: 32, 64, 96 or 128, or 0 for all", o.draft_experts);
             return 2;

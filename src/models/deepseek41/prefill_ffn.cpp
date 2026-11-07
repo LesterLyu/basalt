@@ -84,6 +84,9 @@ public:
                   dev(xq2_, mmq::q8_bytes((int64_t) R, g_.n_ff_exp));
         ok = ok && dev(gu_, R * 2 * ff * 4) && dev(h_, R * ff * 4);
         ok = ok && dev(ident_, R * 4) && dev(rows_, E * n * 4) && dev(sbnd_, 8 * 4);
+        if (m_.has_overlay())
+            ok = ok && dev(overlay_x_, kernels::native_q8_1_bytes(g_.n_embd,1)) &&
+                 dev(overlay_scratch_, kernels::gated_mlp_scratch_bytes(1,g_.n_ff_exp));
         for (int i = 0; i < 2; ++i) {
             Stage& b = stage_[i];
             b.host = host.stage[i];
@@ -124,7 +127,7 @@ public:
         if (il == 0) {
             stop_prefetch();
             ahead_ = false;
-            if (tier_ && (int64_t) T * K >= prefillp::kAheadPairs) ahead_ = start_ahead();
+            if (!m_.has_overlay() && tier_ && (int64_t) T * K >= prefillp::kAheadPairs) ahead_ = start_ahead();
         }
         if (ahead_) return routed_ahead(il, T, x, ids, w, out, st, err);
         std::vector<int32_t> hid((size_t) T * K);
@@ -140,7 +143,7 @@ public:
         }
         std::vector<int> used;
         for (int e = 0; e < g_.n_expert; ++e)
-            if (!by[(size_t) e].empty()) used.push_back(e);
+            if (!by[(size_t) e].empty() && !m_.replacement(il,e)) used.push_back(e);
         Share share;
         if (tier_ && !plan_share(il, T, x, by, used, share, err)) return false;
 
@@ -257,6 +260,20 @@ public:
             b0 += (size_t) nb;
         }
         if (!finish_share(share, stream, err)) return false;
+        if (m_.has_overlay()) {
+            for (int t=0; t<T; ++t) {
+                bool quantized = false;
+                for (int k=0; k<K; ++k) {
+                    int row = t*K+k;
+                    const auto* v = m_.replacement(il,hid[row]);
+                    if (!v) continue;
+                    if (!quantized) kernels::quantize_q8_1_rows(x+(size_t)t*g_.n_embd,1,g_.n_embd,overlay_x_,stream);
+                    quantized = true;
+                    kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[il],v->blob,1,1,overlay_x_,overlay_scratch_,
+                                               rows_+(size_t)row*g_.n_embd,stream);
+                }
+            }
+        }
         weighted_sum_tokens(rows_, w, T, K, g_.n_embd, out, stream);
         return true;
     }
@@ -796,6 +813,7 @@ private:
     std::vector<void*> dev_;
     uint64_t allocated_bytes_ = 0;
     void *xq1_ = nullptr, *xq2_ = nullptr;
+    void *overlay_x_ = nullptr, *overlay_scratch_ = nullptr;
     int32_t *ident_ = nullptr, *sbnd_ = nullptr;
     float *gu_ = nullptr, *h_ = nullptr, *rows_ = nullptr;
     float *hx_ = nullptr, *hrows_ = nullptr, *peer_rows_ = nullptr, *xb_ = nullptr, *drows_ = nullptr;

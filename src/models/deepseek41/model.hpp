@@ -3,6 +3,7 @@
 #pragma once
 
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/vision/mmproj.hpp"
@@ -38,6 +39,17 @@ public:
     ~DsModel() override;
     /// Reads the pack and uploads every dense tensor except the token embedding (read per token from the file).
     bool load(const std::string& path, std::string& err);
+    bool load_overlay(const std::string& path, std::string& err);
+    struct Replacement {
+        kernels::NativeExpertLayout layout;
+        const void* blob = nullptr;
+    };
+    bool has_overlay() const { return overlay_device_ != nullptr; }
+    const Replacement* replacement(int l, int e) const {
+        if (!has_overlay()) return nullptr;
+        const auto& v = overlay_[(size_t) l * geo().n_expert + e];
+        return v.blob ? &v : nullptr;
+    }
 
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
@@ -48,6 +60,7 @@ public:
 
     void memory_usage(core::MemoryUsage& usage) const override {
         if (!usage.claim(this)) return;
+        if (overlay_bytes_) usage.device(device_, "expert_overlay", overlay_bytes_);
         for (const auto& [name, t] : dev_) if (t.ptr) usage.device(device_, "weights", t.bytes);
     }
     const Pack& pack() const { return pack_; }
@@ -94,6 +107,9 @@ public:
     bool open_mmproj(vision::Mmproj& mp, std::string& err) const;
 
 private:
+    std::vector<Replacement> overlay_;
+    void* overlay_device_ = nullptr;
+    size_t overlay_bytes_ = 0;
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;
