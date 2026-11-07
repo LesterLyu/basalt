@@ -581,8 +581,6 @@ public:
         constexpr int kRows = ExpertTier::kMaxK;   // routed outputs of a window: tokens x slots
         constexpr size_t kPlanBytes = std::max(sizeof(ExpertPlan), sizeof(WindowPlan));
         share_g_.assign((size_t) g_.n_layers * (kMaxK + 1), nullptr);
-        if (m_.has_overlay() && !alloc(&overlay_scratch_, kernels::gated_mlp_scratch_bytes(1, g_.n_ff_exp)))
-            return oom(err);
         if (!alloc(&ex_xq_, kernels::native_q8_1_bytes(g_.n_embd, kMaxT)) ||
             !alloc(&ex_scr_, kernels::native_expert_scratch_bytes(kRows, g_.n_ff_exp)) ||
             !alloc((void**) &ex_rows_, (size_t) kRows * g_.n_embd * 4) ||
@@ -757,6 +755,7 @@ public:
             tier_->await_fetch(st);
             if (ng) gpu_share(plan, ex_plan2_, ng, entries);
         }
+        if (m_.has_overlay()) run_overlay(il, T, K, h_ids_, lk, stream);
         // the CPU's share ran while the GPU works; its rows land in their rows
         if (cpu) {
             join.now();
@@ -766,7 +765,6 @@ public:
         WindowRowPtrs rp{};
         for (int r = 0; r < T * K; ++r)
             rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
-        if (m_.has_overlay()) apply_overlay(il,T,K,h_ids_,lk,rp.p,stream);
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
@@ -888,12 +886,13 @@ public:
             const int ng = make_plan(plan2, true);
             tier_->await_fetch(st);
             if (ng) {
-            put_words(&plan2, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
-            ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
-            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng,
-                                                   ng, ex_xq_, ex_scr_, ex_rows_, stream);
+                put_words(&plan2, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
+                ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
+                kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok,
+                                                       ng, ng, ex_xq_, ex_scr_, ex_rows_, stream);
             }
         }
+        if (m_.has_overlay()) run_overlay(il, 1, K, lk.experts, lk, stream);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
         if (cpu) {
             join.now();
@@ -903,7 +902,6 @@ public:
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
-        if (m_.has_overlay()) apply_overlay(il,1,K,lk.experts,lk,rp.p,stream);
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
@@ -944,18 +942,30 @@ private:
         *p = v;
         return true;
     }
-    void apply_overlay(int layer, int rows, int k, const int32_t* ids, const ExpertTier::Lookup& lk, const float** result, void* stream) {
-        const auto stride = kernels::native_q8_1_bytes(g_.n_embd, 1);
-        for (int i=0; i<rows*k; ++i) {
-            const auto* v = m_.replacement(layer, ids[i]);
-            if (!v) continue;
-            float* dst = ex_rows_ + (size_t)i*g_.n_embd;
-            const void* x = (const uint8_t*)ex_xq_ + (i/k)*stride;
-            int u = 0;
-            while (u < lk.k && lk.experts[u] != ids[i]) ++u;
-            if (u == lk.k || !lk.dev[u]) continue;
-            kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[layer],lk.dev[u],1,1,x,overlay_scratch_,dst,stream);
-            result[i] = dst;
+    void run_overlay(int layer, int rows, int k, const int32_t* ids, const ExpertTier::Lookup& lk, void* stream) {
+        bool done[ExpertTier::kMaxK]{};
+        for (int u = 0; u < lk.k; ++u) {
+            const auto* v = m_.replacement(layer, lk.experts[u]);
+            if (!v || !lk.dev[u] || done[u]) continue;
+            WindowPlan p{};
+            int groups = 0, entries = 0;
+            for (int j = u; j < lk.k; ++j) {
+                const auto* w = m_.replacement(layer, lk.experts[j]);
+                if (!w || !lk.dev[j] || w->layout.gu_type != v->layout.gu_type || w->layout.d_type != v->layout.d_type) continue;
+                done[j] = true;
+                p.ptr[groups] = (unsigned long long)lk.dev[j];
+                p.start[groups++] = entries;
+                for (int r = 0; r < rows * k; ++r) if (ids[r] == lk.experts[j]) {
+                    p.dst[entries] = r; p.tok[entries++] = r / k;
+                }
+            }
+            p.start[groups] = entries;
+            p.ng[0] = groups;
+            // Plan words are passed by value; scratch and device metadata are reused in stream order.
+            put_words(&p, ex_plan2_, (int)(sizeof(p)/4), stream);
+            auto* dp = (WindowPlan*)ex_plan2_;
+            kernels::native_expert_grouped_clamped(v->layout, g_.clamp_exp[layer], dp->ptr, dp->start, dp->ng,
+                                                   dp->dst, dp->tok, groups, entries, ex_xq_, ex_scr_, ex_rows_, stream);
         }
     }
     static bool oom(std::string& err) {
@@ -984,7 +994,6 @@ private:
     float *kvraw_ = nullptr, *qr_ = nullptr, *q_ = nullptr, *attn_ = nullptr, *oa_ = nullptr, *mws_ = nullptr;
     void *ex_plan_ = nullptr, *d_plan_host_ = nullptr, *ex_xq_ = nullptr, *ex_scr_ = nullptr;
     void* ex_plan2_ = nullptr;
-    void* overlay_scratch_ = nullptr;
     bool ids_read_ = false;   ///< this layer took the mapped ids and has not cleared them yet
     float* ex_rows_ = nullptr;
     ExpertPlan* h_plan_ = nullptr;

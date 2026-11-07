@@ -12,6 +12,7 @@
 #include "basalt/platform/memory.hpp"
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
+#include "models/deepseek41/tier_slots.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -148,22 +149,22 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     const Geometry& g = m_.geo();
     n_layers_ = g.n_layers;
     n_expert_ = g.n_expert;
-    uint64_t one_each = 0, one_each_ram = 0;   // bytes of one slot in every layer, of one RAM place in every layer
+    uint64_t one_each_ram = 0;
     for (int l = 0; l < n_layers_; ++l) {
         const auto& e = m_.pack().experts[l];
-        const uint64_t capacity = std::max<uint64_t>(e.blob_bytes, m_.overlay_max_bytes(l));
-        device_slot_bytes_.push_back(capacity);
-        one_each += (capacity + 255) / 256 * 256;
         one_each_ram += e.blob_bytes;
+        std::vector<uint64_t> sizes;
+        for (int expert = 0; expert < n_expert_; ++expert) sizes.push_back(std::max<uint64_t>(e.blob_bytes, expert_bytes(l,expert)));
+        std::sort(sizes.begin(), sizes.end());
+        sorted_blob_bytes_.push_back(std::move(sizes));
     }
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         err = "deepseek41: cannot query the free device memory";
         return false;
     }
-    one_each_ = one_each;
     auto slots_in = [&](uint64_t room, uint64_t left_free) {
-        return (int) std::min<uint64_t>(room > left_free ? (room - left_free) / one_each : 0, (uint64_t) n_expert_);
+        return slots_fit(room, left_free, n_expert_);
     };
     if (!load_rank(err)) return false;
     base_count_.resize(n_layers_);
@@ -184,12 +185,14 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     }
 
     int peer_slots = 0;
+    uint64_t peer_room = 0;
     if (m_.peer_device() >= 0) {
         peer_ = std::make_unique<core::PeerExperts>();
         std::string pe;
         if (peer_->open_plain(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_rows, pe)) {
             const uint64_t reserve = (uint64_t) m_.tiers().peer_reserve_mib << 20;
-            peer_slots = (int) std::min<uint64_t>(peer_->room() > reserve ? (peer_->room() - reserve) / one_each : 0, n_expert_);
+            peer_room = peer_->room();
+            peer_slots = slots_fit(peer_room, reserve, n_expert_, 0, false, true);
         } else {
             basalt::log::warn("basalt deepseek41", "second card not used: %s", pe.c_str());
             peer_.reset();
@@ -227,37 +230,66 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     }
     // Rank replacements with ordinary experts. Their immutable RAM bank is already allocated;
     // count only the remaining base weights against the complement's RAM budget.
-    auto layout = [&](int main) { return policy::Homes{main, peer_slots, n_expert_ - main - peer_slots, 0}; };
-    int required = 0;
-    for (int l = 0; l < n_layers_; ++l) {
-        int count = 0;
-        for (int r = 0; r < n_expert_; ++r)
-            if (!m_.replacement(l, ranked(l,r)) && policy::place_of_rank(layout(0), copies, r) == policy::Place::Ram) ++count;
-        required = std::max(required, count);
-    }
-    homes_ = layout(required > ram_slots ? main_homes : 0);
-    layer_homes_.resize(n_layers_);
     uint64_t planned_ram = 0;
-    int max_ram = 0, max_file = 0;
-    for (int l = 0; l < n_layers_; ++l) {
-        int left = 0;
-        for (int r = 0; r < n_expert_; ++r)
-            if (!m_.replacement(l, ranked(l,r)) && policy::place_of_rank(homes_, copies, r) == policy::Place::Ram) ++left;
-        auto& h = layer_homes_[l];
-        h = homes_;
-        h.ram = std::min(left, ram_slots);
-        h.file = left - h.ram;
-        max_ram = std::max(max_ram, h.ram);
-        max_file = std::max(max_file, h.file);
-        const int count = h.ram;
-        if (count > 0) planned_ram += (uint64_t) (count + 1) * m_.pack().experts[l].blob_bytes;
-    }
-    homes_.ram = max_ram;
-    homes_.file = max_file;
-    if (!m_.has_overlay()) {
-        homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots);
-        std::fill(layer_homes_.begin(), layer_homes_.end(), homes_);
-        planned_ram = homes_.ram > 0 ? (uint64_t)(homes_.ram + 1) * one_each_ram : 0;
+    bool keep_main_homes = false;
+    auto plan_homes = [&] {
+        auto layout = [&](int main) { return policy::Homes{main, peer_slots, n_expert_ - main - peer_slots, 0}; };
+        int required = 0;
+        for (int l = 0; l < n_layers_; ++l) {
+            int count = 0;
+            for (int r = 0; r < n_expert_; ++r)
+                if (!m_.replacement(l, ranked(l,r)) && policy::place_of_rank(layout(0), copies, r) == policy::Place::Ram) ++count;
+            required = std::max(required, count);
+        }
+        homes_ = layout(required > ram_slots || keep_main_homes ? main_homes : 0);
+        layer_homes_.resize(n_layers_);
+        planned_ram = 0;
+        int max_ram = 0, max_file = 0;
+        for (int l = 0; l < n_layers_; ++l) {
+            int left = 0;
+            for (int r = 0; r < n_expert_; ++r)
+                if (!m_.replacement(l, ranked(l,r)) && policy::place_of_rank(homes_, copies, r) == policy::Place::Ram) ++left;
+            auto& h = layer_homes_[l];
+            h = homes_;
+            h.ram = std::min(left, ram_slots);
+            h.file = left - h.ram;
+            max_ram = std::max(max_ram, h.ram);
+            max_file = std::max(max_file, h.file);
+            const int count = h.ram;
+            if (count > 0) planned_ram += (uint64_t) (count + 1) * m_.pack().experts[l].blob_bytes;
+        }
+        homes_.ram = max_ram;
+        homes_.file = max_file;
+        if (!m_.has_overlay()) {
+            homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots);
+            std::fill(layer_homes_.begin(), layer_homes_.end(), homes_);
+            planned_ram = homes_.ram > 0 ? (uint64_t)(homes_.ram + 1) * one_each_ram : 0;
+        }
+    };
+    plan_homes();
+    keep_main_homes = homes_.main > 0;
+    if (peer_ && m_.has_overlay()) {
+        const uint64_t reserve = (uint64_t)m_.tiers().peer_reserve_mib << 20;
+        // The conservative estimate opens the host buffers safely. Once the home/copy
+        // arrangement is known, use its actual ranked formats to fill the helper's budget.
+        for (int pass = 0; pass < 4; ++pass) {
+            const int first = homes_.main > 0 ? main_homes : copies;
+            int fit = slots_fit(peer_room,reserve,n_expert_-first,first);
+            if (m_.tiers().diag_tier_peer >= 0) fit = std::min(fit,m_.tiers().diag_tier_peer);
+            if (fit == peer_slots) break;
+            peer_slots = fit;
+            if (!host_.set_ring(prefillp::kRingPieces,err)) return false;
+            avail = available(); ram_slots = ram_in();
+            plan_homes();
+        }
+        // A changed RAM arrangement can change the helper's start rank. Refuse any
+        // overshoot after iteration; reducing its slots always leaves the RAM plan valid.
+        for (;;) {
+            uint64_t bytes = 0;
+            for (auto b : slot_sizes(peer_slots,homes_.main > 0 ? homes_.main : copies)) bytes += ((uint64_t)b+255)/256*256;
+            if (bytes + reserve <= peer_room || peer_slots == 0) break;
+            --peer_slots; plan_homes();
+        }
     }
     const uint64_t ram_floor = ram_reserve + core::pin_tracking_bytes(planned_ram);
     if (homes_.peer == 0) peer_.reset();
@@ -270,9 +302,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         err = "deepseek41: not enough device memory for the expert tier";
         return false;
     }
-    std::vector<int64_t> slot_bytes;
-    for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < per_layer_; ++s) slot_bytes.push_back((int64_t) device_slot_bytes_[l]);
+    const auto slot_bytes = slot_sizes((int)per_layer_);
     if (!slot_bytes.empty() && !cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
@@ -432,14 +462,22 @@ bool ExpertTier::load_ram(std::string& err) {
     if (homes_.main > 0 || homes_.peer > 0) device_home.assign((size_t) n_layers_ * n_expert_, -1);
     if (peer_) {
         peer_owner_.assign((size_t) n_layers_ * homes_.peer, -1);
-        std::vector<int64_t> sizes;
-        for (int l = 0; l < n_layers_; ++l)
-            for (int s = 0; s < homes_.peer; ++s) sizes.push_back((int64_t) device_slot_bytes_[l]);
+        const auto sizes = slot_sizes(homes_.peer, homes_.main > 0 ? homes_.main : (int)copies);
         if (!peer_->open_slots(sizes, err)) return false;
     }
     for (int l = 0; l < n_layers_; ++l) {
         std::vector<int> held;
-        int n_main = 0, n_peer = 0;
+        auto empty_slot = [&](bool helper, uint64_t bytes) {
+            const int count = helper ? homes_.peer : (int)per_layer_;
+            const auto& owners = helper ? peer_owner_ : owner_;
+            const auto& cache = helper ? peer_->cache() : cache_;
+            int found = -1; uint64_t capacity = ~0ull;
+            for (int s = l * count; s < (l+1) * count; ++s) {
+                const uint64_t cap = cache.bytes_of(s+1)-cache.bytes_of(s);
+                if (owners[s] < 0 && cap >= bytes && cap < capacity) { found=s; capacity=cap; }
+            }
+            return found;
+        };
         const policy::Homes placement = m_.has_overlay() ?
             policy::Homes{homes_.main, homes_.peer, n_expert_ - homes_.main - homes_.peer, 0} : homes_;
         for (int r = 0; r < n_expert_; ++r) {
@@ -448,14 +486,16 @@ bool ExpertTier::load_ram(std::string& err) {
             const size_t idx = (size_t) l * n_expert_ + e;
             switch (policy::place_of_rank(placement, (int) copies, r)) {
                 case policy::Place::Main: {
-                    const int32_t slot = (int32_t) ((int64_t) l * per_layer_ + n_main++);
+                    const int32_t slot = empty_slot(false, expert_bytes(l,e));
+                    if (slot < 0) { err="deepseek41: primary slot layout cannot hold its ranked experts"; return false; }
                     res_[idx] = slot;
                     owner_[(size_t) slot] = e;
                     if (!replacement) device_home[idx] = slot;
                     break;
                 }
                 case policy::Place::Peer: {
-                    const int32_t slot = (int32_t) ((int64_t) l * homes_.peer + n_peer++);
+                    const int32_t slot = empty_slot(true, expert_bytes(l,e));
+                    if (slot < 0) { err="deepseek41: helper slot layout cannot hold its ranked experts"; return false; }
                     peer_->admit(l, e, slot);
                     peer_owner_[(size_t) slot] = e;
                     if (!replacement) device_home[idx] = slot;
@@ -774,6 +814,48 @@ const uint8_t* ExpertTier::slot_ptr(int32_t slot) const {
     return slot < nb ? cache_.device_slot(slot) : ext_.device_slot((int32_t) (slot - nb));
 }
 
+uint64_t ExpertTier::slot_capacity(int32_t slot) const {
+    const int64_t nb = (int64_t)n_layers_ * per_layer_;
+    const auto& arena = slot < nb ? cache_ : ext_;
+    const int s = slot < nb ? slot : (int)(slot-nb);
+    return arena.bytes_of(s+1)-arena.bytes_of(s);
+}
+
+std::vector<int64_t> ExpertTier::slot_sizes(int n, int rank_start, bool seed, bool conservative) const {
+    std::vector<int64_t> result;
+    if (n <= 0) return result;
+    result.reserve((size_t)n_layers_*n);
+    for (int l = 0; l < n_layers_; ++l) {
+        std::vector<uint64_t> initial;
+        if (conservative) {
+            const auto& sorted = sorted_blob_bytes_[l];
+            for (int i = 0; i < n; ++i) initial.push_back(sorted[sorted.size()-n+i]);
+        } else {
+            for (int r = rank_start; r < n_expert_ && (int)initial.size() < n; ++r) {
+                const int e = ranked(l,r);
+                if (seed && (!pinned(l,e) || res_[(size_t)l*n_expert_+e] >= 0 || (peer_ && peer_->slot_ptr(l,e)))) continue;
+                initial.push_back(expert_bytes(l,e));
+            }
+            initial.resize(n, m_.pack().experts[l].blob_bytes);
+        }
+        auto sizes = policy::mixed_slot_sizes(sorted_blob_bytes_[l],std::move(initial));
+        result.insert(result.end(),sizes.begin(),sizes.end());
+    }
+    return result;
+}
+
+int ExpertTier::slots_fit(uint64_t free, uint64_t keep, int maximum, int rank_start, bool seed, bool conservative) const {
+    if (free <= keep) return 0;
+    const uint64_t budget = free-keep;
+    int fit = 0;
+    for (int n = 1; n <= maximum; ++n) {
+        uint64_t bytes = 0;
+        for (const auto b : slot_sizes(n,rank_start,seed,conservative)) bytes += ((uint64_t)b+255)/256*256;
+        if (bytes <= budget) fit = n;
+    }
+    return fit;
+}
+
 void ExpertTier::drain() {
     for (const Pending& p : pending_) {
         cudaEventSynchronize(events_[(size_t) p.event]);
@@ -997,16 +1079,24 @@ void ExpertTier::start_cpu_window(int layer, const float* x, const Lookup& lk, c
 
 void ExpertTier::finish_cpu() { pool_->finish_split_multi_native(); }
 
-int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best) const {
+int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best, uint64_t bytes) const {
     int32_t slot = -1;
     best = ~0ull;
+    uint64_t best_capacity = ~0ull;
+    bool best_empty = false;
     auto scan = [&](int64_t lo, int64_t n) {
         for (int64_t s = lo; s < lo + n; ++s) {
             if (busy_[(size_t) s]) continue;
+            const uint64_t capacity = slot_capacity((int)s);
+            if (capacity < bytes) continue;
             const int32_t o = owner_[(size_t) s];
             const uint64_t st = o < 0 ? 0 : stamp_[(size_t) layer * n_expert_ + o];
-            if (st < best) {
+            const bool empty = o < 0;
+            if (st != tick_ && ((empty && !best_empty) || (empty == best_empty &&
+                (capacity < best_capacity || (capacity == best_capacity && st < best))))) {
                 best = st;
+                best_capacity = capacity;
+                best_empty = empty;
                 slot = (int32_t) s;
             }
         }
@@ -1022,22 +1112,27 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     const size_t base = (size_t) layer * n_expert_;
     int32_t slot = -1;
     uint64_t oldest = ~0ull;
+    uint64_t best_capacity = ~0ull;
+    const uint64_t bytes = expert_bytes(layer,e);
     for (int64_t s = (int64_t) layer * homes_.peer; s < (int64_t) (layer + 1) * homes_.peer; ++s) {
         const uint64_t st = stamp_[base + peer_owner_[(size_t) s]];
-        if (st != tick_ && st < oldest) {   // not in use by this very lookup
+        const auto& arena = peer_->cache();
+        const uint64_t capacity = arena.bytes_of(s+1)-arena.bytes_of(s);
+        if (capacity < bytes) continue;
+        if (st != tick_ && (capacity < best_capacity || (capacity == best_capacity && st < oldest))) {
             oldest = st;
+            best_capacity = capacity;
             slot = (int32_t) s;
         }
     }
     uint64_t on_main = ~0ull;
-    oldest_slot(layer, /*homes_too=*/true, on_main);
+    oldest_slot(layer, /*homes_too=*/true, on_main, bytes);
     if (slot < 0 || oldest >= on_main) return false;
     const int victim = peer_owner_[(size_t) slot];
     const bool needs_home = !pinned(layer, victim);
     if (needs_home && !ensure_spare(layer)) return false;
     const int32_t place = needs_home ? spare_[layer] : -1;
     if (needs_home) spare_[layer] = -1;
-    const uint64_t bytes = expert_bytes(layer,e);
     const uint64_t out_bytes = needs_home ? expert_bytes(layer,victim) : 0;
     auto* out = needs_home ? ram_place(layer,place) : nullptr;
     if (peer_submitter_) {
@@ -1081,7 +1176,7 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
         return -1;
     }
     uint64_t best = ~0ull;
-    const int32_t slot = oldest_slot(layer, homes_too, best);
+    const int32_t slot = oldest_slot(layer, homes_too, best, expert_bytes(layer,e));
     if (slot < 0 || best == tick_) return -1;   // every slot is in use by this very lookup
     const int32_t o = owner_[(size_t) slot];
     if (o >= 0) res_[(size_t) layer * n_expert_ + o] = -1;
@@ -1219,11 +1314,10 @@ bool ExpertTier::reclaim(std::string& err) {
         err = "deepseek41: cannot query the free device memory";
         return false;
     }
-    const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
+    int64_t n = slots_fit(free_b, free_floor_, (int)lent_per_layer_);
+    if (n < lent_per_layer_) n = slots_fit(free_b, reserve_ + free_floor_, (int)lent_per_layer_);
     if (n < 1) return true;   // nothing fits above the reserve: the slots stay lent
-    std::vector<int64_t> slot_bytes;
-    for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) device_slot_bytes_[l]);
+    const auto slot_bytes = slot_sizes((int)n);
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
     per_layer_ = n;
     lent_per_layer_ = 0;
@@ -1236,11 +1330,10 @@ void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
-    const int64_t n = policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
+    const int limit = (int)(cap_per_layer_ >= 0 ? std::min<int64_t>(n_expert_,cap_per_layer_) : n_expert_);
+    const int64_t n = slots_fit(free_b, reserve_ + (token_ > 0 ? 0 : modules_) + free_floor_, limit-(int)per_layer_, 0, true);
     if (n < 1) return;
-    std::vector<int64_t> slot_bytes;
-    for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) device_slot_bytes_[l]);
+    const auto slot_bytes = slot_sizes((int)n,0,true);
     std::string err;
     if (!ext_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
         basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot grow: %s", err.c_str());
@@ -1260,10 +1353,22 @@ void ExpertTier::grow() {
 void ExpertTier::set_free_floor(int64_t mib) { free_floor_ = mib < 0 ? start_floor_ : (uint64_t) mib << 20; }
 
 void ExpertTier::report(const char* tag) const {
-    if (m_.has_overlay())
+    if (m_.has_overlay()) {
         basalt::log::info("basalt deepseek41", "overlay %s: primary=%lld peer=%lld cpu_rows=%lld admissions=%lld peer_swaps=%lld", tag,
                          (long long) overlay_hits_, (long long) overlay_peer_, (long long) overlay_cpu_,
                          (long long) overlay_copies_, (long long) overlay_swaps_);
+        uint64_t primary = 0, helper = 0;
+        const int64_t base = (int64_t)n_layers_*per_layer_;
+        for (size_t s = 0; s < owner_.size(); ++s) if (owner_[s] >= 0) {
+            const int layer = s < (size_t)base ? (int)(s/per_layer_) : (int)((s-base)/ext_per_layer_);
+            primary += expert_bytes(layer,owner_[s]);
+        }
+        for (size_t s = 0; s < peer_owner_.size(); ++s) if (peer_owner_[s] >= 0)
+            helper += expert_bytes((int)(s/homes_.peer),peer_owner_[s]);
+        basalt::log::info("basalt deepseek41", "slot storage %s: primary %.3f/%.3f GiB, helper %.3f/%.3f GiB (weight/allocated)", tag,
+                          primary/1073741824., (cache_.mapped_bytes()+ext_.mapped_bytes())/1073741824.,
+                          helper/1073741824., (peer_ ? peer_->cache().mapped_bytes() : 0)/1073741824.);
+    }
     if (profile_peer_exchange_)
         basalt::log::info("basalt deepseek41", "peer exchange %s: count=%llu host_elapsed_ms=%.3f d2h_ms=%.3f memcpy_ms=%.3f h2d_ms=%.3f",
                          tag, (unsigned long long) peer_exchanges_, peer_exchange_ns_ / 1e6,

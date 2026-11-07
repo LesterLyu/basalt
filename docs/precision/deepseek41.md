@@ -96,10 +96,11 @@ Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 2
 Only the listed target experts change. The router, shared experts and DSpark weights keep their original precision.
 Replacement weights have one immutable RAM backing shared across slots; their superseded base bytes are
 excluded from all tiers. Initial placement keeps the normal routing rank. CPU jobs dispatch each expert's
-native format and activation quantizer. Primary and helper GPU slots accept either format, and the normal
-miss split, LRU promotion and swaps apply. Slots reserve their layer's largest blob; the two directions of a
-swap use the actual outgoing and incoming byte counts. A base expert displaced by a replacement gets a RAM
-place subject to the RAM floor. No weights are requantized and neither pack is rewritten.
+native format and activation quantizer. Primary replacement groups are submitted before joining CPU/helper work.
+Both GPU tiers accept either format; the normal miss split, LRU promotion and swaps apply. Slots follow the layer's
+size distribution and initial ranked experts, with a slot for its largest format. Admission selects a fitting slot;
+swap directions use their actual byte counts. A displaced base expert gets a RAM place subject to the RAM floor.
+No weights are requantized and neither pack is rewritten.
 
 Prompt reads stage each replacement once for all its rows and retain native row arithmetic. Base experts use
 the host read-ahead ring with the existing compute groups. `--prefill-chunk N` (config `engine.prefill-chunk`)

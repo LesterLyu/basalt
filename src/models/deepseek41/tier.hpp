@@ -186,6 +186,9 @@ private:
     void land_home(int layer, int in, int out, int place);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
+    uint64_t slot_capacity(int32_t slot) const;
+    std::vector<int64_t> slot_sizes(int n, int rank_start = 0, bool seed = false, bool conservative = false) const;
+    int slots_fit(uint64_t free, uint64_t keep, int maximum, int rank_start = 0, bool seed = false, bool conservative = false) const;
     uint64_t slot_total() const { return (uint64_t) n_layers_ * (uint64_t) (per_layer_ + ext_per_layer_); }
     void drain();
     void finish_swaps();
@@ -197,7 +200,7 @@ private:
     int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false,
                   bool later = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
-    int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
+    int32_t oldest_slot(int layer, bool homes_too, uint64_t& best, uint64_t bytes = 0) const;
     /// Moves (layer, e) into the second card when the expert it replaces there was used before any on the main card.
     bool move_to_peer(int layer, int e, const uint8_t* src);
 
@@ -224,8 +227,8 @@ private:
     cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind
     bool gap_marked_ = false;               ///< gap_ev_ was recorded for the next pump
     uint64_t tick_ = 0;
-    uint64_t one_each_ = 0, reserve_ = 0, modules_ = 0;
-    std::vector<uint64_t> device_slot_bytes_; ///< capacity for either the base or replacement format of each layer
+    uint64_t reserve_ = 0, modules_ = 0;
+    std::vector<std::vector<uint64_t>> sorted_blob_bytes_;
     int64_t overlay_hits_ = 0, overlay_copies_ = 0, overlay_cpu_ = 0, overlay_peer_ = 0, overlay_swaps_ = 0;
     struct ExtraRam { uint8_t* ptr = nullptr; uint64_t mapped = 0; core::RamPin pin; };
     std::vector<std::vector<ExtraRam>> extra_ram_;
