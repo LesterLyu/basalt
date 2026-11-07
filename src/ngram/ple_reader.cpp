@@ -542,7 +542,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     return Ticket{id};
 }
 
-bool PleReader::collect(Ticket t, std::string& err) {
+bool PleReader::collect(Ticket t, std::string& err, double* total_wait_us) {
     Impl& m = *impl_;
     const double start = now_us();
     std::unique_lock<std::mutex> lk(m.mu);
@@ -556,7 +556,9 @@ bool PleReader::collect(Ticket t, std::string& err) {
     if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
     if (!m.error.empty()) { err = m.error; return false; }
     for (const auto& [row, dst] : it->second.split) m.cache.insert(row, dst);
-    m.stats.wait_us += now_us() - start;
+    const double elapsed = now_us() - start;
+    m.stats.wait_us += elapsed;
+    if (total_wait_us) *total_wait_us += elapsed;
     m.tickets.erase(it);
     return true;
 }

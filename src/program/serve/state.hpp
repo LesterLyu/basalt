@@ -202,6 +202,7 @@ public:
         int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
         int64_t p = 0;                 ///< its position
         int64_t produced = 0, max_new = 0;
+        double row_wait_us = 0;
         Clock::time_point t0;
         // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
         // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
