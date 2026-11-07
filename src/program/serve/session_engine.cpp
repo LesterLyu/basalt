@@ -19,6 +19,12 @@ constexpr int32_t kEmbeddingsMagic = 0x31455653;
 
 class SessionRuntime;
 
+void report_row_wait(int slot, double us, int64_t produced) {
+    if (us > 0 && produced > 0)
+        basalt::log::info("basalt serve", "slot %d decode Engram wait %.3f ms / %lld output tokens = %.4f ms/token",
+                          slot, us / 1000, (long long) produced, us / (1000 * (double) produced));
+}
+
 /// A picture's embedding rows, placed at prompt position `at`.
 struct Block {
     int64_t at = 0;
@@ -378,6 +384,7 @@ public:
     bool run_window(int T, int, int&) {
         basalt::model::DecodeRequest d;
         d.tokens = window.data();
+        d.row_wait_us = &row_wait_us_;
         d.n_tokens = T;
         d.pos = p;
         (T > 1 ? d.row_tokens : d.next_token) = outv.data();
@@ -505,7 +512,14 @@ private:
         dc.file_blobs = c.files - counts0_.files;
         return dc;
     }
-    void report_request(const DoneCounts& dc) override { report_expert_counts(dc); }
+    void slot_init(BSlot& sl) override {
+        sl.row_wait_us = row_wait_us_;
+        row_wait_us_ = 0;  // the batch reports the whole request at BDONE
+    }
+    void report_request(const DoneCounts& dc) override {
+        report_expert_counts(dc);
+        report_row_wait(in_slot ? slot_b : 0, row_wait_us_, produced_n);
+    }
 
     void progress_line(const char* tag, int64_t at_pos) {
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -518,6 +532,7 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
+    double row_wait_us_ = 0;
     std::vector<int32_t> drafts_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
@@ -542,6 +557,7 @@ bool SessionRuntime::next_batch_window() {
         basalt::kernels::SamplerParams& sp = slot_sampling_[(size_t) b];
         basalt::model::DecodeRequest d;
         d.tokens = &fed;
+        d.row_wait_us = &sl.row_wait_us;
         d.n_tokens = 1;
         d.pos = sl.p;
         d.next_token = &y;
@@ -576,6 +592,7 @@ bool SessionRuntime::next_batch_window() {
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
         if (fin != nullptr) {
+            report_row_wait(b, sl.row_wait_us, sl.produced);
             std::printf("BDONE %d %lld %s %.1f 0 0\n", b, (long long) sl.produced, fin,
                         std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
             sl.active = false;

@@ -203,14 +203,14 @@ public:
             if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
             std::string err;
             if (!prepare_draw(r, err)) return {model::Status::Error, err};
-            if (!step(r.tokens, r.n_tokens, r.pos, true, r.row_tokens, r.logits, err)) return {model::Status::Error, err};
+            if (!step(r.tokens, r.n_tokens, r.pos, true, r.row_tokens, r.logits, err, r.row_wait_us)) return {model::Status::Error, err};
             return {};
         }
         for (int i = 0; i < r.n_tokens; ++i) {
             const bool last = i + 1 == r.n_tokens;
             std::string err;
             if (last && !prepare_draw(r, err)) return {model::Status::Error, err};
-            if (!step(r.tokens + i, 1, r.pos + i, last, last ? r.next_token : nullptr, last ? r.logits : nullptr, err))
+            if (!step(r.tokens + i, 1, r.pos + i, last, last ? r.next_token : nullptr, last ? r.logits : nullptr, err, r.row_wait_us))
                 return {model::Status::Error, err};
         }
         return {};
@@ -812,9 +812,10 @@ private:
         return run_graph(tail_g_[(size_t) graph_row(T) * g_.n_layers + il], [&]() { return enqueue_tail(il, pos, stream_, T); });
     }
 
-    bool step(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out, std::string& err) {
+    bool step(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out, std::string& err,
+              double* row_wait_us = nullptr) {
         err_.clear();
-        bool ok = flush_features(pos, err_) && step_impl(tokens, T, pos, want_out, next, logits_out);
+        bool ok = flush_features(pos, err_) && step_impl(tokens, T, pos, want_out, next, logits_out, row_wait_us);
         if (ok && drafter_) {
             feat_pos0_ = pos;
             feat_n_ = T;
@@ -836,7 +837,8 @@ private:
 
 
     // `T` rows at pos..; with T > 1 every row's pick lands in next[T] and the rows stay until a later call drops those past it.
-    bool step_impl(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out) {
+    bool step_impl(const int32_t* tokens, int T, int64_t pos, bool want_out, int32_t* next, float* logits_out,
+                   double* row_wait_us) {
         const size_t n = (size_t) g_.n_embd;
         void* st = stream_;
         if (!prefillp::may_resume(pos, (int64_t) hist_.size(), whole_from_)) return fail(kSkippedRows);
@@ -898,7 +900,7 @@ private:
         // expert copies. The projection of an Engram layer past layer 1 runs one layer ahead, behind that layer's head,
         // while its experts run; the Engram layer's head then only adds the result.
         const auto engram_rows = [&](size_t k) {
-            if (!m_.engram_reader().collect(tickets[k], err)) return false;
+            if (!m_.engram_reader().collect(tickets[k], err, row_wait_us)) return false;
             const int blocks = 256 / 32;
             for (int r = 0; r < n_cols * T; ++r)
                 for (int b = 0; b < blocks; ++b)

@@ -111,6 +111,7 @@ struct DecodeRequest {
     const kernels::SamplerParams* sampling = nullptr;   ///< how next_token is drawn (null: greedy)
     const int32_t* history = nullptr; ///< per row, the last `history_len` tokens the pick follows (host), for the penalties
     int history_len = 0;
+    double* row_wait_us = nullptr;    ///< accumulate time collecting n-gram rows for this decode window
 };
 
 struct PrefillRequest {

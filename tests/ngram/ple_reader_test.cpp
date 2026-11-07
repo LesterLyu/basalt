@@ -62,11 +62,12 @@ bool make_table(const std::string& path, uint32_t rows, uint32_t rb) {
     return (bool) f;
 }
 
-bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n_rows, uint32_t rb, const char* what) {
+bool check_rows(ng::PleReader& rd, const std::vector<uint32_t>& rows, uint32_t n_rows, uint32_t rb, const char* what,
+                double* wait_us = nullptr) {
     std::vector<uint8_t> out(rows.size() * rb, 0xCC);
     std::string err;
     const auto t = rd.issue(rows.data(), rows.size(), out.data());
-    if (!rd.collect(t, err)) { CHECK(false, "%s: collect failed: %s", what, err.c_str()); return false; }
+    if (!rd.collect(t, err, wait_us)) { CHECK(false, "%s: collect failed: %s", what, err.c_str()); return false; }
     std::vector<uint8_t> want(rb);
     for (size_t i = 0; i < rows.size(); ++i) {
         if (rows[i] >= n_rows) std::memset(want.data(), 0, rb);
@@ -139,9 +140,12 @@ int selftest(const std::string& dir, uint32_t rb) {
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
         const double t0 = now_us();
-        check_rows(rd, rows, N, rb, "delayed");
+        double first = 0, second = 0;
+        check_rows(rd, rows, N, rb, "delayed", &first);
         CHECK(now_us() - t0 >= 3000, "injected delay not observed (%.0f us)", now_us() - t0);
         CHECK(rd.stats().late_injected > 0, "no read was held back");
+        check_rows(rd, rows, N, rb, "second request", &second);
+        CHECK(first > 0 && second > 0 && first + second == rd.stats().wait_us, "wait attribution across requests");
     }
     // keep-alive: while rows are asked for, a page goes out after `period` without a read; it stops once the
     // window after the last issue has passed, starts again with the next issue (even one the row cache serves),
