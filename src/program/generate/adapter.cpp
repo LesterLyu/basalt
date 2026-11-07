@@ -405,6 +405,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.gpu_single_miss = o.gpu_single_miss;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
+        lreq.diag_tier_timing = o.diag_tier_timing;
         lreq.rope = o.rope;
         lreq.route = o.route;
         lreq.kv_resident = o.kv_resident;
