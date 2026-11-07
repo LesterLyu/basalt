@@ -15,8 +15,11 @@ namespace basalt::platform {
 // the primary GPU maps it. Other platforms retain the portable staging path.
 #if defined(_WIN32)
 inline constexpr bool kDirectHostVmmExchange = true;
+// WDDM submissions can block the caller; keep helper compute off the primary submission thread.
+inline constexpr bool kDedicatedPeerCompute = true;
 #else
 inline constexpr bool kDirectHostVmmExchange = false;
+inline constexpr bool kDedicatedPeerCompute = false;
 #endif
 
 struct LockResult {

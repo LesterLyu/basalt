@@ -63,9 +63,8 @@ struct Dims {
 /// with their row map, the attention's positions and selected rows.
 inline uint64_t per_token_bytes(const Dims& d) {
     const uint64_t n = (uint64_t) d.n_embd;
-    return 4 * (19 * n + (uint64_t) d.hc_coef * 3 + (uint64_t) d.n_expert + 16 + (uint64_t) d.engram_cols +
-                (uint64_t) d.n_used * (n + 2) + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1)) +
-           d.attn_token_bytes;
+    return 4 * (13 * n + (uint64_t) d.hc_coef * 3 + (uint64_t) d.n_expert + 16 + (d.engram_cols > 4*d.n_embd ? (uint64_t)d.engram_cols : 0) +
+                (uint64_t) d.n_used * (n + 2) + (uint64_t) d.hc_splits * (uint64_t) (d.hc_coef + 1)) + d.attn_token_bytes;
 }
 
 /// (token, slot) rows one expert launch of a chunk handles.

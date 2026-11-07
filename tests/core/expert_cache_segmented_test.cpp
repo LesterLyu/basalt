@@ -90,6 +90,27 @@ int main() {
         c.close();
         if (c.valid() || c.slots() != 0) return fail("close");
     }
+    // A reserved arena can start empty or with a physical prefix, for uniform and sized slots.
+    for (int sized = 0; sized < 2; ++sized) for (int initial : {0,25}) {
+        basalt::core::ExpertCache c;
+        c.set_segment_bytes(kSeg);
+        c.set_initial_bytes((int64_t)initial<<20);
+        std::string err;
+        const bool ok = sized ? c.open_sized(std::vector<int64_t>(kSlots,kBlob),4,64,err)
+                              : c.open(kSlots,4,64,kBlob,err);
+        if (!ok) return fail("initial prefix open",err);
+        const int64_t live = initial ? 32 : 0;
+        if (!c.valid() || c.full_slots() != kSlots || c.slots() != live || c.mapped_bytes() != live*kBlob)
+            return fail("initial prefix sizes");
+        uint8_t* const first = c.device_slot(0);
+        if (!fill(c,0,live,kBlob)) return fail("initial prefix fill");
+        if (!c.grow(c.full_bytes(),err) || c.slots() != kSlots || c.device_slot(0) != first || !check(c,live,kBlob))
+            return fail("initial prefix grow",err);
+        if (!fill(c,live,kSlots,kBlob) || !check(c,kSlots,kBlob)) return fail("initial prefix contents");
+        if (!c.shrink(0,err) || c.slots() != 0 || c.mapped_bytes() != 0 || !c.valid()) return fail("lend all prefix",err);
+        if (!c.grow(c.full_bytes(),err) || !fill(c,0,kSlots,kBlob) || !check(c,kSlots,kBlob))
+            return fail("restore empty prefix",err);
+    }
     // the elastic tail: large head segments, granule-sized ones over the last bytes; a shrink by whole granules
     {
         basalt::core::ExpertCache c;

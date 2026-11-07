@@ -68,14 +68,18 @@ public:
         batch_open_ = ops_.open_batch(cap_, err);
         if (!batch_open_) return false;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), 8), 1 << 16);
-        bool ok = buf(x_, C * 4 * n) && buf(x2_, C * 4 * n) && buf(cur_, C * n) && buf(normed_, C * n) &&
-                  buf(attn_, C * n) && buf(moe_, C * n) && buf(sh_, C * n) && buf(sum_, C * n) &&
+        bool ok = buf(x_, C * 4 * n) && buf(x2_, C * 4 * n) && buf(kv_dev_, C * 5 * n) &&
                   buf(coef_a_, C * kHcCoef) && buf(coef_f_[0], C * kHcCoef) && buf(coef_f_[1], C * kHcCoef) &&
                   buf(hc_ws_, hc_mixes_workspace_floats(cap_)) && buf(rlogits_, C * (size_t) g_.n_expert) &&
                   buf(rw_, C * 8) && buf(ids_, C * 8) &&
-                  buf(kv_dev_, C * 5 * n) && buf(q8_, q8) && buf(rows_all_, C * (cols ? cols : 1));
-        if (!ok) err = "out of device memory for the prefill buffers";
-        return ok;
+                  buf(q8_, q8);
+        if (cols > 4*n) ok = ok && buf(rows_all_,C*cols);
+        else rows_all_ = x2_;
+        if (!ok) { err = "out of device memory for the prefill buffers"; return false; }
+        // Engram finishes before attention; attention output is dead before the expert outputs.
+        cur_ = kv_dev_; normed_ = kv_dev_+C*n;
+        attn_ = moe_ = kv_dev_+C*2*n; sh_ = kv_dev_+C*3*n; sum_ = kv_dev_+C*4*n;
+        return true;
     }
 
     bool run(const int32_t* tokens, int n, int64_t pos0, int64_t rows_after, std::vector<int32_t>& hist, std::string& err) override {

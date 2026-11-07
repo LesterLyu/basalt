@@ -77,7 +77,7 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
     }
     cudaMemset(base_ + backed_, 0, n);
     extents_.push_back({backed_, n, h});
-    backed_ = want;
+    backed_ += n;
     return true;
 }
 

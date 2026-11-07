@@ -602,5 +602,10 @@ void PleReader::reset_stats() {
 }
 uint64_t PleReader::cache_capacity() const { return impl_->cache.sets * WAYS; }
 uint64_t PleReader::cache_size() const { return impl_->cache.used; }
+uint64_t PleReader::allocated_bytes() const {
+    const auto& m = *impl_;
+    return m.cache.data.capacity() + m.cache.keys.capacity() * sizeof(uint32_t) + m.cache.next.capacity() +
+           (m.slab ? (uint64_t)m.max_inflight * PAGE : 0);
+}
 
 }  // namespace basalt::ngram
