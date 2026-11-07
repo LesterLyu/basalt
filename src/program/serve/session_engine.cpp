@@ -1,4 +1,4 @@
-// src/program/serve/session_engine.cpp - the shared server over a model's ModelSession: one token per window.
+// src/program/serve/session_engine.cpp - the shared server over a model's ModelSession.
 #include "session_engine.hpp"
 
 #include "decode_loop.hpp"
@@ -513,6 +513,7 @@ private:
         return dc;
     }
     void slot_init(BSlot& sl) override {
+        if (gguard && req_bias_present) sl.grammar_bias = req_bias;
         sl.row_wait_us = row_wait_us_;
         row_wait_us_ = 0;  // the batch reports the whole request at BDONE
     }
@@ -544,7 +545,8 @@ private:
     double live_ms_ = -1e9;
 };
 
-// One token of every active slot, one session at a time.
+// Each slot verifies one window before giving the other sessions a turn. Only verified inputs
+// enter its reusable prefix; proposals and the confidence policy belong to this request.
 bool SessionRuntime::next_batch_window() {
     std::vector<int32_t> history;
     std::vector<float> grammar_bias;
@@ -552,55 +554,88 @@ bool SessionRuntime::next_batch_window() {
         BSlot& sl = bs[(size_t) b];
         if (!sl.active) continue;
         set_active(b);
-        const int32_t fed = sl.x;
-        int32_t y = -1;
-        basalt::kernels::SamplerParams& sp = slot_sampling_[(size_t) b];
-        basalt::model::DecodeRequest d;
-        d.tokens = &fed;
-        d.row_wait_us = &sl.row_wait_us;
-        d.n_tokens = 1;
-        d.pos = sl.p;
-        d.next_token = &y;
-        d.sampling = &sp;
-        if (sl.pen_n > 0) {
-            history.resize((size_t) sl.pen_n);
-            basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), &fed, 1, sl.pen_n, history.data());
-            d.history = history.data();
-            d.history_len = sl.pen_n;
-        }
-        sp.counter = (uint64_t) sl.produced;
-        if (const basalt::model::Result r = session().decode_window(d); !r.ok()) {
+        const auto fail = [&](const basalt::model::Result& r) {
             std::printf("ERR %s\n", r.message.c_str());
             set_active(0);
             return false;
+        };
+        const int cap = std::min(session().max_window(), (int) std::size(sl.dr));
+        decltype(sl.dr) input{}, picks{};
+        input[0] = sl.x;
+        int width = 1;
+        float chance = 1;
+        while (!sl.stop && width < cap && width <= sl.n_dr && sl.produced + width < sl.max_new &&
+               sl.p + width + 1 < o.max_context) {
+            chance *= sl.dprob[width - 1];
+            if (chance < sl.cum.th()) break;
+            input[width] = sl.dr[width - 1];
+            ++width;
         }
-        if (sl.guard != nullptr && sl.guard->on() && sl.guard->scan(&y, 1) >= 0) {
-            sl.guard->mask_bias({}, grammar_bias);
-            if (const basalt::model::Result r = session().resample_row(0, grammar_bias.data(), y); !r.ok()) {
-                std::printf("ERR %s\n", r.message.c_str());
-                set_active(0);
-                return false;
+
+        const char* fin = sl.stop ? "cancel" : nullptr;
+        if (!fin) {
+            basalt::model::DecodeRequest d;
+            d.tokens = input;
+            d.row_wait_us = &sl.row_wait_us;
+            d.n_tokens = width;
+            d.pos = sl.p;
+            (width == 1 ? d.next_token : d.row_tokens) = picks;
+            auto& sp = slot_sampling_[(size_t) b];
+            d.sampling = &sp;
+            if (sl.pen_n > 0) {
+                history.resize((size_t) width * sl.pen_n);
+                basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), input, width, sl.pen_n, history.data());
+                d.history = history.data();
+                d.history_len = sl.pen_n;
             }
-            if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
+            sp.counter = (uint64_t) sl.produced;
+            if (const auto r = session().decode_window(d); !r.ok()) return fail(r);
+
+            int kept = 0;
+            for (; kept < width;) {
+                const int row = kept++;
+                int32_t& y = picks[row];
+                bool masked = false;
+                if (sl.guard && sl.guard->on() && sl.guard->scan(&y, 1) >= 0) {
+                    sl.guard->mask_bias(sl.grammar_bias, grammar_bias);
+                    if (const auto r = session().resample_row(row, grammar_bias.data(), y); !r.ok()) return fail(r);
+                    if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
+                    masked = true;
+                }
+                sl.ids.push_back(input[row]);
+                ++sl.produced;
+                ++sl.p;
+                sl.x = y;
+                std::printf("BT %d %d\n", b, (int) y);
+                basalt::core::progress_beat();
+                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                fin = eos ? "stop" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
+                if (fin || masked || kept == width || y != input[kept]) break;
+            }
+            sl.drafts_offered += width - 1;
+            sl.drafts_accepted += kept - 1;
+            sl.cum.observe_chances(sl.dprob, width - 1, kept - 1);
+            sl.n_dr = 0;
+            std::fflush(stdout);
+            if (!fin && cap > 1) {
+                const auto r = session().draft_begin(sl.x, sl.p);
+                if (r.ok()) {
+                    if (const auto done = session().draft_end(sl.dr, sl.dprob, cap - 1, sl.n_dr); !done.ok()) return fail(done);
+                } else if (r.status != basalt::model::Status::NotImplemented) return fail(r);
+            }
         }
-        sl.ids.push_back(fed);
-        ++sl.produced;
-        ++sl.p;
-        sl.x = y;
-        std::printf("BT %d %d\n", b, (int) y);
-        basalt::core::progress_beat();
-        const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-        const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
         if (fin != nullptr) {
             report_row_wait(b, sl.row_wait_us, sl.produced);
-            std::printf("BDONE %d %lld %s %.1f 0 0\n", b, (long long) sl.produced, fin,
-                        std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count());
+            std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
+                        std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
+                        (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
             sl.active = false;
             sl.cached = o.prompt_cache > 0;
             sl.idle_busy = busy_now();
             sl.guard.reset();
+            sl.grammar_bias.clear();
+            std::fflush(stdout);
         }
-        std::fflush(stdout);
     }
     set_active(0);
     return true;

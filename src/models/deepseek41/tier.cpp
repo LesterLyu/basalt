@@ -586,6 +586,7 @@ const uint8_t* ExpertTier::blob_of(int layer, int e) const {
     const ExpertLayer& el = m_.pack().experts[(size_t) layer];
     const int32_t r = ram_idx_[(size_t) layer * n_expert_ + e];
     if (r >= 0) return ram_[(size_t) layer] + (size_t) r * el.blob_bytes;
+    if (!file_.data()) return nullptr;
     return file_.data() + m_.pack().experts_range.offset + el.offset + (uint64_t) e * el.blob_bytes;
 }
 
@@ -749,6 +750,11 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         } else {
             lk.dev[i] = nullptr;
             lk.host[i] = blob_of(layer, e);
+            if (!lk.host[i]) {
+                err = "deepseek41: no backing for routed expert " + std::to_string(e) +
+                      " in layer " + std::to_string(layer);
+                return false;
+            }
             lk.again[i] = policy::repeat_miss(last_miss_[idx], token_, policy::kPromoteWindow);
             if (pinned(layer, e)) {
                 ++ram_hits_;

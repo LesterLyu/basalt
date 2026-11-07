@@ -7,6 +7,7 @@
 // position on a stream of its own and `draft_end` waits for it, so host work can overlap the block.
 #pragma once
 
+#include <cuda_runtime_api.h>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -16,6 +17,7 @@
 namespace basalt::models::deepseek41 {
 
 class DsModel;
+struct DsparkWorkspace;
 
 constexpr int kDsparkBlock = 5;     ///< rows of a block: the anchor and four mask tokens
 constexpr int kDsparkWindow = 128;  ///< positions before the block a stage attends
@@ -34,18 +36,22 @@ std::vector<std::vector<int>> dspark_kept_experts(const std::vector<std::pair<in
 class DsparkDrafter {
 public:
     ~DsparkDrafter();
+    DsparkDrafter(const DsparkDrafter&) = delete;
+    DsparkDrafter& operator=(const DsparkDrafter&) = delete;
 
     /// Loads the pack's dspark/gguf section onto `device` (weights, a window ring per stage, scratch). Null with `err` set
     /// on failure.
     /// `ranking` (the format of data/profiles, a pair per stage and expert, most routed first): each stage keeps its `keep`
     /// most routed experts (0: all) and the router picks among them; without the file every expert loads.
-    static std::unique_ptr<DsparkDrafter> create(const DsModel& main, int device, const std::string& ranking, int keep,
+    static std::unique_ptr<DsparkDrafter> create(DsModel& main, int device, const std::string& ranking, int keep,
                                                  std::string& err);
 
     /// Slot (0..n_target_layers) the main model's layer `il` fills in the feature rows, or -1.
     int feature_slot(int il) const;
     int feature_floats() const;   ///< n_target_layers * n_embd
     int device() const;
+    const void* shared_workspace() const { return p_.get(); }
+    uint64_t ring_bytes() const;
     uint64_t device_bytes() const;   ///< what it took on its card
     const std::string& kept() const;   ///< how many experts each stage kept, and why all when that was not asked
 
@@ -63,9 +69,12 @@ public:
     void report() const;
 
 private:
-    struct Impl;
-    explicit DsparkDrafter(std::unique_ptr<Impl> i);
-    std::unique_ptr<Impl> p_;
+    explicit DsparkDrafter(std::shared_ptr<DsparkWorkspace> workspace);
+    std::shared_ptr<DsparkWorkspace> p_;
+    uint16_t* rings_ = nullptr;
+    // The body graph captures this slot's ring addresses; weights and the head graph are shared.
+    cudaGraphExec_t body_graph_ = nullptr;
+    std::vector<int64_t> ring_pos_;
 };
 
 }  // namespace basalt::models::deepseek41

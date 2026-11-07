@@ -31,6 +31,7 @@ inline void dense_f32(const DevTensor& w, const float* x, void* scratch_q8_1, fl
 }
 
 class ExpertTier;
+struct DsparkWorkspace;
 
 class DsModel final : public model::LoadedModel {
 public:
@@ -73,6 +74,7 @@ public:
         float* h_rows = nullptr;
     };
     SharedTier& shared_tier() const { return shared_tier_; }
+    std::weak_ptr<DsparkWorkspace> draft_workspace;
     /// The sessions that will hold a context each.
     int sessions() const { return tiers_.sessions > 0 ? tiers_.sessions : 1; }
     /// What the flags ask of the expert tiers.

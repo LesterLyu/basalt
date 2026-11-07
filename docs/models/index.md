@@ -16,7 +16,7 @@ switch. Several models can share one address ([router](../configuration/models.m
 | `--kv` | fp16 (default), int8, q4_0, k8v4 | fp16 only |
 | Cards | main card plus up to three expert-tier cards | main card plus one expert-tier card |
 | Layer split | yes, matched cards, priced at start | no |
-| Parallel slots | yes | yes; slots draft nothing |
+| Parallel slots | yes | yes; slots share the DSpark weights |
 | Lossy flags | `--relaxed-drafting`, `--route-prior`, `--route-tail-skip` (off) | none |
 | Prompt skip | no | yes (`--no-prompt-skip` turns it off) |
 | Idle sleep, wake | yes (Linux) | yes (Linux); a second-card sleep may be refused |

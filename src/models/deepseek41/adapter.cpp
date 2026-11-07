@@ -102,11 +102,11 @@ public:
         const bool drafter = opened && file.find("dspark/gguf") != nullptr;
         // the pack's drafter runs in windows of 3 unless --spec says otherwise; a token file drafts in its place
         if (!o.spec_given) {
-            o.spec = drafter && o.batch <= 1 ? 3 : 0;
+            o.spec = drafter ? 3 : 0;
             if (opened && !drafter) basalt::log::info("basalt deepseek41", "no dspark/gguf section: plain decode");
         }
         if (o.spec >= 2 && o.spec_oracle.empty()) {
-            const char* off = o.batch > 1 ? "--parallel slots draft nothing" : !drafter ? "the pack has no dspark/gguf section" : nullptr;
+            const char* off = !drafter ? "the pack has no dspark/gguf section" : nullptr;
             if (off != nullptr) {
                 basalt::log::warn("basalt deepseek41", "--spec %d off: %s", o.spec, off);
                 o.spec = 0;

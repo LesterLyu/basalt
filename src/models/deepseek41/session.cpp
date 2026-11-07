@@ -48,7 +48,6 @@ class Session final : public model::ModelSession {
 public:
     explicit Session(DsModel& m) : m_(m), g_(m.geo()) {}
     ~Session() override {
-        if (drafter_) drafter_->report();
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
         if (h_dfeat_) cudaFreeHost(h_dfeat_);
@@ -75,7 +74,11 @@ public:
         if (ops_) ops_->memory_usage(usage);
         if (prefill_) prefill_->memory_usage(usage);
         if (vis_) usage.device(m_.device(), "vision", vis_->device_bytes());
-        if (drafter_) usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
+        if (drafter_) {
+            usage.device(drafter_->device(), "dspark", drafter_->ring_bytes());
+            if (usage.claim(drafter_->shared_workspace()))
+                usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
+        }
     }
     bool init(std::string& err) {
         // the layer's chain runs ahead of the mixes branch, one step below the attention's branches, which hold the chain
@@ -154,15 +157,16 @@ public:
         ops_ = make_kernel_ops(m_, err);
         if (!ops_) return false;
         dump_dir_ = m_.diag_dump();
-        if (m_.tiers().draft && !m_.pack().dspark.empty() && m_.sessions() == 1) {
+        if (m_.tiers().draft && !m_.pack().dspark.empty()) {
             // the drafter takes its memory before the tiers size themselves to what is left
             const int device = m_.tiers().drafter_device >= 0 ? m_.tiers().drafter_device : m_.device();
             // the ranking that says which experts each stage keeps ships beside the expert profiles
             const std::string ranking = m_.tiers().profile_dir.empty() ? std::string()
                 : m_.tiers().profile_dir + "/deepseek41-" + std::to_string(g_.n_layers) + "x" + std::to_string(g_.n_expert) + "-dspark.prof";
+            const bool first = m_.draft_workspace.expired();
             drafter_ = DsparkDrafter::create(m_, device, ranking, m_.tiers().draft_experts, err);
             if (!drafter_) return false;
-            basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, %s, windows of at most %d tokens (--spec 0: off)", device,
+            if (first) basalt::log::info("basalt deepseek41", "drafter on GPU %d: %.2f GiB, %s, windows of at most %d tokens (--spec 0: off)", device,
                               (double) drafter_->device_bytes() / (1ull << 30), drafter_->kept().c_str(),
                               std::min(max_window(), kDsparkBlock + 1));
             const size_t ff = (size_t) drafter_->feature_floats();
@@ -175,7 +179,7 @@ public:
         return true;
     }
 
-    int max_window() const override { return m_.sessions() > 1 ? 1 : std::clamp(m_.tiers().spec, 1, kMaxWindow); }
+    int max_window() const override { return std::clamp(m_.tiers().spec, 1, kMaxWindow); }
 
     model::Result draft_begin(int32_t anchor, int64_t pos) override {
         if (!drafter_) return {model::Status::NotImplemented, "deepseek41: no drafter is loaded"};
@@ -852,11 +856,13 @@ private:
         if ((int64_t) hist_.size() < pos) return fail("positions must be consecutive from 0 (the session keeps one sequence)");
         hist_.resize((size_t) pos);   // a position before the end drops the rejected rows of a window
         hist_.insert(hist_.end(), tokens, tokens + T);
-        ops_->begin_token(pos, T);
         {
             std::string se;
             if (!ops_->stage_token(pos, T, st, se)) return fail(se);
         }
+        // A newly admitted slot attaches to the shared expert tier in stage_token().
+        // Retire the previous slot's pending moves before looking up this slot's experts.
+        ops_->begin_token(pos, T);
         const bool graphs = dump_dir_.empty() && ops_->graph_capable();
         fused_ = graphs;
 

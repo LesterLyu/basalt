@@ -73,13 +73,12 @@ struct Stage {
     float *hc_attn_fn = nullptr, *hc_attn_scale = nullptr, *hc_attn_base = nullptr;
     float *hc_ffn_fn = nullptr, *hc_ffn_scale = nullptr, *hc_ffn_base = nullptr;
     float *router = nullptr, *router_bias = nullptr;
-    uint16_t* ring = nullptr;   ///< [kWindowSlots][512] fp16
     int n_exp = kExperts;       ///< routed experts kept, the router's choices
 };
 
 }  // namespace
 
-struct DsparkDrafter::Impl {
+struct DsparkWorkspace {
     const DsModel& main;
     int device = 0;
     cudaStream_t st = nullptr;
@@ -108,7 +107,6 @@ struct DsparkDrafter::Impl {
     float* x_mask = nullptr;   // the mask rows of the block's input, four streams each
 
     // the block as two graphs: the stages, then the head for the rows a window can use
-    cudaGraphExec_t g_body = nullptr;
     cudaGraphExec_t g_head[kT + 1] = {};
 
     // pinned host staging
@@ -119,8 +117,6 @@ struct DsparkDrafter::Impl {
     int32_t* h_out = nullptr;    // tok[5]
     float* h_conf = nullptr;
 
-    // which position each ring slot holds
-    std::vector<int64_t> ring_pos;
     bool block_live = false;
     int n_out = kT;   // the rows the live block drafts
     std::string kept_note;
@@ -128,8 +124,8 @@ struct DsparkDrafter::Impl {
     int64_t blocks = 0;
     double ms_body = 0, ms_head = 0;
 
-    explicit Impl(const DsModel& m) : main(m) {}
-    ~Impl() {
+    explicit DsparkWorkspace(const DsModel& m) : main(m) {}
+    ~DsparkWorkspace() {
         core::OnDevice g(device);
         for (void* p : allocs) cudaFree(p);
         if (h_feat) cudaFreeHost(h_feat);
@@ -141,7 +137,6 @@ struct DsparkDrafter::Impl {
         if (ev0) cudaEventDestroy(ev0);
         if (ev_body) cudaEventDestroy(ev_body);
         if (ev1) cudaEventDestroy(ev1);
-        if (g_body) cudaGraphExecDestroy(g_body);
         for (cudaGraphExec_t e : g_head)
             if (e) cudaGraphExecDestroy(e);
         if (st) cudaStreamDestroy(st);
@@ -278,10 +273,6 @@ struct DsparkDrafter::Impl {
                 err = "dspark: the routed experts are not MXFP4";
                 return false;
             }
-            if (!buf(s.ring, (size_t) kWindowSlots * kLatent)) {
-                err = "dspark: out of device memory";
-                return false;
-            }
         }
         if (!wt("fc.weight", fc) || !ft("enc.output_norm.weight", enc_norm, kN) || !ft("output_norm.weight", out_norm, kN) ||
             !ft("conf_proj.weight", conf_w, kN + kMarkovR)) {
@@ -339,7 +330,6 @@ struct DsparkDrafter::Impl {
         rope_freq_table(RopeParams{}, tab);
         if (!upload(tab, sizeof(tab), (void**) &freq)) return false;
         rope = rope_table_window();
-        ring_pos.assign((size_t) kWindowSlots, -1);
         const size_t Tn = (size_t) kT * kN;
         const size_t ff = (size_t) kN * target_layers.size();
         const size_t Rows = std::max<size_t>(kT, kInjectRows);
@@ -396,7 +386,7 @@ struct DsparkDrafter::Impl {
     }
 
     // Window latents of n <= kInjectRows positions from the staged features.
-    void inject_staged(int n) {
+    void inject_staged(int n, uint16_t* rings) {
         const size_t ff = (size_t) kN * target_layers.size();
         cudaMemcpyAsync(feat, h_feat, (size_t) n * ff * 4, cudaMemcpyHostToDevice, st);
         cudaMemcpyAsync(dpos1, h_pos, (size_t) n * 4, cudaMemcpyHostToDevice, st);
@@ -406,12 +396,12 @@ struct DsparkDrafter::Impl {
         kernels::native_quantize_q8_1(mainxn, xq, kN, n, st);
         for (int l = 0; l < kStages; ++l) {
             kernels::native_mmvq(stage[l].wkv.type, stage[l].wkv.p, xq, kvraw, kN, kLatent, n, st);
-            dspark_kv_rope(kvraw, stage[l].kv_norm, dpos1, n, kEps, freq, nullptr, stage[l].ring, kWindowSlots, st);
+            dspark_kv_rope(kvraw, stage[l].kv_norm, dpos1, n, kEps, freq, nullptr, rings + (size_t) l * kWindowSlots * kLatent, kWindowSlots, st);
         }
     }
 
     // The block's stages: its inputs (the metadata, the anchor's row, the mask rows), then every stage over all rows.
-    void run_body() {
+    void run_body(const uint16_t* rings) {
         cudaMemcpyAsync(dmeta, h_meta, (size_t) kMetaUpload * 4, cudaMemcpyHostToDevice, st);
         cudaMemcpyAsync(x, h_emb, (size_t) 4 * kN * 4, cudaMemcpyHostToDevice, st);
         cudaMemcpyAsync(x + (size_t) 4 * kN, x_mask, (size_t) 4 * (kT - 1) * kN * 4, cudaMemcpyDeviceToDevice, st);
@@ -442,7 +432,7 @@ struct DsparkDrafter::Impl {
             MqaArgs a;
             a.n_tokens = kT;
             a.q = q;
-            a.win = s.ring;
+            a.win = rings + (size_t) l * kWindowSlots * kLatent;
             a.win_type = LatentType::F16;
             a.win_cap = kWindowSlots;
             a.win_start = dstart;
@@ -525,8 +515,14 @@ struct DsparkDrafter::Impl {
     }
 };
 
-DsparkDrafter::DsparkDrafter(std::unique_ptr<Impl> i) : p_(std::move(i)) {}
-DsparkDrafter::~DsparkDrafter() = default;
+DsparkDrafter::DsparkDrafter(std::shared_ptr<DsparkWorkspace> workspace)
+    : p_(std::move(workspace)), ring_pos_(kWindowSlots, -1) {}
+DsparkDrafter::~DsparkDrafter() {
+    core::OnDevice guard(device());
+    if (body_graph_) cudaGraphExecDestroy(body_graph_);
+    if (rings_) cudaFree(rings_);
+    if (p_.use_count() == 1) report();
+}
 
 std::vector<std::vector<int>> dspark_kept_experts(const std::vector<std::pair<int32_t, int32_t>>& ranked, int stages, int experts,
                                                   int keep) {
@@ -547,18 +543,28 @@ std::vector<std::vector<int>> dspark_kept_experts(const std::vector<std::pair<in
     return out;
 }
 
-std::unique_ptr<DsparkDrafter> DsparkDrafter::create(const DsModel& main, int device, const std::string& ranking, int keep,
+std::unique_ptr<DsparkDrafter> DsparkDrafter::create(DsModel& main, int device, const std::string& ranking, int keep,
                                                      std::string& err) {
     core::OnDevice g(device);
-    auto i = std::make_unique<Impl>(main);
-    i->device = device;
     try {
-        if (!i->load(main.pack().dspark, ranking, keep, err)) return nullptr;
+        auto workspace = main.draft_workspace.lock();
+        if (!workspace) {
+            workspace = std::make_shared<DsparkWorkspace>(main);
+            workspace->device = device;
+            if (!workspace->load(main.pack().dspark, ranking, keep, err)) return nullptr;
+            main.draft_workspace = workspace;
+        }
+        auto slot = std::unique_ptr<DsparkDrafter>(new DsparkDrafter(std::move(workspace)));
+        if (cudaMalloc(&slot->rings_, slot->ring_bytes()) != cudaSuccess ||
+            cudaMemset(slot->rings_, 0, slot->ring_bytes()) != cudaSuccess) {
+            err = "dspark: cannot allocate the session's draft rings";
+            return nullptr;
+        }
+        return slot;
     } catch (const std::exception& e) {
         err = std::string("dspark: ") + e.what();
         return nullptr;
     }
-    return std::unique_ptr<DsparkDrafter>(new DsparkDrafter(std::move(i)));
 }
 
 int DsparkDrafter::feature_floats() const { return kN * (int) p_->target_layers.size(); }
@@ -568,18 +574,19 @@ int DsparkDrafter::feature_slot(int il) const {
     return -1;
 }
 int DsparkDrafter::device() const { return p_->device; }
+uint64_t DsparkDrafter::ring_bytes() const { return size_t{kStages} * kWindowSlots * kLatent * sizeof(uint16_t); }
 uint64_t DsparkDrafter::device_bytes() const { return p_->bytes_taken; }
 const std::string& DsparkDrafter::kept() const { return p_->kept_note; }
 
 void DsparkDrafter::forget_from(int64_t pos) {
-    for (int64_t& rp : p_->ring_pos)
+    for (int64_t& rp : ring_pos_)
         if (rp >= pos) rp = -1;
 }
 
-void DsparkDrafter::reset() { std::fill(p_->ring_pos.begin(), p_->ring_pos.end(), -1); }
+void DsparkDrafter::reset() { std::fill(ring_pos_.begin(), ring_pos_.end(), -1); }
 
 void DsparkDrafter::report() const {
-    const Impl& d = *p_;
+    const DsparkWorkspace& d = *p_;
     if (d.blocks == 0) return;
     basalt::log::info("basalt deepseek41", "drafter: %lld blocks, %.2f ms each (stages %.2f, head %.2f)", (long long) d.blocks,
                       (d.ms_body + d.ms_head) / (double) d.blocks, d.ms_body / (double) d.blocks, d.ms_head / (double) d.blocks);
@@ -587,7 +594,7 @@ void DsparkDrafter::report() const {
 
 bool DsparkDrafter::inject(int64_t pos0, int n_rows, const float* features, std::string& err) {
     core::OnDevice g(p_->device);
-    Impl& d = *p_;
+    DsparkWorkspace& d = *p_;
     try {
         const size_t ff = (size_t) feature_floats();
         for (int r = 0; r < n_rows; r += kInjectRows) {
@@ -597,9 +604,9 @@ bool DsparkDrafter::inject(int64_t pos0, int n_rows, const float* features, std:
             for (int j = 0; j < n; ++j) {
                 const int64_t p = pos0 + r + j;
                 d.h_pos[j] = (int32_t) p;
-                d.ring_pos[(size_t) (p % kWindowSlots)] = p;
+                ring_pos_[(size_t) (p % kWindowSlots)] = p;
             }
-            d.inject_staged(n);
+            d.inject_staged(n, rings_);
         }
     } catch (const std::exception& e) {
         err = std::string("dspark inject: ") + e.what();
@@ -610,7 +617,7 @@ bool DsparkDrafter::inject(int64_t pos0, int n_rows, const float* features, std:
 
 bool DsparkDrafter::draft_begin(int32_t anchor, int64_t pos, int n_out, std::string& err) {
     core::OnDevice g(p_->device);
-    Impl& d = *p_;
+    DsparkWorkspace& d = *p_;
     n_out = std::clamp(n_out, 1, kT);
     try {
         // the block's host inputs: four hyper-connection copies of the anchor's embedding, then the index arrays
@@ -619,7 +626,7 @@ bool DsparkDrafter::draft_begin(int32_t anchor, int64_t pos, int n_out, std::str
         for (int s = 1; s < 4; ++s) std::memcpy(d.h_emb + (size_t) s * kN, d.h_emb, (size_t) kN * 4);
         // the window is the run of positions before `pos` the rings hold
         int64_t start = pos;
-        while (start > 0 && pos - start < kDsparkWindow && d.ring_pos[(size_t) ((start - 1) % kWindowSlots)] == start - 1) --start;
+        while (start > 0 && pos - start < kDsparkWindow && ring_pos_[(size_t) ((start - 1) % kWindowSlots)] == start - 1) --start;
         int32_t* m = d.h_meta;
         for (int t = 0; t < kT; ++t) {
             m[t] = (int32_t) (pos + t);
@@ -630,7 +637,7 @@ bool DsparkDrafter::draft_begin(int32_t anchor, int64_t pos, int n_out, std::str
         }
         m[4 * kT + kT * kT] = anchor;
         cudaEventRecord(d.ev0, d.st);
-        if (!d.launch(d.g_body, [&] { d.run_body(); }, err)) return false;
+        if (!d.launch(body_graph_, [&] { d.run_body(rings_); }, err)) return false;
         cudaEventRecord(d.ev_body, d.st);
         if (!d.launch(d.g_head[n_out], [&] { d.run_head(n_out); }, err)) return false;
         cudaEventRecord(d.ev1, d.st);
@@ -645,7 +652,7 @@ bool DsparkDrafter::draft_begin(int32_t anchor, int64_t pos, int n_out, std::str
 
 bool DsparkDrafter::draft_end(DsparkDraft& out, std::string& err) {
     core::OnDevice g(p_->device);
-    Impl& d = *p_;
+    DsparkWorkspace& d = *p_;
     if (!d.block_live) {
         err = "dspark draft: no block was started";
         return false;

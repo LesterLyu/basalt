@@ -69,6 +69,8 @@ read's end (20 × 127 + 128) therefore stops at layer 20's compressor. `--no-pro
 temperature 1 matches plain decode. With tiers moving, rows round as under any placement: forced through the plain text, 15 to 25 prose
 picks and 1 to 6 code picks differ over 800 tokens.
 
+With two slots, each request verifies against its own target state. On UD-IQ1_S at fixed expert placement, the conversation and prose fixtures each matched all 48 greedy solo tokens when interleaved. Cancelling the conversation left the prose output unchanged.
+
 ## Against llama.cpp
 
 Basalt's kernels are its own ports of the same graph. Per-layer tensors on the same weights, relative RMS: router logits 1e-7 (decode),
