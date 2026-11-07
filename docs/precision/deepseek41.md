@@ -97,7 +97,16 @@ Only the listed target experts change. The router, shared experts and DSpark wei
 Replacement RAM is allocated per expert and shared across slots; superseded base bytes are excluded from all tiers.
 Exclusive primary/helper homes release their host allocation only after the incoming copy finishes. Eviction
 allocates RAM above the floor, copies the outgoing weights from VRAM and publishes them after the fence; it never
-rereads replacement weights from the sidecar during inference. Ordinary primary cache copies keep their RAM source.
+rereads replacement weights from the sidecar during inference. The primary's reclaimable cache also owns its weights
+without RAM copies. Startup plans both GPU arenas first and reads each ordinary expert directly into its final tier,
+omitting all replaced base bytes. Replacement metadata is read first; only CPU-owned weights receive persistent RAM,
+while GPU-owned replacements pass through one bounded upload buffer. There is no full host mirror or post-load arena
+rebuild. Before lending cache VRAM to prefill, KV or vision, the tier reserves host backing and copies the weights from
+VRAM; ownership changes only after the copy fence. If backing cannot fit above the RAM floor, the VRAM stays resident.
+Refilling the cache releases
+the returned host allocations again. The helper remains an exclusive owner through the same swap transitions.
+At request and loan boundaries, extra ordinary expert blocks move into vacant arena places and are freed,
+so repeated loans do not retain both empty arena capacity and separate returned weights.
 Initial placement keeps the normal routing rank. CPU jobs dispatch each expert's
 native format and activation quantizer. Primary replacement groups are submitted before joining CPU/helper work.
 Both GPU tiers accept either format; the normal miss split, LRU promotion and swaps apply. Slots follow the layer's

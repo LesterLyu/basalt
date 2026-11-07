@@ -84,20 +84,34 @@ uint64_t granularity() {
     return (uint64_t) g;
 }
 
-uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
-    mapped = 0;
+namespace {
+bool host_prop(CUmemAllocationProp& prop, size_t& g) {
     const Fns& v = fns();
     int dev = current_device(), supported = 0, node = -1;
     CUdevice cu;
-    if (!bytes || !v.ok || v.device_get(&cu, dev) != CUDA_SUCCESS ||
+    if (!v.ok || v.device_get(&cu, dev) != CUDA_SUCCESS ||
         v.attribute(&supported, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) != CUDA_SUCCESS ||
-        !supported || v.attribute(&node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, cu) != CUDA_SUCCESS) return nullptr;
-    CUmemAllocationProp prop{};
+        !supported || v.attribute(&node, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, cu) != CUDA_SUCCESS) return false;
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location = {CU_MEM_LOCATION_TYPE_HOST_NUMA, node < 0 ? 0 : node};
+    return v.granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS && g;
+}
+}
+
+uint64_t host_granularity() {
+    CUmemAllocationProp prop{};
     size_t g = 0;
-    if (v.granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS ||
-        !g || bytes > SIZE_MAX - (g - 1)) return nullptr;
+    return host_prop(prop,g) ? g : 0;
+}
+
+uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
+    mapped = 0;
+    const Fns& v = fns();
+    CUmemAllocationProp prop{};
+    size_t g = 0;
+    if (!bytes || !host_prop(prop,g)) return nullptr;
+    const int dev = current_device();
+    if (bytes > SIZE_MAX - (g - 1)) return nullptr;
     size_t n = (bytes + g - 1) / g * g;
     CUdeviceptr p = 0;
     CUmemGenericAllocationHandle h;

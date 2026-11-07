@@ -47,10 +47,13 @@ public:
     struct Replacement {
         kernels::NativeExpertLayout layout;
         kernels::cpu::NativeFmt cpu;
+        uint64_t offset = 0;
         mutable std::unique_ptr<ExpertRam> ram;
         const uint8_t* host() const { return ram && ram->ready ? ram->data : nullptr; }
     };
     bool has_overlay() const { return overlay_bytes_ != 0; }
+    uint64_t initial_overlay_ram_budget() const { return overlay_ram_budget_; }
+    bool read_initial_replacement(int layer, int expert, uint8_t* to, std::string& err) const;
     uint8_t* prepare_replacement_ram(int layer, int expert) const;
     void publish_replacement_ram(int layer, int expert) const;
     void release_replacement_ram(int layer, int expert) const;
@@ -130,6 +133,8 @@ public:
 private:
     std::vector<Replacement> overlay_;
     size_t overlay_bytes_ = 0;
+    uint64_t overlay_ram_budget_ = 0;
+    core::FileRange overlay_source_;
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;

@@ -62,27 +62,27 @@ bool DsModel::load_overlay(const std::string& path, std::string& err) {
         ent.layout.swiglu_limit = g.clamp_exp[l];
         if (!kernels::cpu::native_fmt(gu,d,g.n_embd,g.n_ff_exp,ent.cpu,err,g.clamp_exp[l])) return false;
         if (ent.layout.bytes!=bytes) {err="overlay expert size does not match quantization"; return false;}
+        ent.offset = off;
         entries.emplace_back(key,off); cursor+=bytes;
     }
     if (cursor!=data.bytes || entries.empty()) {err="incomplete overlay layout"; return false;}
-    core::detail::HostMemory hm;
-    if (!core::detail::host_available_memory(hm) ||
-        cursor > core::ram_tier_room(hm.available, platform::ram_reserve(), true)) {
-        err = "not enough RAM above the safety reserve for expert overlay"; return false;
-    }
     overlay_bytes_=cursor;
-    uint64_t allocated = 0, pinned = 0;
-    for (auto [i,off] : entries) {
-        auto* dst = prepare_replacement_ram((int)(i/g.n_expert),(int)(i%g.n_expert));
-        if (!dst) { err="cannot allocate host replacement expert above the RAM floor"; return false; }
-        if (!core::read_range_at(data,off,dst,overlay_[i].layout.bytes,err)) return false;
-        overlay_[i].ram->ready = true;
-        allocated += overlay_[i].ram->allocated();
-        pinned += overlay_[i].ram->registered();
+    overlay_source_ = data;
+    const uint64_t grain = platform::kDirectHostVmmExchange ? core::vmm::host_granularity() : 0;
+    overlay_ram_budget_ = 0;
+    for (const auto& entry : entries) {
+        const auto bytes = overlay_[entry.first].layout.bytes;
+        overlay_ram_budget_ += grain ? (bytes+grain-1)/grain*grain : bytes;
     }
-    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB weights, %.2f GiB initial RAM, %.2f GiB pinned; exclusive GPU homes",
-                    entries.size(),cursor/1073741824.,allocated/1073741824.,pinned/1073741824.);
+    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB weights; loading after tier placement",
+                    entries.size(),cursor/1073741824.);
     return true;
+}
+
+bool DsModel::read_initial_replacement(int layer, int expert, uint8_t* to, std::string& err) const {
+    const auto* v = replacement(layer,expert);
+    if (!v || !to) { err = "invalid initial replacement destination"; return false; }
+    return core::read_range_at(overlay_source_,v->offset,to,v->layout.bytes,err);
 }
 
 uint8_t* DsModel::prepare_replacement_ram(int layer, int expert) const {

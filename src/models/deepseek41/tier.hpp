@@ -1,9 +1,9 @@
 // src/models/deepseek41/tier.hpp - where the routed experts of a DeepSeek-V4.1 pack live while a token runs.
 //
 // An expert's home is a slot of the main card, a slot of a second card, the pinned RAM tier or the pack file mapped
-// read-only (policy::Homes); the routing order deals them out at the start. The main card's other slots (shared
-// core::ExpertCache storage) hold copies of pinned experts; its homes and copies share a per-layer LRU, and a home that
-// loses its slot, on either card, goes to RAM, into the place of the expert taking the slot. The GPUs compute the experts they
+// read-only (policy::Homes); the routing order deals them out at the start. The main card's reclaimable cache and its
+// permanent homes share a per-layer LRU. Both GPUs own resident weights exclusively; an evicted expert goes to RAM
+// before its GPU slot is overwritten. The GPUs compute the experts they
 // hold; the CPU pool computes the rest from RAM or the mapped file while the GPUs work, and the pinned experts it
 // computed are copied into the main card's LRU on a side stream so the next token finds them there.
 #pragma once
@@ -74,7 +74,7 @@ public:
     bool open(const Reserve& reserve, float* h_rows, std::string& err);
 
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
-    /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
+    /// allocated); `grow` takes the memory freed after them as extra slots. Weights return to RAM before release.
     void shrink();
     void grow();
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
@@ -183,6 +183,9 @@ private:
     uint8_t* ram_place(int layer, int place) const;
     bool ensure_spare(int layer);
     void return_place(int layer, int place);
+    void pack_extra_ram();
+    uint64_t resident_ram_bytes() const;
+    bool restore_primary(int64_t first, std::string& err);
     void land_home(int layer, int in, int out, int place);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
@@ -211,6 +214,8 @@ private:
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
+    bool exclusive_cache_ = false;         ///< primary cache entries own their weights without RAM copies
+    uint64_t returned_experts_ = 0, returned_bytes_ = 0;
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
@@ -245,8 +250,8 @@ private:
     policy::Homes homes_;
     std::vector<policy::Homes> layer_homes_;
     std::vector<int> base_count_;          ///< effective base experts; replacement weights have separate RAM backing
-    uint64_t resident_bytes_ = 0;          ///< RAM weights excluding swap spares
     std::vector<int32_t> rank_;             ///< [layer * n_expert + rank] expert; empty: the file's order
+    std::vector<std::vector<int>> initial_seeds_; ///< ranked host candidates while initial placement is planned
     std::vector<std::vector<int>> preread_experts_; ///< immutable initial file-backed ranking for the reader thread
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1

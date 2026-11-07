@@ -14,6 +14,8 @@ namespace basalt::core::vmm {
 bool supported();
 /// The allocation granularity of the current device (every size and offset below is a multiple of it); 0 on failure.
 uint64_t granularity();
+/// The minimum host allocation granularity on the current device, or 0 without host VMM.
+uint64_t host_granularity();
 /// CUDA-pinned system memory accessible to the CPU and only the current GPU.
 /// Returns the padded mapping size for free_host; no portable registration is involved.
 uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped);

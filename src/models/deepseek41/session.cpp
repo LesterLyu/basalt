@@ -342,7 +342,9 @@ public:
 
     ExpertCounts expert_counts() const override {
         std::string e;
-        const ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        // Publish completed cache moves before the request's counters and memory snapshot.
+        if (t) t->settle();
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
