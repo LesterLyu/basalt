@@ -22,10 +22,7 @@ namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
     shared_tier_.tier.reset();
-    if (overlay_host_) {
-        if (overlay_mapped_) core::vmm::free_host(overlay_host_, overlay_mapped_);
-        else { core::unpin_ram(overlay_host_, overlay_pin_); platform::free_aligned(overlay_host_); }
-    }
+    overlay_.clear();
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (embd_fd_ >= 0) platform::close_fd(embd_fd_);
@@ -73,21 +70,43 @@ bool DsModel::load_overlay(const std::string& path, std::string& err) {
         cursor > core::ram_tier_room(hm.available, platform::ram_reserve(), true)) {
         err = "not enough RAM above the safety reserve for expert overlay"; return false;
     }
-    if constexpr (platform::kDirectHostVmmExchange)
-        overlay_host_ = core::vmm::alloc_host(cursor, overlay_mapped_);
-    if (!overlay_host_) overlay_host_ = core::alloc_ram(cursor);
-    if (!overlay_host_) {err="cannot allocate host expert overlay";return false;}
-    for (uint64_t at=0;at<cursor;) {
-        const size_t n=(size_t)std::min<uint64_t>(8<<20,cursor-at);
-        if (!core::read_range_at(data,at,overlay_host_+at,n,err)) return false;
-        at+=n;
-    }
-    if (!overlay_mapped_) overlay_pin_ = core::pin_ram(overlay_host_, cursor, cursor, {}, false);
-    for (auto [i,off]:entries) overlay_[i].blob=overlay_host_+off;
     overlay_bytes_=cursor;
-    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB in RAM, %.2f GiB pinned; adaptive GPU copies",
-                    entries.size(),cursor/1073741824.,(overlay_mapped_ ? overlay_mapped_ : overlay_pin_.registered_bytes)/1073741824.);
+    uint64_t allocated = 0, pinned = 0;
+    for (auto [i,off] : entries) {
+        auto* dst = prepare_replacement_ram((int)(i/g.n_expert),(int)(i%g.n_expert));
+        if (!dst) { err="cannot allocate host replacement expert above the RAM floor"; return false; }
+        if (!core::read_range_at(data,off,dst,overlay_[i].layout.bytes,err)) return false;
+        overlay_[i].ram->ready = true;
+        allocated += overlay_[i].ram->allocated();
+        pinned += overlay_[i].ram->registered();
+    }
+    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB weights, %.2f GiB initial RAM, %.2f GiB pinned; exclusive GPU homes",
+                    entries.size(),cursor/1073741824.,allocated/1073741824.,pinned/1073741824.);
     return true;
+}
+
+uint8_t* DsModel::prepare_replacement_ram(int layer, int expert) const {
+    const auto* v = replacement(layer,expert);
+    if (!v) return nullptr;
+    if (v->ram) return v->ram->data;
+    core::detail::HostMemory hm;
+    if (!core::detail::host_available_memory(hm)) return nullptr;
+    const auto room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
+    if (v->layout.bytes > room) return nullptr;
+    auto ram = std::make_unique<ExpertRam>();
+    if (!ram->allocate(v->layout.bytes) || ram->allocated() > room) return nullptr;
+    auto* data = ram->data;
+    v->ram = std::move(ram);
+    return data;
+}
+
+void DsModel::publish_replacement_ram(int layer, int expert) const {
+    const auto* v = replacement(layer,expert);
+    if (v && v->ram) v->ram->ready = true;
+}
+
+void DsModel::release_replacement_ram(int layer, int expert) const {
+    if (const auto* v = replacement(layer,expert)) v->ram.reset();
 }
 
 bool DsModel::load(const std::string& path, std::string& err) {

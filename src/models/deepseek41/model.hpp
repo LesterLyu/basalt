@@ -11,6 +11,7 @@
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
+#include "models/deepseek41/expert_ram.hpp"
 
 #include <map>
 #include <algorithm>
@@ -46,9 +47,13 @@ public:
     struct Replacement {
         kernels::NativeExpertLayout layout;
         kernels::cpu::NativeFmt cpu;
-        const void* blob = nullptr;
+        mutable std::unique_ptr<ExpertRam> ram;
+        const uint8_t* host() const { return ram && ram->ready ? ram->data : nullptr; }
     };
-    bool has_overlay() const { return overlay_host_ != nullptr; }
+    bool has_overlay() const { return overlay_bytes_ != 0; }
+    uint8_t* prepare_replacement_ram(int layer, int expert) const;
+    void publish_replacement_ram(int layer, int expert) const;
+    void release_replacement_ram(int layer, int expert) const;
     uint64_t overlay_max_bytes(int layer = -1) const {
         uint64_t bytes = 0;
         if (has_overlay())
@@ -60,7 +65,7 @@ public:
     const Replacement* replacement(int l, int e) const {
         if (!has_overlay()) return nullptr;
         const auto& v = overlay_[(size_t) l * geo().n_expert + e];
-        return v.blob ? &v : nullptr;
+        return v.layout.bytes ? &v : nullptr;
     }
 
     const model::ModelDesc& desc() const override { return desc_; }
@@ -72,10 +77,10 @@ public:
 
     void memory_usage(core::MemoryUsage& usage) const override {
         if (!usage.claim(this)) return;
-        if (overlay_bytes_) {
-            usage.host["resident_experts"] += overlay_bytes_;
-            usage.host["pinned_experts"] += overlay_mapped_ ? overlay_mapped_ : overlay_pin_.registered_bytes;
-            usage.host["locked_experts"] += overlay_pin_.locked_bytes;
+        for (const auto& v : overlay_) if (v.ram) {
+            usage.host["resident_experts"] += v.ram->allocated();
+            usage.host["pinned_experts"] += v.ram->registered();
+            usage.host["locked_experts"] += v.ram->pin.locked_bytes;
         }
         for (const auto& [name, t] : dev_) if (t.ptr) usage.device(device_, "weights", t.bytes);
     }
@@ -124,9 +129,6 @@ public:
 
 private:
     std::vector<Replacement> overlay_;
-    uint8_t* overlay_host_ = nullptr;
-    uint64_t overlay_mapped_ = 0;
-    core::RamPin overlay_pin_;
     size_t overlay_bytes_ = 0;
     Pack pack_;
     model::ModelDesc desc_;

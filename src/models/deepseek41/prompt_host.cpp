@@ -28,7 +28,7 @@ uint64_t staged_stride(const ExpertLayer& e) {
 }
 
 PromptHost::~PromptHost() {
-    for (void* p : {(void*) ring, (void*) stage[0], (void*) stage[1], (void*) hx, (void*) hrows, (void*) xb})
+    for (void* p : {(void*) ring, (void*) stage[0], (void*) stage[1], (void*) replacement_stage, (void*) hx, (void*) hrows, (void*) xb})
         if (p) cudaFreeHost(p);
     platform::free_aligned(act);
 }
@@ -51,6 +51,7 @@ bool PromptHost::open(const DsModel& m, int pieces, int slots, bool vision, std:
     bool ok = pin(ring, (size_t) pieces * slot, kPortable) &&
               pin(stage[0], (size_t) prefillp::kStageExperts * slot, kPortable) &&
               pin(stage[1], (size_t) prefillp::kStageExperts * slot, kPortable) &&
+              pin(replacement_stage, (size_t)m.overlay_max_bytes(), kPortable) &&
               pin(hx, (size_t) share_rows * n * 4, kPortable) && pin(hrows, (size_t) prefillp::kShareRows * n * 4, kMapped) &&
               pin(xb, (size_t) core::PeerExperts::kRowBatch * n * 4, kPortable);
     act = ok ? (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * (size_t) share_rows, 64) : nullptr;

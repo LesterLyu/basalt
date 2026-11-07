@@ -49,6 +49,7 @@ public:
         stop_prefetch();
         for (cudaEvent_t e : pf_events_) cudaEventDestroy(e);
         for (const auto& o : pf_out_) cudaEventDestroy(o.first);
+        if (replacement_copied_) cudaEventDestroy(replacement_copied_);
         for (void* p : dev_) cudaFree(p);
         for (Stage& b : stage_) {
             if (b.copied) cudaEventDestroy(b.copied);
@@ -88,7 +89,8 @@ public:
         if (m_.has_overlay())
             ok = ok && dev(overlay_x_, kernels::native_q8_1_bytes(g_.n_embd,1)) &&
                  dev(overlay_scratch_, kernels::gated_mlp_scratch_bytes(1,g_.n_ff_exp)) &&
-                 dev(overlay_blob_, m_.overlay_max_bytes());
+                 dev(overlay_blob_, m_.overlay_max_bytes()) &&
+                 cudaEventCreateWithFlags(&replacement_copied_, cudaEventDisableTiming) == cudaSuccess;
         for (int i = 0; i < 2; ++i) {
             Stage& b = stage_[i];
             b.host = host.stage[i];
@@ -280,8 +282,25 @@ public:
                 const auto src = tier_->locate(il,e);
                 const void* blob = src.dev;
                 if (!blob) {
-                    if (cudaMemcpyAsync(overlay_blob_,v->blob,v->layout.bytes,cudaMemcpyHostToDevice,st) != cudaSuccess) {
+                    const uint8_t* host = src.pinned;
+                    if (src.peer) {
+                        if (replacement_copy_pending_ && cudaEventSynchronize(replacement_copied_) != cudaSuccess) {
+                            err = "deepseek41: waiting for replacement staging failed"; return false;
+                        }
+                        auto* stage = tier_->host().replacement_stage;
+                        tier_->peer()->read_slot(src.peer, stage, v->layout.bytes);
+                        if (!tier_->peer()->read_wait(err)) return false;
+                        host = stage;
+                    }
+                    if (!host) { err = "deepseek41: replacement has neither RAM nor GPU backing"; return false; }
+                    if (cudaMemcpyAsync(overlay_blob_,host,v->layout.bytes,cudaMemcpyHostToDevice,st) != cudaSuccess) {
                         err = "deepseek41: cannot stage replacement prompt expert"; return false;
+                    }
+                    if (src.peer) {
+                        if (cudaEventRecord(replacement_copied_,st) != cudaSuccess) {
+                            err = "deepseek41: fencing replacement staging failed"; return false;
+                        }
+                        replacement_copy_pending_ = true;
                     }
                     blob = overlay_blob_;
                 }
@@ -867,6 +886,8 @@ private:
     uint64_t allocated_bytes_ = 0;
     void *xq1_ = nullptr, *xq2_ = nullptr;
     void *overlay_x_ = nullptr, *overlay_scratch_ = nullptr, *overlay_blob_ = nullptr;
+    cudaEvent_t replacement_copied_ = nullptr;
+    bool replacement_copy_pending_ = false;
     int32_t *ident_ = nullptr, *sbnd_ = nullptr;
     float *gu_ = nullptr, *h_ = nullptr, *rows_ = nullptr;
     float *hx_ = nullptr, *hrows_ = nullptr, *peer_rows_ = nullptr, *xb_ = nullptr, *drows_ = nullptr;

@@ -38,6 +38,7 @@ public:
     uint8_t* ring = nullptr;            ///< [ring_pieces][slot], pinned
     int ring_pieces = 0;
     uint8_t* stage[2] = {};             ///< [kStageExperts][slot] each, pinned: a short read's two launches
+    uint8_t* replacement_stage = nullptr; ///< one helper-owned replacement, copied through RAM without retaining it
     float* hx = nullptr;                ///< [share_rows][n_embd] a short read's activations, pinned
     float* hrows = nullptr;             ///< [kShareRows][n_embd] rows the CPU and the second card return, pinned and mapped
     float* xb = nullptr;                ///< [kRowBatch][n_embd] one batch to the second card, pinned

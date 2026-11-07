@@ -2,6 +2,7 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "models/deepseek41/expert_ram.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
@@ -164,6 +165,19 @@ int main(int argc, char** argv) try {
         }
     }
     cudaFree(scratch); cudaFree(xq); cudaFree(dy); cudaFree(dx);
+    // GPU-exclusive homes drop the allocation and reconstruct the same bytes from VRAM.
+    for (int round = 0; round < 4; ++round) for (int i = 0; i < E; ++i) {
+        auto ram = std::make_unique<basalt::models::deepseek41::ExpertRam>();
+        require(ram->allocate(experts[i].bytes.size()),"recreate exclusive expert RAM");
+        require(!ram->ready,"RAM must not publish before the device copy");
+        peer.read_slot(peer.slot_ptr(0,i),ram->data,experts[i].bytes.size());
+        require(peer.read_wait(err),err.c_str());
+        require(!std::memcmp(ram->data,experts[i].bytes.data(),experts[i].bytes.size()),"VRAM restored bytes changed");
+        ram->ready = true;
+        require(ram->allocated() >= experts[i].bytes.size(),"resident accounting");
+        ram.reset();
+        require(!ram,"exclusive home retained its host allocation");
+    }
     std::puts("ds41_mixed_expert_test: ok");
     return 0;
 } catch (const std::exception& e) { std::printf("FAIL: %s\n",e.what()); return 1; }

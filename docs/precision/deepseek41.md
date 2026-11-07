@@ -94,15 +94,19 @@ Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 2
 `overlay.base-header`, a text `overlay.layout` starting with `BASALT_DS_EXPERTS_V1` and rows
 `layer expert gate_up_type down_type offset bytes`, and the contiguous `experts` section (gate, up, down).
 Only the listed target experts change. The router, shared experts and DSpark weights keep their original precision.
-Replacement weights have one immutable RAM backing shared across slots; their superseded base bytes are
-excluded from all tiers. Initial placement keeps the normal routing rank. CPU jobs dispatch each expert's
+Replacement RAM is allocated per expert and shared across slots; superseded base bytes are excluded from all tiers.
+Exclusive primary/helper homes release their host allocation only after the incoming copy finishes. Eviction
+allocates RAM above the floor, copies the outgoing weights from VRAM and publishes them after the fence; it never
+rereads replacement weights from the sidecar during inference. Ordinary primary cache copies keep their RAM source.
+Initial placement keeps the normal routing rank. CPU jobs dispatch each expert's
 native format and activation quantizer. Primary replacement groups are submitted before joining CPU/helper work.
 Both GPU tiers accept either format; the normal miss split, LRU promotion and swaps apply. Slots follow the layer's
 size distribution and initial ranked experts, with a slot for its largest format. Admission selects a fitting slot;
 swap directions use their actual byte counts. A displaced base expert gets a RAM place subject to the RAM floor.
 No weights are requantized and neither pack is rewritten.
 
-Prompt reads stage each replacement once for all its rows and retain native row arithmetic. Base experts use
+Prompt reads stage each replacement once for all its rows and retain native row arithmetic. Helper-only weights
+pass through one bounded host staging buffer; a copy fence protects its reuse. Base experts use
 the host read-ahead ring with the existing compute groups. `--prefill-chunk N` (config `engine.prefill-chunk`)
 sets a power-of-two ceiling from 256 through 16384; the default is 16384. Memory fit may halve it.
 Disk KV reuse must be disabled with an overlay; removing the overlay restores the base model.

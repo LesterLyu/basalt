@@ -653,16 +653,18 @@ bool ExpertTier::load_ram(std::string& err) {
         if (!v) continue;
         const int s = res_[(size_t)l*n_expert_+e];
         if (s >= 0) {
-            if (cudaMemcpy(cache_.device_slot(s), v->blob, v->layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (cudaMemcpy(cache_.device_slot(s), v->host(), v->layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = "deepseek41: loading a replacement primary expert"; return false;
             }
             main_load->add(v->layout.bytes);
+            m_.release_replacement_ram(l,e);
         } else if (peer_ && peer_->slot_ptr(l,e)) {
             const int ps = peer_->residency()[(size_t)l*n_expert_+e];
-            if (!peer_->fill_slot(ps, (const uint8_t*)v->blob, v->layout.bytes)) {
+            if (!peer_->fill_slot(ps, v->host(), v->layout.bytes)) {
                 err = "deepseek41: loading a replacement helper expert"; return false;
             }
             peer_load->add(v->layout.bytes);
+            m_.release_replacement_ram(l,e);
         }
     }
     if (ram_load) ram_load->finish();
@@ -727,7 +729,7 @@ void ExpertTier::seed_copies(int64_t n) {
 }
 
 const uint8_t* ExpertTier::blob_of(int layer, int e) const {
-    if (const auto* v = m_.replacement(layer, e)) return static_cast<const uint8_t*>(v->blob);
+    if (const auto* v = m_.replacement(layer, e)) return v->host();
     const ExpertLayer& el = m_.pack().experts[(size_t) layer];
     const int32_t r = ram_idx_[(size_t) layer * n_expert_ + e];
     if (r >= 0) return ram_place(layer, r);
@@ -736,7 +738,8 @@ const uint8_t* ExpertTier::blob_of(int layer, int e) const {
 }
 
 bool ExpertTier::pinned(int layer, int e) const {
-    return m_.replacement(layer, e) || ram_idx_[(size_t) layer * n_expert_ + e] >= 0;
+    if (const auto* v = m_.replacement(layer, e)) return v->host() != nullptr;
+    return ram_idx_[(size_t) layer * n_expert_ + e] >= 0;
 }
 
 const kernels::cpu::NativeFmt& ExpertTier::fmt(int layer, int e) const {
@@ -801,8 +804,10 @@ void ExpertTier::return_place(int layer, int place) {
 
 void ExpertTier::land_home(int layer, int in, int out, int place) {
     const size_t base = (size_t) layer * n_expert_;
-    if (place >= 0) ram_idx_[base + out] = place;
-    if (!m_.replacement(layer, in)) {
+    if (out >= 0 && m_.replacement(layer,out)) m_.publish_replacement_ram(layer,out);
+    else if (place >= 0) ram_idx_[base + out] = place;
+    if (m_.replacement(layer, in)) m_.release_replacement_ram(layer,in);
+    else {
         const int old = ram_idx_[base + in];
         ram_idx_[base + in] = -1;
         return_place(layer, old);
@@ -1130,11 +1135,13 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     if (slot < 0 || oldest >= on_main) return false;
     const int victim = peer_owner_[(size_t) slot];
     const bool needs_home = !pinned(layer, victim);
-    if (needs_home && !ensure_spare(layer)) return false;
-    const int32_t place = needs_home ? spare_[layer] : -1;
-    if (needs_home) spare_[layer] = -1;
+    const bool replacement_home = needs_home && m_.replacement(layer,victim);
+    uint8_t* out = replacement_home ? m_.prepare_replacement_ram(layer,victim) : nullptr;
+    if (replacement_home && !out) return false;
+    if (needs_home && !replacement_home && !ensure_spare(layer)) return false;
+    const int32_t place = needs_home && !replacement_home ? spare_[layer] : -1;
+    if (place >= 0) { spare_[layer] = -1; out = ram_place(layer,place); }
     const uint64_t out_bytes = needs_home ? expert_bytes(layer,victim) : 0;
-    auto* out = needs_home ? ram_place(layer,place) : nullptr;
     if (peer_submitter_) {
         peer_submitter_->submit({slot, out, src, out_bytes, bytes});
     } else if (!host_vmm_bytes_.empty()) {
@@ -1179,14 +1186,18 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     const int32_t slot = oldest_slot(layer, homes_too, best, expert_bytes(layer,e));
     if (slot < 0 || best == tick_) return -1;   // every slot is in use by this very lookup
     const int32_t o = owner_[(size_t) slot];
+    const bool home = homes_.main > 0 && slot < (int64_t) n_layers_ * per_layer_;
+    const bool needs_home = home && o >= 0 && !pinned(layer,o);
+    const bool replacement_home = needs_home && m_.replacement(layer,o);
+    uint8_t* home_to = replacement_home ? m_.prepare_replacement_ram(layer,o) : nullptr;
+    if (replacement_home && !home_to) return -1;
+    if (needs_home && !replacement_home && spare_[layer] < 0) return -1;
     if (o >= 0) res_[(size_t) layer * n_expert_ + o] = -1;
     owner_[(size_t) slot] = e;
     busy_[(size_t) slot] = 1;
     stamp_[(size_t) layer * n_expert_ + e] = tick_;
     const uint64_t bytes = replacement ? replacement->layout.bytes : m_.pack().experts[(size_t) layer].blob_bytes;
     uint8_t* dst = const_cast<uint8_t*>(slot_ptr(slot));
-    const bool home = homes_.main > 0 && slot < (int64_t) n_layers_ * per_layer_;
-    const bool needs_home = home && o >= 0 && !pinned(layer,o);
     const uint64_t out_bytes = needs_home ? expert_bytes(layer,o) : 0;
     int32_t place = -1;
     const uint64_t piece = whole ? bytes : policy::kPieceBytes;
@@ -1194,21 +1205,22 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
         for (uint64_t off = 0; off < size; off += piece)
             cudaMemcpyAsync(to + off, from + off, std::min(piece, size - off), kind, stream);
     };
-    if (needs_home) {   // the home's bytes first: the stream keeps the order
+    if (needs_home && !replacement_home) {
         place = spare_[(size_t) layer];
         spare_[(size_t) layer] = -1;
+        home_to = ram_place(layer,place);
     }
     const int ev = free_events_.back();
     free_events_.pop_back();
     ++promoted_;
     if (replacement) ++overlay_copies_;
     if (later) {
-        Queued q{{layer, e, slot, ev, o, place, home}, dst, src, needs_home ? ram_place(layer,place) : nullptr, bytes};
+        Queued q{{layer, e, slot, ev, o, place, home}, dst, src, home_to, bytes};
         q.home_bytes = out_bytes;
         queue_.push_back(q);
         return slot;
     }
-    if (needs_home) pieces(ram_place(layer,place), dst, out_bytes, cudaMemcpyDeviceToHost);
+    if (needs_home) pieces(home_to, dst, out_bytes, cudaMemcpyDeviceToHost);
     pieces(dst, src, bytes, cudaMemcpyHostToDevice);
     cudaEventRecord(events_[(size_t) ev], stream);
     pending_.push_back({layer, e, slot, ev, o, place, home});
