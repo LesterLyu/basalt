@@ -5,6 +5,7 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/peer_copy.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
@@ -66,63 +67,25 @@ inline size_t peer_scales_at(int64_t Tp) { return al256(fp4::token_bytes(Tp, N))
 // the peer's device-to-host copies run ahead of the primary's host-to-device ones, and no host thread blocks in a
 // synchronous staged peer copy.
 struct PeerStage {
-    // a failed call here would let a buffer be reused early and corrupt weights silently: stop instead
-    static void must(cudaError_t e, const char* what) {
-        if (e != cudaSuccess) {
-            basalt::log::error("basalt", "prefill peer stage: %s: %s", what, cudaGetErrorString(e));
-            std::exit(1);
-        }
-    }
     static constexpr int kBufs = 16;
-    uint8_t* buf[kBufs] = {};
-    cudaEvent_t d2h[kBufs] = {}, h2d[kBufs] = {};
-    cudaStream_t stream = nullptr;
-    int dev = -1, n = 0;
-    bool ok = false;
-    size_t bytes = 0;
-    bool setup(int peer_dev, size_t blob_bytes) {
-        if (ok && dev == peer_dev && bytes >= blob_bytes) return true;
-        release();
-        dev = peer_dev;
-        bytes = blob_bytes;
-        for (int i = 0; i < kBufs; ++i)
-            if (cudaHostAlloc((void**) &buf[i], bytes, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); release(); return false; }
-        // h2d is recorded on the primary's copy stream, so it belongs to the current (primary) device; the rest to the peer
-        for (int i = 0; i < kBufs; ++i)
-            if (cudaEventCreateWithFlags(&h2d[i], cudaEventDisableTiming) != cudaSuccess) { release(); return false; }
-        const core::OnDevice od(dev);
-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) { release(); return false; }
-        for (int i = 0; i < kBufs; ++i)
-            if (cudaEventCreateWithFlags(&d2h[i], cudaEventDisableTiming) != cudaSuccess) { release(); return false; }
-        ok = true;
-        return true;
+    core::PeerCopy transport;
+    bool setup(int peer_dev, size_t blob_bytes, std::string& err) {
+        int primary = 0;
+        const cudaError_t e = cudaGetDevice(&primary);
+        if (e != cudaSuccess) {
+            err = std::string("prefill peer stage: ") + cudaGetErrorString(e);
+            return false;
+        }
+        return transport.open(peer_dev, primary, blob_bytes, kBufs, err);
     }
     // queue `src` (on the peer) into `dst` (on the current device) behind `copy_stream`'s earlier work
     void copy(void* dst, const void* src, size_t nbytes, cudaStream_t copy_stream) {
-        const int b = n++ % kBufs;
-        {
-            const core::OnDevice od(dev);
-            must(cudaStreamWaitEvent(stream, h2d[b], 0), "wait for the buffer's previous host-to-device copy");
-            must(cudaMemcpyAsync(buf[b], src, nbytes, cudaMemcpyDeviceToHost, stream), "device-to-host copy");
-            must(cudaEventRecord(d2h[b], stream), "record the device-to-host copy");
+        std::string err;
+        if (!transport.copy(dst, src, nbytes, copy_stream, err)) {
+            basalt::log::error("basalt", "prefill peer stage: %s", err.c_str());
+            std::exit(1);
         }
-        must(cudaStreamWaitEvent(copy_stream, d2h[b], 0), "wait for the device-to-host copy");
-        must(cudaMemcpyAsync(dst, buf[b], nbytes, cudaMemcpyHostToDevice, copy_stream), "host-to-device copy");
-        must(cudaEventRecord(h2d[b], copy_stream), "record the host-to-device copy");
     }
-    void release() {
-        ok = false;
-        for (int i = 0; i < kBufs; ++i) {
-            if (buf[i]) cudaFreeHost(buf[i]);
-            buf[i] = nullptr;
-            if (d2h[i]) cudaEventDestroy(d2h[i]);
-            if (h2d[i]) cudaEventDestroy(h2d[i]);
-            d2h[i] = h2d[i] = nullptr;
-        }
-        if (stream) { const core::OnDevice od(dev); cudaStreamDestroy(stream); }
-        stream = nullptr;
-    }
-    ~PeerStage() { release(); }
 };
 
 }  // namespace basalt::prefill

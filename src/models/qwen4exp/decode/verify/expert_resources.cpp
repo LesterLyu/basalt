@@ -178,11 +178,17 @@ bool Verifier::dm_init(std::string& err) {
             }
             x.shadow.assign((size_t) LE, INT32_MIN);
             if (!ok) { err = "verify: device-planned MoE buffers of a further peer"; return false; }
+            x.launcher = std::make_unique<PeerWindowLauncher>();
+            if (!x.launcher->open(x.dev, err)) return false;
         }
     }
     if (d->pdev >= 0) {
         hs_init();
         gs_init();
+    }
+    if (d->pdev >= 0) {
+        d->launcher = std::make_unique<PeerWindowLauncher>();
+        if (!d->launcher->open(d->pdev, err)) return false;
     }
     if (cpu_warm && codes_ok) {
         CpuWarm* w = new CpuWarm;
@@ -251,6 +257,7 @@ bool Verifier::dm_init(std::string& err) {
 void Verifier::dm_free() {
     DecMoe* d = dm_;
     if (d == nullptr) return;
+    d->launcher.reset();
     hs_free();
     gs_free();
     if (d->warm != nullptr) {
@@ -264,6 +271,7 @@ void Verifier::dm_free() {
             if (p) cudaFree(p);
     }
     for (DecMoe::XPeer& x : d->xp) {
+        x.launcher.reset();
         {
             const OnDevice on(x.dev);
             if (x.ps) { cudaStreamSynchronize(x.ps); cudaStreamDestroy(x.ps); }

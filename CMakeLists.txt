@@ -299,7 +299,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/host_plan.cpp)
+                             src/core/peer_copy.cpp src/core/host_plan.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -394,6 +394,11 @@ if(BUILD_TESTING)
   basalt_embed_manifest(direct_upload_test)
   basalt_gpu_test(NAME direct_upload_test COMMAND direct_upload_test)
   set_tests_properties(direct_upload_test PROPERTIES TIMEOUT 60)
+  add_executable(peer_copy_test tests/core/peer_copy_test.cpp)
+  target_link_libraries(peer_copy_test PRIVATE core)
+  basalt_embed_manifest(peer_copy_test)
+  basalt_gpu_test(NAME peer_copy_test COMMAND peer_copy_test)
+  set_tests_properties(peer_copy_test PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endif()
 # the learned expert profile (--expert-profile-save): its order and file format (CPU only)
 if(BUILD_TESTING)
