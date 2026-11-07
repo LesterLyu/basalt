@@ -98,12 +98,16 @@ Command line `--name`; the Where column says which config block takes it.
 
 ## Expert cache and memory
 
+`full-resident-experts` (Flash-Next engine, switch, off by default) keeps every expert in RAM, including GPU copies.
+It cannot be combined with mmap/complement modes. The full-arena RAM guard still applies; `prefill auto` uses
+the pack's normal chunk ceiling, bounded by the expert cache's lendable capacity.
+
 When every expert has a RAM or GPU copy, serving releases its expert file view after loading. PLE can keep reading
 its embedded table directly; copy fallbacks use a bounded direct-read buffer, and pointer fallbacks restore the view.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `vram-reserve-mib` | engine | MiB, at least 256 (128 on Linux) | 700 (lowered to 300 on a card with too few slots) | VRAM kept free on the main card for graphs, scratch and the head. Raised to the floor the kernels need (`--parallel 4` on Linux: at least 320). |
+| `vram-reserve-mib` | engine | MiB, at least 200 (128 on Linux) | 700 (lowered to 300 on a card with too few slots) | VRAM kept free on the main card for graphs, scratch and the head. Raised to the floor the kernels need (`--parallel 4` on Linux: at least 320). |
 | `resident-experts` | engine | switch | on with a profile | Flash-Next only. Keep experts the GPU does not hold in page-locked RAM. Falls back to a file mapping when RAM is short. |
 | `resident-budget-gib` | engine | GiB | auto | At most N GiB of experts in RAM, hottest first. |
 | `mmap-experts` | engine | switch | off | Flash-Next only. Use a file mapping instead of the RAM copy. |

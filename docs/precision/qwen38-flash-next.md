@@ -207,3 +207,9 @@ Quality gate (100 chunks, 400 W + 180 W, int8 KV, both flags together) and prose
 
 The flags' speed comes from fewer misses, so it grows with the share
 of experts outside VRAM, and so does the error. The bare defaults are not measured.
+
+## Full-RAM automatic prompt chunks
+
+The anonymous full-RAM arena uses the resident complement's automatic chunk ceiling, bounded by lendable cache capacity.
+A file-backed arena keeps the conservative 8192-token ceiling unless `auto:N` is explicit. Different chunk grids can
+change K/V rounding for long prompts; the quality gate's 256-token prompt half still fits in one chunk.

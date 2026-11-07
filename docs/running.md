@@ -60,7 +60,7 @@ free RAM with 8 GiB to spare. `--idle-unload` ends the process instead.
 
 Basalt refuses settings that would leave the machine without memory, and never shrinks what you asked for:
 
-- `--vram-reserve-mib` below 256 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
+- `--vram-reserve-mib` below 200 is refused on Windows and WSL2 (128 on Linux): less free VRAM makes the driver page GPU memory.
 - `--ram-reserve-mib` (default 2048) is the RAM left free for the rest of the system. The engine allocates its host buffers
   first, or holds their RAM when it page-locks them later; the expert tiers then take the free RAM less the reserve and less
   the driver's tracking of the pages they pin (`RAM floor ...` in the start log). Programs left idle beside a small reserve
