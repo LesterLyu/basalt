@@ -295,17 +295,18 @@ void ExpertPool::drain(int id, uint32_t epoch) {
 }
 
 void ExpertPool::native_gu_range(int e, int r0, int r1) {
+    const NativeFmt* format = mjobs_[e].native_format ? mjobs_[e].native_format : this->nfmt_;
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const ExpertJobMulti& j = mjobs_[e];
-    if (q2_native_kernels(nfmt_->gu_type)) {
+    if (q2_native_kernels(format->gu_type)) {
         // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
         thread_local float gbuf[MAXT][kNativeMaxFF], ubuf[MAXT][kNativeMaxFF];
         float* gp[MAXT];
         float* up[MAXT];
         for (int t = 0; t < j.nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-        const int nbk = (int) (nfmt_->n_embd / 64);
-        q2_rows_any(j.blob, nfmt_->gu_row, nbk, j.act, j.nt, gp, r0, r1);
-        q2_rows_any(j.blob + nfmt_->up_off, nfmt_->gu_row, nbk, j.act, j.nt, up, r0, r1);
+        const int nbk = (int) (format->n_embd / 64);
+        q2_rows_any(j.blob, format->gu_row, nbk, j.act, j.nt, gp, r0, r1);
+        q2_rows_any(j.blob + format->up_off, format->gu_row, nbk, j.act, j.nt, up, r0, r1);
         for (int t = 0; t < j.nt; ++t)
             for (int r = r0; r < r1; ++r)
                 sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
@@ -313,29 +314,31 @@ void ExpertPool::native_gu_range(int e, int r0, int r1) {
     }
     float* ff[MAXT];
     for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t];
-    native_gu_rows(*nfmt_, j.blob, j.nact, j.nt, ff, r0, r1);
+    native_gu_rows(*format, j.blob, j.nact, j.nt, ff, r0, r1);
 }
 
 void ExpertPool::native_down_range(int e, int r0, int r1) {
+    const NativeFmt* format = mjobs_[e].native_format ? mjobs_[e].native_format : this->nfmt_;
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const ExpertJobMulti& j = mjobs_[e];
-    if (q2_native_kernels(nfmt_->d_type)) {
+    if (q2_native_kernels(format->d_type)) {
         // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
         const ActQ* a2[MAXT];
         for (int t = 0; t < j.nt; ++t) a2[t] = &sb.a2[t];
-        q2_rows_any(j.blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2, j.nt, j.out, r0, r1);
+        q2_rows_any(j.blob + format->down_off, format->d_row, (int) (format->n_ff / 64), a2, j.nt, j.out, r0, r1);
         return;
     }
     const void* hq[MAXT];
     for (int t = 0; t < j.nt; ++t) hq[t] = sb.hq[t];
-    native_down_rows(*nfmt_, j.blob, hq, j.nt, j.out, r0, r1);
+    native_down_rows(*format, j.blob, hq, j.nt, j.out, r0, r1);
 }
 
 void ExpertPool::native_quantize(int e) {
+    const NativeFmt* format = mjobs_[e].native_format ? mjobs_[e].native_format : this->nfmt_;
     SplitBufMulti& sb = split_multi_[(size_t) e];
     for (int t = 0; t < mjobs_[e].nt; ++t)
-        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
-        else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+        if (q2_native_kernels(format->d_type)) act_quant_any(sb.ff[t], (int) format->n_ff, sb.a2[t]);
+        else native_quant_h(*format, sb.ff[t], sb.hq[t]);
 }
 
 int ExpertPool::set_active_workers(int k) {
@@ -433,7 +436,7 @@ void ExpertPool::finish_split_multi_native() {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pend_t0_).count();
     ms_multi_gu += ms * pend_gu_share_;
     ms_multi_down += ms * (1.0 - pend_gu_share_);
-    multi_bytes += (int64_t) pend_n_ * (int64_t) nfmt_->bytes;
+    for (int i = 0; i < pend_n_; ++i) multi_bytes += (int64_t) (mjobs_[i].native_format ? mjobs_[i].native_format : nfmt_)->bytes;
     mode_ = 0;
     pend_tasks_ = 0;
 }
@@ -451,7 +454,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         ms_multi_gu += ms * gu_share;
         ms_multi_down += ms * (1.0 - gu_share);
     }
-    multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    for (int i = 0; i < n; ++i) multi_bytes += (int64_t) (jobs[i].native_format ? jobs[i].native_format : &f)->bytes;
     mode_ = 0;
 }
 

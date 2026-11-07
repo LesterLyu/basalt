@@ -67,6 +67,7 @@ public:
     /// Queues, in this order, a copy of a slot's blob into `out` and of `in` into the slot (both pinned, portable host
     /// memory); `read_wait` waits for those queued too.
     void exchange_slot(int32_t slot, uint8_t* out, const uint8_t* in, uint64_t bytes);
+    void exchange_slot(int32_t slot, uint8_t* out, uint64_t out_bytes, const uint8_t* in, uint64_t in_bytes);
     bool read_wait(std::string& err);
     /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
     bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
@@ -74,12 +75,13 @@ public:
     /// The share of a window of `n_tok` rows over the pinned activations `x` [n_tok][n_embd]: entry t * k + j computes
     /// ids[t * k + j] over row t where kind says so; the rows land at that entry of open_plain's rows.
     bool launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err);
+                       int64_t k, const int32_t* kind, std::string& err,
+                       const kernels::NativeExpertLayout* const* layouts = nullptr);
     /// `n` rows, each with its own activation in `x` (pinned, portable): entry i computes expert ids[i] over x[i] and its row
     /// lands at out[i], `out` as this card addresses mapped host memory (`map_rows`). At most kRowBatch entries; `finish` waits.
     static constexpr int64_t kRowBatch = 80;
     bool launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n, float* out,
-                     std::string& err);
+                     std::string& err, const kernels::NativeExpertLayout* const* layouts = nullptr);
     float* map_rows(float* host, std::string& err);
     /// A slot's bytes for an expert of `layer`.
     static uint64_t slot_bytes(int64_t layer);
@@ -211,7 +213,8 @@ private:
     int64_t n_embd_ = 0;                              ///< activation width of the launched shares
     float* rows_map_ = nullptr;                       ///< open_plain's rows as this card addresses them
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err, float* out);
+                       int64_t k, const int32_t* kind, std::string& err, float* out,
+                       const kernels::NativeExpertLayout* const* layouts = nullptr, int plan = 0);
 };
 
 }  // namespace basalt::core
