@@ -1,6 +1,7 @@
 // src/models/deepseek41/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
 #include "models/deepseek41/tier_policy.hpp"
 #include "models/deepseek41/tier_slots.hpp"
+#include "models/deepseek41/ram_plan.hpp"
 #include <algorithm>
 #include <random>
 
@@ -20,6 +21,56 @@ static int g_fail = 0;
     } while (0)
 
 int main() {
+    // Final GPU ownership removes mandatory replacement RAM and base RAM alike.
+    // The conservative pre-placement budget spills; actual CPU ownership fits.
+    {
+        const std::vector<RamLayer> layers(40, {270, 7ull<<20});
+        const uint64_t base = 40ull*271*7*(1ull<<20);
+        auto old = plan_ram(layers,base+(5ull<<30),9ull<<30,2ull<<20);
+        auto final = plan_ram(layers,base+(5ull<<30),4ull<<30,2ull<<20);
+        CHECK(old.fits && final.fits);
+        CHECK(std::count(final.counts.begin(),final.counts.end(),270) == 40);
+        CHECK(std::count(old.counts.begin(),old.counts.end(),270) < 40);
+        CHECK(final.bytes <= base+(5ull<<30));
+        auto none = plan_ram({{0,7},{0,9}},10,10,2);
+        CHECK(none.fits && none.bytes == 10 && none.counts[0] == 0 && none.counts[1] == 0);
+        CHECK(!plan_ram({{3,7}},9,10,2).fits);
+        // A lone expert needs its spare and alignment; one byte less must spill it.
+        CHECK(plan_ram({{1,7}},16,0,8).counts[0] == 1);
+        CHECK(plan_ram({{1,7}},15,0,8).counts[0] == 0);
+        CHECK(plan_ram({{1,7}},14,0,0).counts[0] == 1);
+        std::mt19937 random(91);
+        for (int trial = 0; trial < 500; ++trial) {
+            std::vector<RamLayer> needs;
+            uint64_t whole = 17;
+            const uint64_t grain = trial%2 ? 8 : 0;
+            for (int l = 0; l < 5; ++l) {
+                const int count = (int)(random()%12);
+                const uint64_t bytes = 1+random()%19;
+                needs.push_back({count,bytes});
+                if (count) whole += ram_aligned((count+1)*bytes,grain);
+            }
+            const uint64_t budget = random()%(whole+10);
+            const auto p = plan_ram(needs,budget,17,grain);
+            CHECK(p.fits == (budget >= 17));
+            if (!p.fits) continue;
+            uint64_t actual = 17;
+            for (size_t l = 0; l < needs.size(); ++l) {
+                CHECK(p.counts[l] >= 0 && p.counts[l] <= needs[l].experts);
+                if (p.counts[l]) actual += ram_aligned((p.counts[l]+1)*needs[l].blob_bytes,grain);
+            }
+            CHECK(actual == p.bytes && actual <= budget);
+            const auto full = plan_ram(needs,whole,17,grain);
+            for (size_t l = 0; l < needs.size(); ++l) CHECK(full.counts[l] == needs[l].experts);
+        }
+    }
+    CHECK(loan_keep(1024ull<<20,1) == (960ull<<20));
+    CHECK(loan_keep(1024ull<<20,128ull<<20) == (896ull<<20));
+    CHECK(loan_keep(1024ull<<20,2048ull<<20) == 0);
+    CHECK(refill_reserve(1024,512,256,128,0) == 768);
+    CHECK(refill_reserve(1024,2048,256,128,0) == 256);
+    CHECK(refill_reserve(1024,1024,0,128,0) == 128);
+
     // Sparse larger formats must not inflate every slot; initial ranked subsets still fit,
     // even when assigned in arbitrary order by smallest fitting free slot.
     std::mt19937 rng(17);

@@ -58,6 +58,8 @@ public:
     uint8_t* prepare_replacement_ram(int layer, int expert) const;
     void publish_replacement_ram(int layer, int expert) const;
     void release_replacement_ram(int layer, int expert) const;
+    std::unique_ptr<ExpertRam> acquire_expert_ram(uint64_t bytes) const;
+    void recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const;
     uint64_t overlay_max_bytes(int layer = -1) const {
         uint64_t bytes = 0;
         if (has_overlay())
@@ -89,6 +91,8 @@ public:
             usage.host["pinned_experts"] += v.ram->registered();
             usage.host["locked_experts"] += v.ram->pin.locked_bytes;
         }
+        usage.host["expert_swap_workspace"] += swap_pool_bytes_;
+        if (engram_) usage.host["engram_reader"] += engram_->allocated_bytes();
         for (const auto& [name, t] : dev_) if (t.ptr) usage.device(device_, "weights", t.bytes);
     }
     const Pack& pack() const { return pack_; }
@@ -145,6 +149,8 @@ public:
 private:
     CacheFormat cache_format_ = CacheFormat::Fp8;
     std::vector<Replacement> overlay_;
+    mutable std::vector<std::unique_ptr<ExpertRam>> swap_pool_;
+    mutable uint64_t swap_pool_bytes_ = 0;
     size_t overlay_bytes_ = 0;
     uint64_t overlay_ram_budget_ = 0;
     core::FileRange overlay_source_;

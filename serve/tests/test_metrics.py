@@ -350,7 +350,10 @@ class PerGpu(unittest.TestCase):
     def test_host_allocations_are_separate_from_working_sets(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "ok")
-        allocations = {"resident_experts": 80, "pinned_experts": 40, "expert_homes": 12}
+        allocations = {"resident_experts": 80, "pinned_experts": 40, "expert_homes": 12,
+                       "expert_prefetch": 4, "expert_staging": 2, "prefill_activations": 1,
+                       "embedding_workspace": 3, "engram_workspace": 5, "engram_reader": 6,
+                       "vision_workspace": 7, "decode_workspace": 8}
         engine.ram_usage = lambda: allocations
         svc = Service(engine, tok, ChatTemplate.from_file(TEMPLATE))
         svc.telemetry = mock.Mock()

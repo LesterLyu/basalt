@@ -37,7 +37,6 @@
 
 namespace basalt::models::deepseek41 {
 namespace {
-constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
 constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time when no workspaces fit
 
 #define DS_CUDA(call)                                                                                   \
@@ -54,6 +53,7 @@ public:
     ~Session() override {
         for (auto& reads : eread_)   // reads still out land in eraw_ before it goes
             for (ngram::PleReader::Ticket& t : reads) finish_read(t);
+        drop_prefill();
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
         if (h_emb4_) cudaFreeHost(h_emb4_);
@@ -82,6 +82,7 @@ public:
         if (ops_) ops_->memory_usage(usage);
         if (prefill_) prefill_->memory_usage(usage);
         if (vis_) usage.device(m_.device(), "vision", vis_->device_bytes());
+        usage.host["decode_workspace"] += host_allocated_bytes_ + emb4_.capacity() * sizeof(float) + hist_.capacity() * sizeof(int32_t);
         if (drafter_ && usage.claim(drafter_.get()))
             usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
     }
@@ -129,7 +130,7 @@ public:
             float *h = nullptr, *d = nullptr, *kv = nullptr;
             void* q = nullptr;
             ok = cudaHostAlloc((void**) &h, cols * W * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess;
-            if (h) erow_h_.push_back(h);
+            if (h) { erow_h_.push_back(h); host_allocated_bytes_ += cols * W * sizeof(float); }
             ok = ok && cudaHostGetDevicePointer((void**) &d, h, 0) == cudaSuccess && buf(kv, 5 * n * W) &&
                  cudaMalloc(&q, kernels::native_q8_1_bytes((int) cols, W)) == cudaSuccess;
             if (q) allocs_.push_back(q);
@@ -158,6 +159,8 @@ public:
         if (v) { allocs_.push_back(v); allocated_bytes_ += argmax_workspace_bytes(); }
         ok = ok && cudaHostAlloc((void**) &h_next_, W * sizeof(int32_t), cudaHostAllocPortable) == cudaSuccess &&
              cudaHostAlloc((void**) &h_emb4_, 4 * n * W * sizeof(float), cudaHostAllocPortable) == cudaSuccess;
+        if (h_next_) host_allocated_bytes_ += W * sizeof(int32_t);
+        if (h_emb4_) host_allocated_bytes_ += 4 * n * W * sizeof(float);
         v = nullptr;
         const size_t q8 = std::max<size_t>(kernels::native_q8_1_bytes((int) std::max<size_t>(cols, n), W), 1 << 16);
         ok = ok && cudaMalloc(&v, q8) == cudaSuccess;
@@ -202,6 +205,7 @@ public:
                     if (feat_first_ < 0) feat_first_ = il;
                     feat_last_ = il;
                 }
+            host_allocated_bytes_ += ff * kDsparkWindow * sizeof(float);
         }
         return true;
     }
@@ -236,6 +240,7 @@ public:
             std::string err;
             if (!prepare_draw(r, err)) return {model::Status::Error, err};
             if (!step(r.tokens, r.n_tokens, r.pos, true, r.row_tokens, r.logits, err, r.row_wait_us)) return {model::Status::Error, err};
+            refill_after_decode();
             return {};
         }
         for (int i = 0; i < r.n_tokens; ++i) {
@@ -245,6 +250,7 @@ public:
             if (!step(r.tokens + i, 1, r.pos + i, last, last ? r.next_token : nullptr, last ? r.logits : nullptr, err, r.row_wait_us))
                 return {model::Status::Error, err};
         }
+        refill_after_decode();
         return {};
     }
 
@@ -263,10 +269,6 @@ public:
             {
                 if (plan_tokens > prefillp::kShortPrompt) release_short_prompt();
                 open_prompt_path(plan_tokens);
-                if (plan_tokens >= kLendTierTokens) {
-                    std::string te;
-                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
-                }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
                 if (!prefill_ && !make_prefill_fit(plan_tokens, err)) {
@@ -277,11 +279,7 @@ public:
                             if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
                         return {};
                     }
-                    std::string te;
-                    err.clear();
-                    short_prompt_ = false;
-                    if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
-                    if (!make_prefill_fit(plan_tokens, err)) return prompt_failed(err);
+                    return prompt_failed(err);
                 }
                 prefill_->progress = r.progress;
                 prefill_->live = r.live;
@@ -529,7 +527,6 @@ public:
             std::string te;
             err.clear();
             short_prompt_ = false;
-            if (ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
             if (!make_prefill_fit(n_rows, err)) return prompt_failed(err);
         }
         tap_features();
@@ -554,35 +551,62 @@ private:
         }
         // the reserve stays free through the read: the chunk halves to fit above it
         std::string te;
-        const ExpertTier* tier = ops_->expert_tier(te);
+        ExpertTier* tier = ops_->expert_tier(te);
         const bool beside = short_prompt_;
         const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
         if (beside) tokens = prefillp::kShortChunk;   // these workspaces stay for the next short read, whatever its size
-        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, margin, tokens, m_.tiers().prefill_chunk);
+        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b + (tier ? tier->loanable_bytes() : 0), margin, tokens, m_.tiers().prefill_chunk);
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
             return false;
         }
         for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap /= 2) {
             std::string e;
+            const uint64_t wanted = prefillp::chunk_bytes(d,cap,tokens)+margin;
+            if (tier && !tier->lend(wanted,e)) { if (!e.empty()) err=e; continue; }
             prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
             const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
             if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                 cudaGetLastError();   // a larger size that did not fit left its error behind
+                core::MemoryUsage usage;
+                prefill_->memory_usage(usage);
+                if (tier) {
+                    tier->prompt_workspace(this,usage.gpus[m_.device()]["long_prefill"],after);
+                    tier->grow();
+                    if (!beside && cudaMemGetInfo(&free_b,&total_b) == cudaSuccess)
+                        basalt::log::info("basalt deepseek41","prompt workspace: %d tokens, %.2f GiB buffers, %.2f GiB reclaimable experts, %.2f GiB free",cap,
+                                          usage.gpus[m_.device()]["long_prefill"]/1073741824.,
+                                          (tier->loanable_bytes())/1073741824.,free_b/1073741824.);
+                }
                 return true;
             }
-            prefill_.reset();
+            drop_prefill();
             if (!e.empty()) err = e;
         }
         if (err.empty()) err = "deepseek41: not enough free device memory for the prompt workspaces";
         return false;
     }
 
+    void refill_after_decode() {
+        if (tier_refilled_) return;
+        tier_refilled_ = true;
+        std::string err;
+        if (auto* tier = ops_->expert_tier(err)) tier->grow();
+    }
+    bool tier_refilled_ = false;
+
+    void drop_prefill() {
+        if (!prefill_) return;
+        std::string err;
+        if (auto* tier = ops_->expert_tier(err)) tier->prompt_workspace(this,0,0);
+        prefill_.reset();
+    }
+
     // A prompt that cannot run gives its workspaces back and lets the tier take the memory again, so the engine holds
     // nothing for it; the request fails with `err` and the next one starts clean.
     model::Result prompt_failed(const std::string& err) {
         cudaStreamSynchronize(stream_);
-        prefill_.reset();
+        drop_prefill();
         short_prompt_ = false;
         std::string e;
         if (ExpertTier* t = ops_->expert_tier(e)) {
@@ -598,7 +622,7 @@ private:
         ExpertTier* t = ops_->expert_tier(e);
         if (!t || prefill_) return;
         short_prompt_ = n_tokens <= prefillp::kShortPrompt;   // its workspaces fit beside the copies
-        if (!short_prompt_) t->shrink();
+        // make_prefill_fit lends only the workspace deficit.
     }
     void settle_tier() {
         std::string e;
@@ -607,7 +631,7 @@ private:
     void release_short_prompt() {
         if (!short_prompt_) return;
         cudaStreamSynchronize(stream_);
-        prefill_.reset();
+        drop_prefill();
         short_prompt_ = false;
     }
     // A short read's workspaces stay for the next one: the tier planned for them.
@@ -617,7 +641,7 @@ private:
         if (!t) return;
         if (short_prompt_) return;
         cudaStreamSynchronize(stream_);
-        prefill_.reset();
+        drop_prefill();
         if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
         t->grow();
     }
@@ -1159,6 +1183,7 @@ private:
     bool vis_borrowed_ = false;
     std::vector<void*> allocs_;
     uint64_t allocated_bytes_ = 0;
+    uint64_t host_allocated_bytes_ = 0;
     std::vector<int32_t> hist_;
     std::string dump_dir_, err_;
     int64_t whole_from_ = 0;   ///< the first position to save at or go back to, after a read that left rows short (prefillp::whole_from)

@@ -73,6 +73,11 @@ struct PeerArm {
     }
 };
 
+struct PeerJoin {
+    ExpertTier* tier = nullptr;
+    ~PeerJoin() { if (tier) { std::string err; tier->finish_peer(err); } }
+};
+
 // A window's plan: the distinct experts of its rows, each with the rows it computes.
 struct WindowPlan {
     unsigned long long ptr[ExpertTier::kMaxK];
@@ -411,9 +416,8 @@ public:
     }
     bool graph_capable() const override { return true; }
 
-    // Backs the compressed caches up to `positions`. When the card is full the expert tier gives back its loan of
-    // spare slots and the mapping is tried again; when that is not enough (a step maps 4 granules on every layer at
-    // once) it lends all its slots, as a long prompt read does, and stage_token takes back what is left.
+    // Borrow only the KV growth deficit. Dropping the whole spare expert arena here both copies gigabytes back
+    // to RAM and discards the other slot's warmed placement, even for its first few positions.
     bool ensure_positions(int64_t positions, std::string& err) override {
         if (positions <= backed_positions_) return true;
         if (positions > ctx_) {
@@ -424,6 +428,17 @@ public:
             std::string e;
             bool ok = true;
             const uint64_t keep = tier_ ? tier_->free_floor() : 0;
+            uint64_t needed = 0;
+            for (int il = 0; il < g_.n_layers; ++il) {
+                if (!el_kv_[(size_t) il]) continue;
+                const uint64_t rows = (uint64_t) positions / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
+                needed += el_kv_[(size_t) il]->additional_bytes(rows * kLatent * 2);
+                needed += el_ik_[(size_t) il]->additional_bytes(rows * kIdxDim * 2);
+            }
+            if (needed && tier_ && !tier_->lend(needed + keep, e)) {
+                err = "deepseek41: cannot make room for compressed cache growth (" + e + ")";
+                return false;
+            }
             for (int il = 0; il < g_.n_layers && ok; ++il) {
                 if (!el_kv_[(size_t) il]) continue;
                 const uint64_t rows = (uint64_t) positions / (uint64_t) g_.compress_ratio[(size_t) il] + 1;
@@ -435,8 +450,8 @@ public:
                 return true;
             }
             if (attempt == 0 && tier_) {
-                cudaDeviceSynchronize();
-                tier_->shrink();
+                // A racing device allocation may have consumed headroom. Recalculate the remaining deficit.
+                cudaGetLastError();
                 continue;
             }
             if (attempt == 1 && tier_) {
@@ -791,6 +806,7 @@ public:
         }
 
         // the second card's share first: its rows are the last of the two cards' to land
+        PeerJoin peer_join{peer && m_.has_overlay() ? tier_.get() : nullptr};
         if (peer && m_.has_overlay()) {
             int32_t kind[ExpertTier::kMaxK] = {};
             for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
@@ -798,7 +814,7 @@ public:
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
             for (int r = 0; r < T*K; ++r) if (const auto* v = m_.replacement(il,h_ids_[r])) layouts[r] = &v->layout;
-            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
+            if (!tier_->launch_peer(il, limited, h_x_, h_ids_, T, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
@@ -832,6 +848,7 @@ public:
         const int nhits = make_plan(plan, false, entries);
         if (nhits) gpu_share(plan, ex_plan_, nhits, entries);
         if (n_fetched) {
+            tier_->submit_fetch();
             const int ng = make_plan(plan, true, entries);
             tier_->await_fetch(st);
             if (ng) gpu_share(plan, ex_plan2_, ng, entries);
@@ -852,11 +869,11 @@ public:
         }
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in their rows
-        if (cpu) {
-            join.now();
-            tier_->promote(il, lk);
+        if (cpu) join.now();
+        if (cpu || n_fetched) tier_->promote(il, lk);
+        if (peer) {
+            if (m_.has_overlay() ? !tier_->finish_peer(err) : !peer->finish(nullptr, err)) return false;
         }
-        if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
@@ -934,6 +951,7 @@ public:
         }
 
         // the second card's share first: its rows are the last of the two cards' to land
+        PeerJoin peer_join{peer && m_.has_overlay() ? tier_.get() : nullptr};
         if (peer && m_.has_overlay()) {
             int32_t kind[ExpertTier::kMaxK] = {};
             for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
@@ -941,7 +959,7 @@ public:
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
             for (int r = 0; r < K; ++r) if (const auto* v = m_.replacement(il,lk.experts[r])) layouts[r] = &v->layout;
-            if (!peer->launch_window(il, limited, h_x_, lk.experts, 1, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
+            if (!tier_->launch_peer(il, limited, h_x_, lk.experts, 1, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
@@ -993,6 +1011,7 @@ public:
             gpu_share();
         }
         if (n_fetched) {
+            tier_->submit_fetch();
             ExpertPlan plan2;
             const int ng = make_plan(plan2, true);
             tier_->await_fetch(st);
@@ -1019,11 +1038,11 @@ public:
         }
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
-        if (cpu) {
-            join.now();
-            tier_->promote(il, lk);
+        if (cpu) join.now();
+        if (cpu || n_fetched) tier_->promote(il, lk);
+        if (peer) {
+            if (m_.has_overlay() ? !tier_->finish_peer(err) : !peer->finish(nullptr, err)) return false;
         }
-        if (peer && !peer->finish(nullptr, err)) return false;
         jw.raise();
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;

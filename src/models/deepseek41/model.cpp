@@ -92,12 +92,8 @@ uint8_t* DsModel::prepare_replacement_ram(int layer, int expert) const {
     const auto* v = replacement(layer,expert);
     if (!v) return nullptr;
     if (v->ram) return v->ram->data;
-    core::detail::HostMemory hm;
-    if (!core::detail::host_available_memory(hm)) return nullptr;
-    const auto room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
-    if (v->layout.bytes > room) return nullptr;
-    auto ram = std::make_unique<ExpertRam>();
-    if (!ram->allocate(v->layout.bytes) || ram->allocated() > room) return nullptr;
+    auto ram = acquire_expert_ram(v->layout.bytes);
+    if (!ram) return nullptr;
     auto* data = ram->data;
     v->ram = std::move(ram);
     return data;
@@ -109,7 +105,41 @@ void DsModel::publish_replacement_ram(int layer, int expert) const {
 }
 
 void DsModel::release_replacement_ram(int layer, int expert) const {
-    if (const auto* v = replacement(layer,expert)) v->ram.reset();
+    if (const auto* v = replacement(layer,expert)) recycle_expert_ram(std::move(v->ram));
+}
+
+std::unique_ptr<ExpertRam> DsModel::acquire_expert_ram(uint64_t bytes) const {
+    size_t best = swap_pool_.size();
+    for (size_t i = 0; i < swap_pool_.size(); ++i)
+        if (swap_pool_[i]->allocated() >= bytes && (best == swap_pool_.size() || swap_pool_[i]->allocated() < swap_pool_[best]->allocated())) best=i;
+    if (best != swap_pool_.size()) {
+        auto ram = std::move(swap_pool_[best]);
+        swap_pool_[best] = std::move(swap_pool_.back()); swap_pool_.pop_back();
+        swap_pool_bytes_ -= ram->allocated();
+        return ram;
+    }
+    core::detail::HostMemory hm;
+    if (!core::detail::host_available_memory(hm)) return nullptr;
+    auto room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
+    if (bytes > room && !swap_pool_.empty()) {
+        swap_pool_.clear(); swap_pool_bytes_=0;
+        if (!core::detail::host_available_memory(hm)) return nullptr;
+        room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
+    }
+    if (bytes > room) return nullptr;
+    auto ram = std::make_unique<ExpertRam>();
+    if (!ram->allocate(bytes) || ram->allocated() > room) return nullptr;
+    return ram;
+}
+
+void DsModel::recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const {
+    constexpr uint64_t capacity = 1ull<<30;
+    if (!ram || ram->registered() < ram->bytes || ram->allocated() > capacity-swap_pool_bytes_) {
+        ram.reset(); return;
+    }
+    ram->ready = false;
+    swap_pool_bytes_ += ram->allocated();
+    swap_pool_.push_back(std::move(ram));
 }
 
 bool DsModel::load(const std::string& path, std::string& err) {

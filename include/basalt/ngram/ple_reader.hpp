@@ -95,6 +95,7 @@ public:
     void reset_stats();
     uint64_t cache_capacity() const;
     uint64_t cache_size() const;
+    uint64_t allocated_bytes() const;
 
 private:
     struct Impl;

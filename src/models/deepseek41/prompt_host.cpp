@@ -61,6 +61,9 @@ bool PromptHost::open(const DsModel& m, int pieces, int slots, bool vision, std:
         return false;
     }
     bytes_ = pinned_ + kernels::cpu::kNativeActBytes * (size_t) share_rows;
+    expert_staging_bytes_ = (uint64_t)2 * prefillp::kStageExperts * slot + m.overlay_max_bytes();
+    activation_bytes_ = (uint64_t)share_rows * n * 4 + (uint64_t)prefillp::kShareRows * n * 4 +
+                        kernels::cpu::kNativeActBytes * (uint64_t)share_rows + (xb ? core::PeerExperts::kRowBatch*n*4 : 0);
     // pages written once now, so the free memory the tier reads already lacks them
     auto take = [&](auto& v, size_t count) {
         v.assign(count, 0);
@@ -106,6 +109,18 @@ bool PromptHost::set_ring(int pieces, std::string& err) {
 
 PromptHost::Image* PromptHost::take_image() {
     return images_taken_ < (int) images_.size() ? &images_[(size_t) images_taken_++] : nullptr;
+}
+
+void PromptHost::memory_usage(core::MemoryUsage& usage) const {
+    if (!usage.claim(this)) return;
+    usage.host["expert_prefetch"] += (uint64_t)ring_pieces * slot;
+    usage.host["expert_staging"] += expert_staging_bytes_;
+    usage.host["prefill_activations"] += activation_bytes_;
+    usage.host["embedding_workspace"] += embed.capacity() * sizeof(float);
+    usage.host["engram_workspace"] += engram_rows.capacity() * sizeof(float);
+    for (const auto& raw : engram_raw) usage.host["engram_workspace"] += raw.capacity();
+    for (const auto& image : images_)
+        usage.host["vision_workspace"] += image.picture.rgb.capacity() + image.patches.capacity() * sizeof(float);
 }
 
 }  // namespace basalt::models::deepseek41

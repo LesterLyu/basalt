@@ -2,6 +2,7 @@
 #pragma once
 
 #include "basalt/vision/preprocess.hpp"
+#include "basalt/core/memory_usage.hpp"
 #include "models/deepseek41/pack.hpp"
 
 #include <cstdint>
@@ -33,6 +34,7 @@ public:
     /// Page-locked bytes, which the driver keeps tracking memory for.
     uint64_t pinned_bytes() const { return pinned_; }
     uint64_t bytes() const { return bytes_; }
+    void memory_usage(core::MemoryUsage& usage) const;
 
     size_t slot = 0;                    ///< bytes of one staged expert (staged_stride of the largest layer)
     uint8_t* ring = nullptr;            ///< [ring_pieces][slot], pinned
@@ -60,6 +62,7 @@ private:
     std::vector<Image> images_;
     int images_taken_ = 0;
     uint64_t pinned_ = 0, bytes_ = 0;
+    uint64_t expert_staging_bytes_ = 0, activation_bytes_ = 0;
 };
 
 }  // namespace basalt::models::deepseek41

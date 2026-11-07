@@ -144,6 +144,11 @@ rebuild. Before lending cache VRAM to prefill, KV or vision, the tier reserves h
 VRAM; ownership changes only after the copy fence. If backing cannot fit above the RAM floor, the VRAM stays resident.
 Refilling the cache releases
 the returned host allocations again. The helper remains an exclusive owner through the same swap transitions.
+Reclaimable GPU arenas use physical segments at stable addresses, with slots interleaved across layers.
+A prompt borrows only its allocation deficit and counts every slot's existing workspace before cache refill.
+Phase-disjoint Engram, attention and expert temporaries share prompt storage.
+RAM misses compute from fenced GPU staging slots before repeat misses enter the cache through a device copy.
+Empty CUDA-registered RAM blocks are reused within a 1 GiB workspace budget without publishing expert mirrors.
 At request and loan boundaries, extra ordinary expert blocks move into vacant arena places and are freed,
 so repeated loans do not retain both empty arena capacity and separate returned weights.
 Initial placement keeps the normal routing rank. CPU jobs dispatch each expert's

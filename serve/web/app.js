@@ -457,7 +457,11 @@ const vramLabels = {weights: "Model weights", experts: "Expert cache", expert_he
   long_prefill: "Prefill workspace", dspark: "DSpark", mtp: "MTP", vision: "Vision workspace",
   system_reserved: "System reserved", other_apps: "Other apps"};
 const hostLabels = {resident_experts: "Resident experts", expert_homes: "Evicted / borrowed experts",
-  checkpoints: "Conversation checkpoints", engram_workspace: "Engram workspace"};
+  checkpoints: "Conversation checkpoints", expert_swap_workspace: "Expert swap workspace",
+  expert_prefetch: "Expert prefetch ring", expert_staging: "Expert upload staging",
+  prefill_activations: "Prefill activations", embedding_workspace: "Token embedding staging",
+  engram_workspace: "Engram buffers", engram_reader: "Engram row cache & I/O",
+  vision_workspace: "Image buffers", decode_workspace: "Decode CPU buffers"};
 function memoryParts(parts, labels) {
   return Object.entries(labels).flatMap(([key, label], i) =>
     num(parts?.[key]) ? [[label, parts[key], colors[i % colors.length]]] : []);
@@ -502,10 +506,11 @@ function hostCard(hw, st, hist) {
       ((num(parts.pinned_experts) || num(parts.locked_experts)) ?
         '<div class="subrows">' + (num(parts.pinned_experts) ? memoryRow("CUDA-registered", parts.pinned_experts) : "") +
         (num(parts.locked_experts) ? memoryRow("OS locked", parts.locked_experts) : "") + '<p class="hint">Subsets of resident experts.</p></div>' : "") +
-      '<p class="hint">Allocated bytes can include paged-out memory.</p>' : '<p class="hint">This engine does not report RAM allocations.</p>') +
+      '<p class="hint">Allocated capacity, not resident pages. File-backed pages, runtime and driver memory also contribute to the working set below.</p>' : '<p class="hint">This engine does not report RAM allocations.</p>') +
     grouped("Process RAM · working set", (resident || '<p class="hint">Process counters unavailable.</p>') +
       (num(processStats.peak_rss) ? memoryRow("Engine peak working set", processStats.peak_rss) : "") +
       (num(processStats.private_commit) ? memoryRow("Engine private commit", processStats.private_commit) : "") +
+      (num(processStats.rss) && entries.length ? memoryRow("Outside tracked allocations (estimate)", Math.max(0, processStats.rss - allocated)) : "") +
       (resident ? '<p class="hint">Working sets can overlap. Private commit can include paged-out memory.</p>' : "")) +
     grouped("Host activity", row("Processor", shortCpu(st.cpu_name) || dash) +
       row("Cores / threads", (num(st.cores) ? fmt(st.cores) : dash) + " / " + (num(st.threads) ? fmt(st.threads) : dash)) +

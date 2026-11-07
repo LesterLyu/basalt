@@ -43,6 +43,13 @@ bool ElasticBuf::open(uint64_t bytes, std::string& err) {
     return true;
 }
 
+uint64_t ElasticBuf::additional_bytes(uint64_t bytes) const {
+    if (bytes <= backed_ || !gran_) return 0;
+    const uint64_t step = gran_ * 4;
+    const uint64_t want = std::min(reserved_, (bytes + step - 1) / step * step);
+    return want - backed_;
+}
+
 bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     if (bytes <= backed_) return true;
     if (bytes > reserved_) {
@@ -50,9 +57,7 @@ bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
         return false;
     }
     // grow in steps of a few granules so a long generation maps rarely
-    const uint64_t step = gran_ * 4;
-    const uint64_t want = std::min(reserved_, (bytes + step - 1) / step * step);
-    const uint64_t n = want - backed_;
+    const uint64_t n = additional_bytes(bytes);
     if (keep_free > 0) {
         uint64_t free_b = 0, total_b = 0;
         std::string why;
@@ -72,7 +77,7 @@ bool ElasticBuf::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) {
     }
     cudaMemset(base_ + backed_, 0, n);
     extents_.push_back({backed_, n, h});
-    backed_ = want;
+    backed_ += n;
     return true;
 }
 

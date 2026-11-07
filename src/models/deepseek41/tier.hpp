@@ -19,9 +19,11 @@
 #include "basalt/prefill/peer_share.hpp"
 #include "basalt/platform/mapped_file.hpp"
 #include "models/deepseek41/prompt_host.hpp"
+#include "models/deepseek41/expert_ram.hpp"
 #include "models/deepseek41/tier_policy.hpp"
 
 #include <cuda_runtime.h>
+#include <map>
 
 #include <atomic>
 #include <condition_variable>
@@ -74,12 +76,16 @@ public:
     /// Sizes the tiers and loads them. `h_rows`: the mapped rows a second card shares with the CPU pool.
     bool open(const Reserve& reserve, float* h_rows, std::string& err);
 
-    /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
-    /// allocated); `grow` takes the memory freed after them as extra slots. Weights return to RAM before release.
+    /// Gives the extra arena's physical segments back; weights return to RAM before release.
+    /// Prompt workspaces use lend() for a partial loan, and grow() refills the free segments.
     void shrink();
     void grow();
+    /// Make this many bytes free by returning only the needed cache segments to RAM.
+    bool lend(uint64_t free_bytes, std::string& err);
+    uint64_t loanable_bytes() const { return ext_.mapped_bytes() + (homes_.main == 0 ? cache_.mapped_bytes() : 0); }
+    void prompt_workspace(const void* owner, uint64_t bytes, uint64_t margin);
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
-    /// copies go back whole, and reclaim() opens them again empty. Homes stay.
+    /// reclaimable segments go back whole, and reclaim() maps them again at the same addresses. Homes stay.
     void lend_all();
     bool reclaim(std::string& err);
     /// Main card bytes the tier, the caches and the prompt path leave free: --vram-reserve-mib, or `mib` once set
@@ -111,12 +117,11 @@ public:
     void mark_gap(cudaStream_t main);
     void pump(int layer, int pieces);
     static constexpr int kAllPieces = 1 << 20;
-    /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
-    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. With a
-    /// second card, policy::peer_bus_count of them cross its own link into its scratch slots instead (`peer`, marked
-    /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
-    /// makes `main` wait for them.
+    /// Plans the GPU share of RAM misses in transient slots, leaving the rest for the CPU. submit_fetch() starts
+    /// their copies after the other shares launch; await_fetch() gates their GPU consumers. Repeat misses may be cached.
     int fetch(int layer, Lookup& lk);
+    /// Submit the planned misses after the CPU, helper and resident GPU experts have started.
+    void submit_fetch();
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
     /// VRAM tier (side stream, off the token path, in pieces).
@@ -137,6 +142,10 @@ public:
     prefill::PeerShare* peer_share() const { return share_.get(); }
     /// What the split of a layer's experts between the cards prices them at.
     const prefill::ShareRates& share_rates(int layer) const { return rates_[(size_t) layer]; }
+    bool launch_peer(int layer, const kernels::NativeExpertLayout& layout, const float* x, const int32_t* ids,
+                     int tokens, int k, const int32_t* kind, std::string& err,
+                     const kernels::NativeExpertLayout* const* layouts);
+    bool finish_peer(std::string& err);
     /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
     PromptHost& host() { return host_; }
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
@@ -144,7 +153,7 @@ public:
     const kernels::cpu::NativeFmt& fmt(int layer, int expert) const;
 
     /// The VRAM slots open now, every layer's.
-    int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
+    int64_t slots() const { return cache_.slots()+ext_.slots(); }
 
     void memory_usage(core::MemoryUsage& usage) const;
     void report(const char* tag) const;
@@ -174,7 +183,9 @@ private:
         const uint8_t* src;
         uint8_t* home_to;
         uint64_t bytes, off = 0, home_off = 0, home_bytes = 0;
+        bool device_source = false;
     };
+    struct Fetch { uint8_t* dst; const uint8_t* src; uint64_t bytes; };
     /// `in` on its way into the second card's `slot`, its pieces waiting for an idle bus; `out`, which held it, on its
     /// way to RAM place `place`: the slot's bytes out to `to` first, then `from` in.
     struct PeerMove {
@@ -211,6 +222,11 @@ private:
     void pack_extra_ram();
     uint64_t resident_ram_bytes() const;
     bool restore_primary(int64_t first, std::string& err);
+    bool shrink_cache(core::ExpertCache& cache, uint64_t offset, uint64_t keep, std::string& err);
+    uint64_t refill_reserve() const;
+    int main_slot(int layer, int rank) const;
+    int slot_layer(int slot) const;
+    std::vector<int64_t> cache_sizes(int n, bool extra) const;
     void land_home(int layer, int in, int out, int place);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
@@ -221,11 +237,9 @@ private:
     void finish_swaps();
     void start_swaps();
     void swap_worker();
-    /// Copies (layer, e) from `src` into the least recently used free slot of the layer; the slot, or -1. With `homes_too`
-    /// that slot may be a home's, when the layer has a free RAM place for it. `whole`: one copy, for a layer that waits
-    /// on it; else pieces, which let a waited copy pass. With `later` the pieces wait in the queue for pump.
-    int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false,
-                  bool later = false);
+    /// Reserves the least recently used fitting slot, or -1, for a background copy. Homes require a RAM place
+    /// for their displaced expert. Device sources remain live until the fetch ring's completion event.
+    int32_t claim(int layer, int e, const uint8_t* src, bool homes_too, bool device_source = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
     int32_t oldest_slot(int layer, bool homes_too, uint64_t& best, uint64_t bytes = 0) const;
     /// Moves into the helper only when its victim is policy::kPeerMoveAge older than the main card's.
@@ -237,8 +251,9 @@ private:
     int64_t per_layer_ = 0;                 ///< VRAM slots each layer owns in the base arena
     core::ExpertCache ext_;                 ///< slots beside the base arena, open only while no prompt workspace is
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
-    bool unread_said_ = false;              ///< `grow` has said that the runtime could not answer
-    int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
+    uint64_t ram_file_keep_ = 0;
+    bool unread_said_ = false;
+    std::map<const void*, std::pair<uint64_t,uint64_t>> prompt_workspaces_;
     bool exclusive_cache_ = false;         ///< primary cache entries own their weights without RAM copies
     uint64_t returned_experts_ = 0, returned_bytes_ = 0;
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
@@ -247,15 +262,23 @@ private:
     std::vector<uint8_t> busy_;             ///< [slot] a promotion is copying into it
     std::vector<Pending> pending_;          ///< issued copies not landed yet
     std::vector<Queued> queue_;             ///< promotions not yet fully issued, oldest first
+    std::vector<Fetch> fetch_queue_;
     std::vector<PeerMove> peer_moves_;      ///< second card exchanges not landed yet, oldest first
     std::vector<int32_t> peer_owner_;       ///< [second card slot] expert it holds or is receiving
-    std::vector<cudaEvent_t> events_;       ///< [event] behind a copy's last piece in
-    std::vector<cudaEvent_t> out_events_;   ///< [event] behind the last piece out of the home a promotion replaces
+    std::vector<cudaEvent_t> events_, return_events_;
     std::vector<int> free_events_;
     int claims_ = 0;                        ///< copies claimed since the last begin_token (at most kMaxPending)
     cudaStream_t copy_stream_ = nullptr;    ///< promotions, off the token path
-    cudaStream_t out_stream_ = nullptr;     ///< the homes they replace, out to RAM beside them
+    cudaStream_t return_stream_ = nullptr;
     cudaStream_t fetch_stream_ = nullptr;   ///< copies a layer waits for (high priority)
+    uint8_t* fetch_scratch_ = nullptr;
+    uint64_t fetch_stride_ = 0;
+    int fetch_slots_ = 0;
+    static constexpr int kFetchRings = 3;
+    int fetch_ring_ = 0;
+    bool fetch_scratch_used_ = false, fetch_promotions_ = false;
+    bool fetch_scratch_fenced_[kFetchRings]{};
+    cudaEvent_t fetch_scratch_done_[kFetchRings]{};
     cudaEvent_t fetch_ev_ = nullptr;
     cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind
     bool gap_marked_ = false;               ///< gap_ev_ was recorded for the next pump
@@ -263,8 +286,7 @@ private:
     uint64_t reserve_ = 0, modules_ = 0;
     std::vector<std::vector<uint64_t>> sorted_blob_bytes_;
     int64_t overlay_hits_ = 0, overlay_copies_ = 0, overlay_cpu_ = 0, overlay_peer_ = 0, overlay_swaps_ = 0;
-    struct ExtraRam { uint8_t* ptr = nullptr; uint64_t mapped = 0; core::RamPin pin; };
-    std::vector<std::vector<ExtraRam>> extra_ram_;
+    std::vector<std::vector<std::unique_ptr<ExpertRam>>> extra_ram_;
     std::vector<std::vector<int>> free_places_;
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
@@ -302,10 +324,12 @@ private:
     platform::MappedFile file_;             ///< the experts section
     PromptHost host_;
     struct PeerSubmitter;
+    struct PeerCompute;
     std::unique_ptr<core::PeerExperts> peer_;
     std::unique_ptr<prefill::PeerShare> share_;
     std::vector<prefill::ShareRates> rates_;    ///< [layer]
     std::unique_ptr<PeerSubmitter> peer_submitter_;
+    std::unique_ptr<PeerCompute> peer_compute_;
     std::vector<kernels::cpu::NativeFmt> fmt_;   ///< [layer]
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     uint8_t* act_ = nullptr;                ///< the quantized activation the CPU jobs share

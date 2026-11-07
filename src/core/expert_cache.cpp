@@ -176,6 +176,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
         at += n;
     }
     for (size_t i = 0; i < segs_.size(); ++i) {
+        if (initial_req_ >= 0 && seg_off_[i] >= initial_req_) break;
         segs_[i] = vmm::map(base_ + seg_off_[i], (uint64_t) seg_size_[i]);
         if (segs_[i] == 0) {
             char buf[200];
@@ -297,7 +298,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-        if ((uint64_t) free_b < want) {
+        const uint64_t initial = seg_req_ > 0 && initial_req_ >= 0 ?
+            std::min(want, ((uint64_t)initial_req_ + seg_req_ - 1) / seg_req_ * seg_req_) : want;
+        if ((uint64_t) free_b < initial) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
                           "ExpertCache: %lld slots x %lld B = %.2f GiB, but only %.2f GiB of VRAM is free "
@@ -322,7 +325,8 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
+    const uint64_t mapped = segs_.empty() ? want : mapped_bytes();
+    if (mapped && cudaMemset(base_, 0, (size_t) mapped) != cudaSuccess) {
         err = "ExpertCache: cudaMemset of the slot arena failed";
         close();
         return false;
@@ -330,10 +334,10 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = n_slots;
-    live_slots_ = n_slots;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
+    live_slots_ = slots_within(mapped);
     next_free_ = 0;
     fills_ = 0;
     admitted_ = 0;
@@ -361,9 +365,9 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
     if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
     slots_ = (int64_t) slot_bytes.size();
-    live_slots_ = slots_;
     blob_ = mx;
     off_ = std::move(off);
+    live_slots_ = slots_within(mapped_bytes());
     // each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized "slots",
     // so its seeds are not slot indices
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);

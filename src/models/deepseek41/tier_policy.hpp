@@ -12,6 +12,18 @@ constexpr int kSwapsPerToken = 2;               // pinned-slot swaps started per
 constexpr uint64_t kPieceBytes = 1ull << 20;    // largest single promotion copy
 constexpr int kPeerGapPieces = 3;               // second card exchange pieces per layer: about what one head leaves its bus
 constexpr uint64_t kPeerMoveAge = 1280;         // lookups (~32 windows) the second card's victim must be older than the main card's
+constexpr uint64_t kCacheSegment = 64ull << 20;
+
+/// Round down so lending releases at least the requested number of physical bytes.
+inline uint64_t loan_keep(uint64_t mapped, uint64_t needed) {
+    return needed >= mapped ? 0 : (mapped-needed)/kCacheSegment*kCacheSegment;
+}
+
+/// Existing prompt buffers already consume device memory; reserve only their missing share.
+inline uint64_t refill_reserve(uint64_t short_budget, uint64_t held, uint64_t margin, uint64_t floor, uint64_t modules) {
+    const uint64_t missing = held < short_budget ? short_budget-held : 0;
+    return missing + (margin > floor ? margin : floor) + modules;
+}
 
 /// `last` is the token + 1 of the previous miss of an expert (0 = never); true when it falls within `window` tokens.
 inline bool repeat_miss(uint64_t last, uint64_t token, int window) {

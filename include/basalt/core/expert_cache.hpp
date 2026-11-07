@@ -96,6 +96,8 @@ public:
     /// prompt path's loan all hold addresses into it).  0 (the default): one cudaMalloc.  The slots past `slots()`
     /// after a shrink must hold no resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
+    /// Reserve the full segmented address range but initially back only this prefix; -1 backs all of it.
+    void set_initial_bytes(int64_t bytes) { initial_req_ = bytes; }
     /// **THE ELASTIC TAIL.**  With `tail_bytes` set before `open`/`open_sized` (and no segment size), the arena is
     /// segmented too: large segments up to the last `tail_bytes`, then segments of the driver's granularity, so the
     /// tail can be lent to the elastic KV pools one granule at a time (`shrink`/`grow`, same rules as above).
@@ -191,6 +193,7 @@ private:
     uint8_t* base_ = nullptr;
     int64_t live_slots_ = 0;   // slots() - all of them unless shrunk
     int64_t seg_req_ = 0;   // the segment size asked for (0: one cudaMalloc)
+    int64_t initial_req_ = -1;   // initially mapped bytes of a segmented arena (-1: all)
     int64_t seg_ = 0;   // the segment size used (a multiple of the driver's granularity)
     uint64_t reserved_ = 0;   // the reserved address range's size
     std::vector<unsigned long long> segs_;   // each segment's physical handle (0: unmapped)
