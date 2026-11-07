@@ -7,8 +7,10 @@ import http.client
 import io
 import json
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from serve.frontend import ChatTemplate  # noqa: E402
@@ -305,6 +307,62 @@ class OverHttp(Server):
         self.post({"model": "basalt", "input": "hi", "stream": True})
         self.assertIn("/v1/responses", self.svc.v1_status()["dialects"])
         self.assertEqual(self.svc.history[-1]["path"], "/v1/responses")
+
+
+class BufferedKeepAlive(Server):
+    def tool_script(self, name, payload):
+        return ("</think>\n\n<tool_call>\n<function=functions." + name + ">\n<parameter=input>\n" +
+                payload + "\n</parameter>\n</function>\n</tool_call><|im_end|>")
+
+    def test_long_custom_tool_inputs_keep_the_response_alive(self):
+        patch = "*** Begin Patch\n*** Add File: test.txt\n" + "+hello\n" * 80 + "*** End Patch"
+        code = "text = 'hello'\n" * 40 + "print(text)"
+        for name, payload in (("apply_patch", patch), ("exec", code)):
+            with self.subTest(tool=name):
+                script = self.tool_script(name, payload)
+                self.engine.script = self.tok.encode(script, parse_special=True)
+                original = self.engine.generate
+                now = [0.0]
+
+                def generate(*args, **kwargs):
+                    for token in original(*args, **kwargs):
+                        now[0] += 1.0                   # a long call, without sleeping or using a GPU
+                        yield token
+
+                self.engine.generate = generate
+                tool = {"type": "namespace", "name": "functions", "tools": [
+                    {"type": "custom", "name": name, "description": "Run the input."}]}
+                try:
+                    with mock.patch("serve.handler.time", wraps=time) as clock:
+                        clock.monotonic.side_effect = lambda: now[0]
+                        status, events = self.post({"model": "basalt", "input": "go", "tools": [tool],
+                                                    "stream": True})
+                finally:
+                    self.engine.generate = original
+                self.assertEqual(status, 200, events)
+                held = [e for e in events if e["type"] == "response.in_progress" and
+                        any(item["type"] == "custom_tool_call" and item["status"] == "in_progress"
+                            for item in e["response"]["output"])]
+                self.assertGreater(len(held), 20, "buffered custom input must emit semantic heartbeats")
+                self.assertTrue(all(e["response"]["output"][-1]["input"] == "" for e in held))
+                self.assertEqual([e["sequence_number"] for e in events], list(range(len(events))))
+                self.assertEqual(events[-1]["type"], "response.completed")
+                self.assertEqual(events[-1]["response"]["output"][-1]["input"], payload)
+                self.assertEqual([e["delta"] for e in events if e["type"] == "response.custom_tool_call_input.delta"],
+                                 [payload])
+
+
+class DeepSeekBufferedKeepAlive(BufferedKeepAlive):
+    def setUp(self):
+        from serve.tests.test_deepseek41_tool_repair import service
+        self.svc, self.tok, self.engine = service([""])
+        self.httpd = serve(self.svc, port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tool_script(self, name, payload):
+        from serve.models.deepseek41 import CALLS_START, CALLS_END, EOS
+        from serve.tests.test_deepseek41_dialect import invoke
+        return "</think>\n" + CALLS_START + "\n" + invoke("functions." + name, input=payload) + CALLS_END + EOS
 
 
 class ToolsWithStructuredOutput(Server):
