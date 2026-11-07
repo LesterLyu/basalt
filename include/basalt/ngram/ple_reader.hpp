@@ -70,7 +70,7 @@ public:
     Ticket issue(const uint32_t* rows, size_t n, uint8_t* out_raw);
 
     /// Block until every row of the ticket is in `out_raw`. Returns false on an I/O error (message in `err`).
-    bool collect(Ticket t, std::string& err);
+    bool collect(Ticket t, std::string& err, double* total_wait_us = nullptr);
 
     /// Keep the SSD awake while the table is in use (call after `open`): when no read has
     /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`

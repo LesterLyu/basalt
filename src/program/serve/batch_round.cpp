@@ -62,6 +62,7 @@ void Runtime::slot_window_begin(int b, SlotWin& w, int limit) {
     w.d = {};
     w.d.tokens = w.win.data();
     w.d.n_tokens = T;
+    w.d.row_wait_us = &sl.row_wait_us;
     w.d.pos = sl.p;
     (T > 1 ? w.d.row_tokens : w.d.next_token) = w.out.data();
     w.d.sampling = &sp;
@@ -195,6 +196,7 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
         else bpolicy->observe_window(w.chance, T, a, ms);
     }
     if (fin != nullptr) {
+        report_row_wait(b, sl.row_wait_us, sl.produced);
         std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
                     std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
                     (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);

@@ -68,6 +68,12 @@ void stall_report(std::FILE* f, uint64_t layers_during);
 
 enum class Flow { proceed, next, quit, error };
 
+inline void report_row_wait(int slot, double us, int64_t produced) {
+    if (us > 0 && produced > 0)
+        basalt::log::info("basalt serve", "slot %d decode Engram wait %.3f ms / %lld output tokens = %.4f ms/token",
+                          slot, us / 1000, (long long) produced, us / (1000 * (double) produced));
+}
+
 struct SlotWin;
 
 // Below this much free VRAM a later allocation (a first-used window's buffers, the desktop, another program) can make
@@ -271,6 +277,7 @@ public:
         int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
         int64_t p = 0;                 ///< its position
         int64_t produced = 0, max_new = 0;
+        double row_wait_us = 0;
         Clock::time_point t0;
         // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
         // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it

@@ -475,6 +475,7 @@ public:
     bool run_window(int T, int e0, int&) {
         basalt::model::DecodeRequest d;
         d.tokens = window.data();
+        d.row_wait_us = &row_wait_us_;
         d.n_tokens = T;
         d.pos = p;
         d.drawn_drafts = own_drafts_ && e0 == 0 && ppl == nullptr && T > 1;
@@ -586,6 +587,8 @@ private:
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
     // a slot's prompt lookup history: the conversation, then the token its first window feeds
     void slot_init(BSlot& sl) override {
+        sl.row_wait_us = row_wait_us_;
+        row_wait_us_ = 0;  // the batch reports the whole request at BDONE
         if (!rt_.lookup_on()) return;
         sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
                                                                (size_t) runtime_.o.max_context + 4096);
@@ -629,7 +632,10 @@ private:
         dc.file_blobs = c.files - counts0_.files;
         return dc;
     }
-    void report_request(const DoneCounts& dc) override { report_expert_counts(dc); }
+    void report_request(const DoneCounts& dc) override {
+        report_expert_counts(dc);
+        report_row_wait(in_slot ? slot_b : 0, row_wait_us_, produced_n);
+    }
 
     void progress_line(const char* tag, int64_t at_pos) {
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -641,6 +647,7 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
+    double row_wait_us_ = 0;
     bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;

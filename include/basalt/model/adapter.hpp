@@ -128,6 +128,7 @@ struct DecodeRequest {
     /// Rows 1 .. n_tokens-1 are the drafts the session's own drafter left last (draft_end), in order. A sampled window may
     /// then keep each by the drafter's proposal (speculative sampling) instead of comparing it with its own draw.
     bool drawn_drafts = false;
+    double* row_wait_us = nullptr;    ///< accumulate time collecting n-gram rows for this decode window
 };
 
 struct PrefillRequest {
