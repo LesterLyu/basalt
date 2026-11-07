@@ -94,11 +94,28 @@ Prompt skip cannot be scored this way (512-token chunks). On a 64K prompt, the 2
 `overlay.base-header`, a text `overlay.layout` starting with `BASALT_DS_EXPERTS_V1` and rows
 `layer expert gate_up_type down_type offset bytes`, and the contiguous `experts` section (gate, up, down).
 Only the listed target experts change. The router, shared experts and DSpark weights keep their original precision.
-The primary GPU holds one copy across slots; this reduces memory available to the ordinary expert cache.
-The window and prompt paths use the replacement format before applying router weights. Disk KV reuse is disabled
-for an overlay. Removing the flag restores the base weights.
+Replacement weights have one immutable RAM backing shared across slots; their superseded base bytes are
+excluded from all tiers. Initial placement keeps the normal routing rank. CPU jobs dispatch each expert's
+native format and activation quantizer. Primary and helper GPU slots accept either format, and the normal
+miss split, LRU promotion and swaps apply. Slots reserve their layer's largest blob; the two directions of a
+swap use the actual outgoing and incoming byte counts. A base expert displaced by a replacement gets a RAM
+place subject to the RAM floor. No weights are requantized and neither pack is rewritten.
 
-Q2_K overlay rows use the shared upstream Q2_K dot product. The former overlay-only dot is removed; its
-accumulation order differs, so bitwise identity with that implementation is not assumed. Overlay quality and
-interleaved DSpark parity after this integration have not been remeasured. Each slot owns its captured drafter
-body graph because that graph binds its ring addresses; the head graphs and weights remain shared.
+Prompt reads stage each replacement once for all its rows and retain native row arithmetic. Base experts use
+the host read-ahead ring with the existing compute groups. `--prefill-chunk N` (config `engine.prefill-chunk`)
+sets a power-of-two ceiling from 256 through 16384; the default is 16384. Memory fit may halve it.
+Disk KV reuse must be disabled with an overlay; removing the overlay restores the base model.
+
+Validation on a real 903-expert sidecar covers its seven format pairs at 1, 2, 4 and 8 rows: mixed CPU batches
+match serial CPU kernels bitwise; mixed GPU batches, the primary's row path and the helper match bitwise,
+including unequal-size swaps checked against the original bytes and buffer boundaries. The existing CPU
+pool suite passes 603 cases across nine formats. With replacements deliberately distributed across CPU and
+both GPUs at fixed placement, each 96-token conversation/prose response matches its interleaved two-slot
+response. The test uses two 512K slots, DSpark window 3, 15 workers and 402.5 W / 180 W power limits.
+
+Adaptive runs exercise all three compute locations and replacement swaps, followed by an 18K prompt using
+16384 + 1615 prompt rows. Changing placement can change CPU/GPU activation rounding and generated tokens;
+weight-byte preservation does not promise token identity across different placements or a quality gain.
+The tested donor bytes are 8.48 GiB and replace 6.27 GiB, a net weight increase of 2.21 GiB before cache copies,
+slot padding and transfer buffers. Each slot owns its captured drafter body graph; weights and head graphs
+remain shared.

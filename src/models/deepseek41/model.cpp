@@ -1,5 +1,8 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/vmm.hpp"
+#include "basalt/core/expert_source.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -18,7 +21,11 @@
 namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
-    if (overlay_device_) cudaFree(overlay_device_);
+    shared_tier_.tier.reset();
+    if (overlay_host_) {
+        if (overlay_mapped_) core::vmm::free_host(overlay_host_, overlay_mapped_);
+        else { core::unpin_ram(overlay_host_, overlay_pin_); platform::free_aligned(overlay_host_); }
+    }
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (embd_fd_ >= 0) platform::close_fd(embd_fd_);
@@ -55,23 +62,31 @@ bool DsModel::load_overlay(const std::string& path, std::string& err) {
         auto& ent=overlay_[key];
         if (ent.layout.bytes) {err="duplicate overlay expert"; return false;}
         ent.layout=kernels::native_expert_layout(gu,d,g.n_embd,g.n_ff_exp);
+        ent.layout.swiglu_limit = g.clamp_exp[l];
+        if (!kernels::cpu::native_fmt(gu,d,g.n_embd,g.n_ff_exp,ent.cpu,err,g.clamp_exp[l])) return false;
         if (ent.layout.bytes!=bytes) {err="overlay expert size does not match quantization"; return false;}
         entries.emplace_back(key,off); cursor+=bytes;
     }
     if (cursor!=data.bytes || entries.empty()) {err="incomplete overlay layout"; return false;}
-    if (cudaMalloc(&overlay_device_,cursor)!=cudaSuccess) {err="not enough device memory for expert overlay";return false;}
-    std::vector<uint8_t> chunk(8<<20);
+    core::detail::HostMemory hm;
+    if (!core::detail::host_available_memory(hm) ||
+        cursor > core::ram_tier_room(hm.available, platform::ram_reserve(), true)) {
+        err = "not enough RAM above the safety reserve for expert overlay"; return false;
+    }
+    if constexpr (platform::kDirectHostVmmExchange)
+        overlay_host_ = core::vmm::alloc_host(cursor, overlay_mapped_);
+    if (!overlay_host_) overlay_host_ = core::alloc_ram(cursor);
+    if (!overlay_host_) {err="cannot allocate host expert overlay";return false;}
     for (uint64_t at=0;at<cursor;) {
-        const size_t n=(size_t)std::min<uint64_t>(chunk.size(),cursor-at);
-        if (!core::read_range_at(data,at,chunk.data(),n,err)) return false;
-        if (cudaMemcpy((uint8_t*)overlay_device_+at,chunk.data(),n,cudaMemcpyHostToDevice)!=cudaSuccess) {
-            err="cannot upload expert overlay";return false;
-        }
+        const size_t n=(size_t)std::min<uint64_t>(8<<20,cursor-at);
+        if (!core::read_range_at(data,at,overlay_host_+at,n,err)) return false;
         at+=n;
     }
-    for (auto [i,off]:entries) overlay_[i].blob=(uint8_t*)overlay_device_+off;
+    if (!overlay_mapped_) overlay_pin_ = core::pin_ram(overlay_host_, cursor, cursor, {}, false);
+    for (auto [i,off]:entries) overlay_[i].blob=overlay_host_+off;
     overlay_bytes_=cursor;
-    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB on GPU %d",entries.size(),cursor/1073741824.,device_);
+    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB in RAM, %.2f GiB pinned; adaptive GPU copies",
+                    entries.size(),cursor/1073741824.,(overlay_mapped_ ? overlay_mapped_ : overlay_pin_.registered_bytes)/1073741824.);
     return true;
 }
 
@@ -185,6 +200,7 @@ prefillp::Dims DsModel::prompt_dims() const {
     d.n_expert = g.n_expert;
     d.n_ff_exp = g.n_ff_exp;
     d.engram_cols = (int64_t) pack_.engram.hash.n_cols() * 256;
+    d.replacement_blob_bytes = overlay_max_bytes();
     for (const ExpertLayer& e : pack_.experts) {
         d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
     }

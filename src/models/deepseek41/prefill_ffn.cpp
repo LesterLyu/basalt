@@ -28,6 +28,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <map>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -86,7 +87,8 @@ public:
         ok = ok && dev(ident_, R * 4) && dev(rows_, E * n * 4) && dev(sbnd_, 8 * 4);
         if (m_.has_overlay())
             ok = ok && dev(overlay_x_, kernels::native_q8_1_bytes(g_.n_embd,1)) &&
-                 dev(overlay_scratch_, kernels::gated_mlp_scratch_bytes(1,g_.n_ff_exp));
+                 dev(overlay_scratch_, kernels::gated_mlp_scratch_bytes(1,g_.n_ff_exp)) &&
+                 dev(overlay_blob_, m_.overlay_max_bytes());
         for (int i = 0; i < 2; ++i) {
             Stage& b = stage_[i];
             b.host = host.stage[i];
@@ -127,9 +129,9 @@ public:
         if (il == 0) {
             stop_prefetch();
             ahead_ = false;
-            if (!m_.has_overlay() && tier_ && (int64_t) T * K >= prefillp::kAheadPairs) ahead_ = start_ahead();
+            if (tier_ && (int64_t) T * K >= prefillp::kAheadPairs) ahead_ = start_ahead();
         }
-        if (ahead_) return routed_ahead(il, T, x, ids, w, out, st, err);
+        if (ahead_ && !m_.has_overlay()) return routed_ahead(il, T, x, ids, w, out, st, err);
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
         cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
@@ -143,9 +145,10 @@ public:
         }
         std::vector<int> used;
         for (int e = 0; e < g_.n_expert; ++e)
-            if (!by[(size_t) e].empty() && !m_.replacement(il,e)) used.push_back(e);
+            if (!by[(size_t) e].empty()) used.push_back(e);
         Share share;
         if (tier_ && !plan_share(il, T, x, by, used, share, err)) return false;
+        used.erase(std::remove_if(used.begin(), used.end(), [&](int e) { return m_.replacement(il,e) != nullptr; }), used.end());
 
         for (size_t b0 = 0; b0 < used.size();) {
             // experts of this launch: up to kStageExperts, up to max_rows_ rows
@@ -172,6 +175,14 @@ public:
                     cudaMemcpyAsync(dst, src.dev, L.bytes, cudaMemcpyDeviceToDevice, copy_);
                 } else if (src.pinned) {
                     cudaMemcpyAsync(dst, src.pinned, L.bytes, cudaMemcpyHostToDevice, copy_);
+                } else if (ahead_ && pf_on_) {
+                    // Keep the overlay path's MMQ groups unchanged; only its weight reads run ahead.
+                    const int32_t i = pf_idx_[(size_t) il][(size_t) e];
+                    if (i < 0) { err = "deepseek41: missing prefetch entry"; return false; }
+                    const int64_t seq = pf_base_[(size_t) il] + i;
+                    if (!release_through(seq, err) || !wait_ready(seq, err)) return false;
+                    cudaMemcpyAsync(dst, ring_ + (size_t) (seq % ring_pieces_) * slot_, L.bytes,
+                                    cudaMemcpyHostToDevice, copy_);
                 } else if (src.peer) {
                     tier_->peer()->read_slot(src.peer, B.host + slot_ * (size_t) q, L.bytes);
                     from_peer = true;
@@ -259,17 +270,25 @@ public:
             cudaEventRecord(B.done, st);
             b0 += (size_t) nb;
         }
+        if (ahead_ && pf_on_ && !release_through(pf_base_[(size_t) il + 1], err)) return false;
         if (!finish_share(share, stream, err)) return false;
         if (m_.has_overlay()) {
-            for (int t=0; t<T; ++t) {
-                bool quantized = false;
-                for (int k=0; k<K; ++k) {
-                    int row = t*K+k;
-                    const auto* v = m_.replacement(il,hid[row]);
-                    if (!v) continue;
-                    if (!quantized) kernels::quantize_q8_1_rows(x+(size_t)t*g_.n_embd,1,g_.n_embd,overlay_x_,stream);
-                    quantized = true;
-                    kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[il],v->blob,1,1,overlay_x_,overlay_scratch_,
+            // Stage each replacement once for all its rows, retaining the decode arithmetic and output positions.
+            for (int e = 0; e < g_.n_expert; ++e) {
+                const auto* v = m_.replacement(il,e);
+                if (!v || by[e].empty() || (!share.handled.empty() && share.handled[e])) continue;
+                const auto src = tier_->locate(il,e);
+                const void* blob = src.dev;
+                if (!blob) {
+                    if (cudaMemcpyAsync(overlay_blob_,v->blob,v->layout.bytes,cudaMemcpyHostToDevice,st) != cudaSuccess) {
+                        err = "deepseek41: cannot stage replacement prompt expert"; return false;
+                    }
+                    blob = overlay_blob_;
+                }
+                for (int row : by[e]) {
+                    const int t = row / K;
+                    kernels::quantize_q8_1_rows(x+(size_t)t*g_.n_embd,1,g_.n_embd,overlay_x_,stream);
+                    kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[il],blob,1,1,overlay_x_,overlay_scratch_,
                                                rows_+(size_t)row*g_.n_embd,stream);
                 }
             }
@@ -314,6 +333,8 @@ private:
     struct Share {
         std::vector<kernels::cpu::ExpertJobMulti> jobs;
         std::vector<int32_t> act_tokens, pair;   // tokens whose activations the CPU needs; each row's (token, slot) pair
+        std::vector<const kernels::cpu::NativeFmt*> act_formats;
+        std::vector<uint8_t> handled;
         std::vector<PeerRow> peer;
         int cpu_rows = 0;
         std::thread cpu_thread, peer_thread;
@@ -349,25 +370,30 @@ private:
         if (pinned == 0 && !tier_->peer()) return true;
         if (!share_buffers(err)) return false;
         const size_t n = (size_t) g_.n_embd;
-        std::vector<uint8_t> stays((size_t) g_.n_expert, 0);
+        s.handled.assign((size_t) g_.n_expert, 0);
+        auto& stays = s.handled;
         int rows = 0;
         // the CPU's: one-row experts, then two-row ones, while the bus would still carry as many experts as it has rows
-        std::vector<int32_t> tok_row((size_t) T, -1);
+        std::map<std::pair<int,int>, int32_t> tok_row;
         for (int c = 1; c <= kCpuRows; ++c) {
             for (int e : used) {
                 const ExpertTier::Source src = tier_->locate(il, e);
                 if (!src.pinned || (int) by[(size_t) e].size() != c || stays[(size_t) e]) continue;
                 if (s.cpu_rows + c > pinned - (int) s.jobs.size() - 1 || rows + c > prefillp::kShareRows) break;
                 kernels::cpu::ExpertJobMulti j;
+                const auto& format = tier_->fmt(il,e);
+                j.native_format = &format;
                 j.blob = src.pinned;
                 j.nt = c;
                 for (int i = 0; i < c; ++i) {
                     const int32_t p = by[(size_t) e][(size_t) i], t = p / K;
-                    if (tok_row[(size_t) t] < 0) {
-                        tok_row[(size_t) t] = (int32_t) s.act_tokens.size();
+                    const auto key = std::make_pair(t,format.gu_act);
+                    auto [it, inserted] = tok_row.emplace(key,(int32_t)s.act_tokens.size());
+                    if (inserted) {
                         s.act_tokens.push_back(t);
+                        s.act_formats.push_back(&format);
                     }
-                    j.nact[i] = act_ + (size_t) tok_row[(size_t) t] * kernels::cpu::kNativeActBytes;
+                    j.nact[i] = act_ + (size_t) it->second * kernels::cpu::kNativeActBytes;
                     j.out[i] = hrows_ + (size_t) rows * n;
                     s.pair.push_back(p);
                     ++rows;
@@ -401,7 +427,7 @@ private:
             s.cpu_thread = std::thread([this, il, &s] {
                 const kernels::cpu::NativeFmt& f = tier_->fmt(il);
                 for (size_t i = 0; i < s.act_tokens.size(); ++i)
-                    kernels::cpu::native_quant_act(f, hx_ + (size_t) s.act_tokens[i] * g_.n_embd, act_ + i * kernels::cpu::kNativeActBytes);
+                    kernels::cpu::native_quant_act(*s.act_formats[i], hx_ + (size_t) s.act_tokens[i] * g_.n_embd, act_ + i * kernels::cpu::kNativeActBytes);
                 tier_->pool()->run_split_multi_native(f, s.jobs.data(), (int) s.jobs.size());
             });
         if (!s.peer.empty())
@@ -412,14 +438,17 @@ private:
                 core::PeerExperts* peer = tier_->peer();
                 const size_t n_rows = s.peer.size();
                 int32_t ids[core::PeerExperts::kRowBatch];
+                const kernels::NativeExpertLayout* layouts[core::PeerExperts::kRowBatch]{};
                 for (size_t r0 = 0; r0 < n_rows; r0 += (size_t) core::PeerExperts::kRowBatch) {
                     const size_t nb = std::min<size_t>(n_rows - r0, (size_t) core::PeerExperts::kRowBatch);
                     for (size_t i = 0; i < nb; ++i) {
                         ids[i] = s.peer[r0 + i].expert;
+                        const auto* v = m_.replacement(il,ids[i]);
+                        layouts[i] = v ? &v->layout : nullptr;
                         std::copy_n(hx_ + (size_t) s.peer[r0 + i].tok * g_.n_embd, g_.n_embd, xb_ + i * g_.n_embd);
                     }
                     float* out = peer_rows_ + ((size_t) s.cpu_rows + r0) * g_.n_embd;
-                    if (!peer->launch_rows(il, limited, xb_, ids, (int64_t) nb, out, s.peer_err) || !peer->finish(nullptr, s.peer_err)) return;
+                    if (!peer->launch_rows(il, limited, xb_, ids, (int64_t) nb, out, s.peer_err, m_.has_overlay() ? layouts : nullptr) || !peer->finish(nullptr, s.peer_err)) return;
                 }
             });
         return true;
@@ -451,6 +480,7 @@ private:
         pf_base_.assign((size_t) nl + 1, 0);
         for (int l = 0; l < nl; ++l) {
             for (int e = 0; e < g_.n_expert; ++e) {
+                if (m_.replacement(l, e)) continue;
                 const ExpertTier::Source src = tier_->locate(l, e);
                 if (src.dev || src.pinned) continue;
                 pf_idx_[(size_t) l][(size_t) e] = (int32_t) pf_list_[(size_t) l].size();
@@ -463,7 +493,7 @@ private:
         ring_ = host.ring;
         ring_pieces_ = host.ring_pieces;
         if (pf_base_.back() > 0 && ring_pieces_ < kStageExperts) return false;   // a launch's pieces must fit at once
-        if (!ahead_buffers()) return false;
+        if (!m_.has_overlay() && !ahead_buffers()) return false;
         cudaStreamSynchronize(copy_);
         for (const auto& o : pf_out_) pf_events_.push_back(o.first);
         pf_out_.clear();
@@ -476,6 +506,29 @@ private:
             pf_on_ = true;
             pf_th_ = std::thread([this] { prefetch_loop(run_layers_); });
         }
+        if (m_.has_overlay())
+            basalt::log::info("basalt deepseek41", "overlay prompt: expert read-ahead, unchanged compute groups");
+        return true;
+    }
+
+    // Release skipped ring entries only after all earlier copies have finished. Sparse routing can skip
+    // farther than the ring's capacity; the reader still publishes at most one ringful at a time.
+    bool release_through(int64_t end, std::string& err) {
+        cudaEvent_t ev = nullptr;
+        if (!pf_events_.empty()) {
+            ev = pf_events_.back();
+            pf_events_.pop_back();
+        } else if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+            err = "deepseek41: cannot create a ring release event";
+            return false;
+        }
+        if (cudaEventRecord(ev, copy_) != cudaSuccess) {
+            cudaEventDestroy(ev);
+            err = "deepseek41: cannot record a ring release event";
+            return false;
+        }
+        pf_out_.emplace_back(ev, end);
+        release_done(false);
         return true;
     }
 
@@ -706,7 +759,7 @@ private:
                     std::unique_lock<std::mutex> lk(pf_mu_);
                     pf_cv_.wait(lk, [&] { return pf_stop_ || s0 < pf_released_ + ring_pieces_; });
                     if (pf_stop_) return;
-                    room = pf_released_ + ring_pieces_ - s0;
+                    room = prefillp::ring_read_room(s0, pf_released_, ring_pieces_);
                 }
                 const size_t i1 = std::min(list.size(), i0 + (size_t) room);
                 auto at = [&](size_t i) { return ring_ + (size_t) ((pf_base_[(size_t) l] + (int64_t) i) % ring_pieces_) * slot_; };
@@ -813,7 +866,7 @@ private:
     std::vector<void*> dev_;
     uint64_t allocated_bytes_ = 0;
     void *xq1_ = nullptr, *xq2_ = nullptr;
-    void *overlay_x_ = nullptr, *overlay_scratch_ = nullptr;
+    void *overlay_x_ = nullptr, *overlay_scratch_ = nullptr, *overlay_blob_ = nullptr;
     int32_t *ident_ = nullptr, *sbnd_ = nullptr;
     float *gu_ = nullptr, *h_ = nullptr, *rows_ = nullptr;
     float *hx_ = nullptr, *hrows_ = nullptr, *peer_rows_ = nullptr, *xb_ = nullptr, *drows_ = nullptr;

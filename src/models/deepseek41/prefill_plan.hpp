@@ -30,6 +30,13 @@ constexpr int kShortPrompt = 2048;                 // a prompt this short takes 
 constexpr int kShortChunk = 1024;                  // ... in chunks of this many tokens
 constexpr int64_t kAheadPairs = 50000;              // (token, slot) pairs from which a chunk stages its groups ahead: past a short chunk
 
+/// A sparse consumer may release entries the reader has not reached. One read batch must never wrap
+/// over itself, even when those skipped entries leave more than a ring's worth of logical room.
+inline int64_t ring_read_room(int64_t next, int64_t released, int64_t capacity) {
+    const int64_t room = released + capacity - next;
+    return room < 0 ? 0 : room < capacity ? room : capacity;
+}
+
 /// The first position that stops a read's rows short of the last layers. Each layer past `skip_layer` looks one window further
 /// back through its own window rows, and every row reaches the compressed rows of `skip_layer` anyway.
 inline int64_t far_below(int64_t stop, int n_layers, int skip_layer, int window) {
@@ -47,6 +54,7 @@ struct Dims {
     int64_t n_embd = 0, n_used = 0, n_expert = 0, n_ff_exp = 0;
     int64_t hc_coef = 24, hc_splits = 8, engram_cols = 0;
     uint64_t expert_blob_bytes = 0;   // the largest expert
+    uint64_t replacement_blob_bytes = 0; // one replacement staged at a time, without the ahead device groups
 };
 
 /// Device bytes that grow with the chunk: streams and scratch rows, router outputs, the expert inputs.
@@ -66,14 +74,14 @@ inline int64_t stage_rows(int64_t n_used, int chunk) {
 inline uint64_t fixed_bytes(const Dims& d, int chunk) {
     const uint64_t R = (uint64_t) stage_rows(d.n_used, chunk);
     const uint64_t q8 = (uint64_t) d.n_embd * R * 36 / 32 + (uint64_t) d.n_ff_exp * R * 36 / 32;
-    return q8 + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8) +
+    return d.replacement_blob_bytes + q8 + R * (uint64_t) d.n_ff_exp * 12 + R * 4 + 2 * (d.expert_blob_bytes * kStageExperts + R * 8) +
            (uint64_t) kShareRows * ((uint64_t) d.n_embd * 4 + 4);
 }
 
 inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d, chunk) + per_token_bytes(d) * (uint64_t) chunk; }
 
 /// Device bytes of the long chunks' staged groups of experts, ahead of their products.
-inline uint64_t ahead_bytes(const Dims& d) { return kAheadSlots * d.expert_blob_bytes * kStageExperts; }
+inline uint64_t ahead_bytes(const Dims& d) { return d.replacement_blob_bytes ? 0 : kAheadSlots * d.expert_blob_bytes * kStageExperts; }
 
 struct Fit {
     int chunk = 0;       ///< tokens per chunk; 0 when even the least does not fit

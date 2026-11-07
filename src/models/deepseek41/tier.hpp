@@ -130,6 +130,7 @@ public:
     PromptHost& host() { return host_; }
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
+    const kernels::cpu::NativeFmt& fmt(int layer, int expert) const;
 
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
@@ -152,6 +153,7 @@ private:
     struct Pending {
         int layer, expert, slot, event;
         int out = -1, place = -1;
+        bool home = false;
     };
     /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` first, then `src` into `dst`.
     struct Queued {
@@ -159,7 +161,7 @@ private:
         uint8_t* dst;
         const uint8_t* src;
         uint8_t* home_to;
-        uint64_t bytes, off = 0, home_off = 0;
+        uint64_t bytes, off = 0, home_off = 0, home_bytes = 0;
     };
     /// Issues every queued promotion's remaining copies.
     void flush_queue();
@@ -176,7 +178,12 @@ private:
     bool load_rank(std::string& err);
     void seed_copies(int64_t n);
     void preread();
-    bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
+    bool pinned(int layer, int e) const;
+    uint64_t expert_bytes(int layer, int e) const;
+    uint8_t* ram_place(int layer, int place) const;
+    bool ensure_spare(int layer);
+    void return_place(int layer, int place);
+    void land_home(int layer, int in, int out, int place);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
     uint64_t slot_total() const { return (uint64_t) n_layers_ * (uint64_t) (per_layer_ + ext_per_layer_); }
@@ -218,6 +225,11 @@ private:
     bool gap_marked_ = false;               ///< gap_ev_ was recorded for the next pump
     uint64_t tick_ = 0;
     uint64_t one_each_ = 0, reserve_ = 0, modules_ = 0;
+    std::vector<uint64_t> device_slot_bytes_; ///< capacity for either the base or replacement format of each layer
+    int64_t overlay_hits_ = 0, overlay_copies_ = 0, overlay_cpu_ = 0, overlay_peer_ = 0, overlay_swaps_ = 0;
+    struct ExtraRam { uint8_t* ptr = nullptr; uint64_t mapped = 0; core::RamPin pin; };
+    std::vector<std::vector<ExtraRam>> extra_ram_;
+    std::vector<std::vector<int>> free_places_;
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
@@ -225,9 +237,14 @@ private:
     bool profile_peer_exchange_ = false;
     uint64_t peer_exchanges_ = 0, peer_exchange_ns_ = 0, peer_read_ns_ = 0, peer_host_ns_ = 0, peer_write_ns_ = 0;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
-    std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)
+    std::vector<uint8_t*> ram_;             ///< [layer] compact pinned experts and a spare when the layer has RAM homes
+    std::vector<uint64_t> ram_bytes_;       ///< actual allocated span per layer, including its spare
     policy::Homes homes_;
+    std::vector<policy::Homes> layer_homes_;
+    std::vector<int> base_count_;          ///< effective base experts; replacement weights have separate RAM backing
+    uint64_t resident_bytes_ = 0;          ///< RAM weights excluding swap spares
     std::vector<int32_t> rank_;             ///< [layer * n_expert + rank] expert; empty: the file's order
+    std::vector<std::vector<int>> preread_experts_; ///< immutable initial file-backed ranking for the reader thread
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1

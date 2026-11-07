@@ -717,7 +717,9 @@ public:
             for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err)) return false;
+            const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
+            for (int r = 0; r < T*K; ++r) if (const auto* v = m_.replacement(il,h_ids_[r])) layouts[r] = &v->layout;
+            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
@@ -725,6 +727,7 @@ public:
             int ng = 0, ne = 0;
             for (int i = 0; i < nu; ++i) {
                 if (!lk.dev[i] || lk.fetched[i] != fetched) continue;
+                if (m_.replacement(il, lk.experts[i])) continue;
                 pl.ptr[ng] = (unsigned long long) lk.dev[i];
                 pl.start[ng] = ne;
                 for (int j = 0; j < use[i].nt; ++j) {
@@ -752,7 +755,7 @@ public:
         if (n_fetched) {
             const int ng = make_plan(plan, true, entries);
             tier_->await_fetch(st);
-            gpu_share(plan, ex_plan2_, ng, entries);
+            if (ng) gpu_share(plan, ex_plan2_, ng, entries);
         }
         // the CPU's share ran while the GPU works; its rows land in their rows
         if (cpu) {
@@ -763,7 +766,7 @@ public:
         WindowRowPtrs rp{};
         for (int r = 0; r < T * K; ++r)
             rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : d_rows_ + (size_t) r * n;
-        if (m_.has_overlay()) apply_overlay(il,T,K,h_ids_,rp.p,stream);
+        if (m_.has_overlay()) apply_overlay(il,T,K,h_ids_,lk,rp.p,stream);
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
@@ -827,7 +830,9 @@ public:
             for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->launch_plain(il, limited, h_x_, lk.experts, K, kind, err)) return false;
+            const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
+            for (int r = 0; r < K; ++r) if (const auto* v = m_.replacement(il,lk.experts[r])) layouts[r] = &v->layout;
+            if (!peer->launch_window(il, limited, h_x_, lk.experts, 1, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
@@ -836,6 +841,7 @@ public:
             int m = 0;
             for (int k = 0; k < K; ++k) {
                 if (!lk.dev[k] || lk.fetched[k] != fetched) continue;
+                if (m_.replacement(il, lk.experts[k])) continue;
                 pl.ptr[m] = (unsigned long long) lk.dev[k];
                 pl.start[m] = m;
                 pl.dst[m] = k;
@@ -879,12 +885,14 @@ public:
         }
         if (n_fetched) {
             ExpertPlan plan2;
-            make_plan(plan2, true);
+            const int ng = make_plan(plan2, true);
             tier_->await_fetch(st);
+            if (ng) {
             put_words(&plan2, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
             ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
-            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
-                                                   n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
+            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, ng,
+                                                   ng, ex_xq_, ex_scr_, ex_rows_, stream);
+            }
         }
         // the CPU's share ran while the GPU works; its rows land in the router index's row
         if (cpu) {
@@ -895,7 +903,7 @@ public:
         RowPtrs rp{};
         for (int k = 0; k < K; ++k)
             rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : d_rows_ + (size_t) k * g_.n_embd;
-        if (m_.has_overlay()) apply_overlay(il,1,K,lk.experts,rp.p,stream);
+        if (m_.has_overlay()) apply_overlay(il,1,K,lk.experts,lk,rp.p,stream);
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
@@ -936,14 +944,17 @@ private:
         *p = v;
         return true;
     }
-    void apply_overlay(int layer, int rows, int k, const int32_t* ids, const float** result, void* stream) {
+    void apply_overlay(int layer, int rows, int k, const int32_t* ids, const ExpertTier::Lookup& lk, const float** result, void* stream) {
         const auto stride = kernels::native_q8_1_bytes(g_.n_embd, 1);
         for (int i=0; i<rows*k; ++i) {
             const auto* v = m_.replacement(layer, ids[i]);
             if (!v) continue;
             float* dst = ex_rows_ + (size_t)i*g_.n_embd;
             const void* x = (const uint8_t*)ex_xq_ + (i/k)*stride;
-            kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[layer],v->blob,1,1,x,overlay_scratch_,dst,stream);
+            int u = 0;
+            while (u < lk.k && lk.experts[u] != ids[i]) ++u;
+            if (u == lk.k || !lk.dev[u]) continue;
+            kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[layer],lk.dev[u],1,1,x,overlay_scratch_,dst,stream);
             result[i] = dst;
         }
     }
