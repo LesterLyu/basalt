@@ -52,7 +52,8 @@ bool Prefill::Run::Chunk::start_stream() {
         m.stager->start(std::move(js));
     }
     chunk_stager_done.st = stream_all ? m.stager.get() : nullptr;
-    peer_async = remote_device >= 0 && m.peer_stage.setup(remote_device, (size_t) MAXBLOB());
+    peer_async = remote_device >= 0;
+    if (peer_async && !m.peer_stage.setup(remote_device, (size_t) MAXBLOB(), err)) return false;
     if (threaded_issue) {
         issuer = std::thread([this] {
             const core::OnDevice od(m.device);

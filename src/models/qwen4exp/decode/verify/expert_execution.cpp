@@ -16,7 +16,9 @@ using namespace verify_detail;
 
 // The device-planned tail's window start: residency tables, the flag words, and the peer card's persistent window.
 bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
+    const Clock::time_point ts = Clock::now();
     if (!dm_sync(err)) return false;
+    ms_stage_residency += ms_since(ts);
     decode_events().stamp(4);
     if (gm) gm->mark(13);
     *(volatile uint32_t*) (dm_->h_w + 0) = 0;
@@ -32,8 +34,8 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         dm_->tag_dirty = false;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    const Clock::time_point tp = Clock::now();
     if (dm_->pdev >= 0) {
-        const OnDevice on(dm_->pdev);
         basalt::kernels::DmPeerArgs pa;
         pa.rings_m = dm_->h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
         pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
@@ -46,17 +48,12 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
             pa.mxq_m = gs_h_xq_; pa.mxq = gs_pxq_;
             pa.mx_m = gs_h_x_; pa.mixl = gs_mixl_; pa.part_m = gs_h_part_;
         }
-        if (!basalt::kernels::dec_moe_zero_words(dm_->parr, 16, dm_->ps) ||
-            !basalt::kernels::dec_moe_peer_launch(pa, dm_->pblocks, dm_->ps, dm_->pq2)) {
-            err = "verify: the peer window did not launch";
-            return false;
-        }
+        if (!dm_->launcher->launch(pa, dm_->pblocks, dm_->ps, dm_->pq2, err)) return false;
         dm_->peer_live = true;
     }
     for (DecMoe::XPeer& x : dm_->xp) {   // further peers: the same window on their own ring
         for (int w : {0, 16, 32}) *(volatile uint32_t*) (x.h_w + w) = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        const OnDevice on(x.dev);
         basalt::kernels::DmPeerArgs pa;
         pa.rings_m = x.h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
         pa.seq_m = x.h_w + 0; pa.done_m = x.h_w + 16; pa.rows_m = dm_->h_rows;
@@ -64,13 +61,10 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = x.pscr; pa.arrive = x.parr; pa.diag_m = x.h_w + 32;
         pa.rq = x.rq; pa.rs = x.rs;
-        if (!basalt::kernels::dec_moe_zero_words(x.parr, 16, x.ps) ||
-            !basalt::kernels::dec_moe_peer_launch(pa, x.pblocks, x.ps, dm_->pq2)) {
-            err = "verify: a further peer's window did not launch";
-            return false;
-        }
+        if (!x.launcher->launch(pa, x.pblocks, x.ps, dm_->pq2, err)) return false;
         x.live = true;
     }
+    ms_stage_peer += ms_since(tp);
     if (gm) gm->mark(14);
     return true;
 }

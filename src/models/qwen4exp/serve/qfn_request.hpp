@@ -149,6 +149,7 @@ private:
         int64_t misses, entries, hits, pcie, peer;
     };
     DecSnap ds0{};
+    double stage0[4]{};
     double dt_run{};
     double dt_commit{};
     double dt_draft{};
