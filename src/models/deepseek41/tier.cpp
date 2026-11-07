@@ -460,6 +460,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     }
     promoted_ = 0;
     exclusive_cache_ = true;
+    m_.tier_profile().enabled=m_.tiers().diag_tier_timing;
     basalt::log::info("basalt deepseek41","resident expert RAM %.2f GiB; loaded directly into final tier placement",
                       resident_ram_bytes()/1073741824.);
     // what the start picked by itself, on the server's auto line; the RAM floor the tier left free
@@ -1099,6 +1100,7 @@ void ExpertTier::return_place(int layer, int place) {
 }
 
 void ExpertTier::land_home(int layer, int in, int out, int place) {
+    TierScope profile(m_.tier_profile(),TierProfile::Publish);
     const size_t base = (size_t) layer * n_expert_;
     if (out >= 0 && m_.replacement(layer,out)) m_.publish_replacement_ram(layer,out);
     else if (place >= 0) ram_idx_[base + out] = place;
@@ -1319,7 +1321,7 @@ void ExpertTier::land(int layer) {
 void ExpertTier::land_all() {
     issue(-1, kAllPieces);
     for (const Pending& p : pending_) {
-        cudaEventSynchronize(events_[(size_t) p.event]);
+        { TierScope profile(m_.tier_profile(),TierProfile::DrainWait); cudaEventSynchronize(events_[(size_t)p.event]); }
         apply(p);
     }
     pending_.clear();
@@ -1343,6 +1345,7 @@ void ExpertTier::settle() {
 }
 
 void ExpertTier::begin_token(int n_tokens) {
+    TierScope profile(m_.tier_profile(),TierProfile::Boundary);
     token_ += (uint64_t) n_tokens;
     claims_ = 0;
     finish_swaps();
@@ -1501,12 +1504,14 @@ ExpertTier::Source ExpertTier::locate(int layer, int e) const {
 }
 
 void ExpertTier::start_cpu(int layer, const float* x, const Lookup& lk, float* rows) {
+    TierScope profile(m_.tier_profile(),TierProfile::CpuStart);
     Use use[kMaxK]{};
     for (int i = 0; i < lk.k; ++i) { use[i].nt = 1; use[i].tok[0] = 0; use[i].row[0] = i; }
     start_cpu_window(layer, x, lk, use, rows);
 }
 
 void ExpertTier::start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows) {
+    TierScope profile(m_.tier_profile(),TierProfile::CpuStart);
     const size_t n_embd = (size_t) m_.geo().n_embd;
     int types[kMaxK]{};
     bool quantized[kMaxK][kMaxWindow]{};
@@ -1537,7 +1542,7 @@ void ExpertTier::start_cpu_window(int layer, const float* x, const Lookup& lk, c
     if (n) pool_->start_split_multi_native(fmt(layer), cpu_jobs_, n);
 }
 
-void ExpertTier::finish_cpu() { pool_->finish_split_multi_native(); }
+void ExpertTier::finish_cpu() { TierScope profile(m_.tier_profile(),TierProfile::CpuWait); pool_->finish_split_multi_native(); }
 
 int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best, uint64_t bytes) const {
     int32_t slot = -1;
@@ -1570,6 +1575,7 @@ int32_t ExpertTier::oldest_slot(int layer, bool homes_too, uint64_t& best, uint6
 }
 
 bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
+    TierScope profile(m_.tier_profile(),TierProfile::PeerSubmit);
     if (homes_.peer == 0 || swapping_[(size_t) layer]) return false;
     const size_t base = (size_t) layer * n_expert_;
     int32_t slot = -1;
@@ -1633,6 +1639,7 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
 }
 
 int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, bool homes_too, bool device_source) {
+    TierScope profile(m_.tier_profile(),TierProfile::Claim);
     const auto* replacement = m_.replacement(layer, e);
     if (homes_too && homes_.main > 0) ensure_spare(layer);
     if (claims_ >= (int) kMaxPending || free_events_.empty()) {
@@ -1712,6 +1719,7 @@ void ExpertTier::issue_peer(int layer, int pieces) {
 }
 
 void ExpertTier::issue(int layer, int pieces) {
+    TierScope profile(m_.tier_profile(),TierProfile::Pump);
     if (gap_marked_) {
         cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
         cudaStreamWaitEvent(return_stream_, gap_ev_, 0);
@@ -1773,6 +1781,7 @@ void ExpertTier::pump(int layer, int pieces) {
 }
 
 int ExpertTier::fetch(int layer, Lookup& lk) {
+    TierScope profile(m_.tier_profile(),TierProfile::Fetch);
     if (m_.tiers().diag_tier_frozen) return 0;
     int np = 0, nf = 0;
     for (int i = 0; i < lk.k; ++i)

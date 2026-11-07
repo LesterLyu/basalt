@@ -743,6 +743,7 @@ public:
     // over every row that routed to it, the CPU does the same for the rest.
     bool routed_shared_window(int il, int T, const float* w, float* out, float* shared_out, void* stream,
                               std::string& err) override {
+        TierScope profile(m_.tier_profile(),TierProfile::Routed);
         const ExpertLayer& el = m_.pack().experts[(size_t) il];
         const int K = g_.n_used;
         const int n = g_.n_embd;
@@ -814,10 +815,12 @@ public:
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
             for (int r = 0; r < T*K; ++r) if (const auto* v = m_.replacement(il,h_ids_[r])) layouts[r] = &v->layout;
+            TierScope launch_profile(m_.tier_profile(),TierProfile::PeerLaunch);
             if (!tier_->launch_peer(il, limited, h_x_, h_ids_, T, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
+        TierScope gpu_profile(m_.tier_profile(),TierProfile::GpuSubmit);
         const auto make_plan = [&](WindowPlan& pl, bool fetched, int& entries) {
             int ng = 0, ne = 0;
             for (int i = 0; i < nu; ++i) {
@@ -856,6 +859,7 @@ public:
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !m_.has_overlay() && !peer->run_fetched(err)) return false;
         if (m_.has_overlay()) run_overlay(il, T, K, h_ids_, lk, stream);
+        gpu_profile.stop();
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         WindowRowPtrs rp{};
@@ -872,6 +876,7 @@ public:
         if (cpu) join.now();
         if (cpu || n_fetched) tier_->promote(il, lk);
         if (peer) {
+            TierScope finish_profile(m_.tier_profile(),TierProfile::PeerFinish);
             if (m_.has_overlay() ? !tier_->finish_peer(err) : !peer->finish(nullptr, err)) return false;
         }
         jw.raise();
@@ -884,6 +889,7 @@ public:
     // Every id of the layer landed in the mapped ids (stage_ids writes them after the rows); the stream goes on meanwhile.
     // A launch that failed never writes them.
     void await_ids(cudaStream_t st, int n_ids) {
+        TierScope profile(m_.tier_profile(),TierProfile::RouteWait);
         if (ids_read_) {   // a layer that failed left its ids behind
             cudaStreamSynchronize(st);
             return;
@@ -906,6 +912,7 @@ public:
     // With `shared_out` set, the head has queued the shared expert, and the weighted sum adds its result.
     bool routed_run(int il, const float* w, float* out, float* shared_out, void* stream,
                     std::string& err) {
+        TierScope profile(m_.tier_profile(),TierProfile::Routed);
         const ExpertLayer& el = m_.pack().experts[(size_t) il];
         const int K = g_.n_used;
         const kernels::NativeExpertLayout L =
@@ -959,11 +966,13 @@ public:
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
             for (int r = 0; r < K; ++r) if (const auto* v = m_.replacement(il,lk.experts[r])) layouts[r] = &v->layout;
+            TierScope launch_profile(m_.tier_profile(),TierProfile::PeerLaunch);
             if (!tier_->launch_peer(il, limited, h_x_, lk.experts, 1, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
         // fetched ones in a second plan, once their copies landed, so the hits and the shared expert do not wait for them
+        TierScope gpu_profile(m_.tier_profile(),TierProfile::GpuSubmit);
         const auto make_plan = [&](ExpertPlan& pl, bool fetched) {
             int m = 0;
             for (int k = 0; k < K; ++k) {
@@ -1025,6 +1034,7 @@ public:
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !m_.has_overlay() && !peer->run_fetched(err)) return false;
         if (m_.has_overlay()) run_overlay(il, 1, K, lk.experts, lk, stream);
+        gpu_profile.stop();
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         RowPtrs rp{};
@@ -1041,6 +1051,7 @@ public:
         if (cpu) join.now();
         if (cpu || n_fetched) tier_->promote(il, lk);
         if (peer) {
+            TierScope finish_profile(m_.tier_profile(),TierProfile::PeerFinish);
             if (m_.has_overlay() ? !tier_->finish_peer(err) : !peer->finish(nullptr, err)) return false;
         }
         jw.raise();

@@ -25,6 +25,7 @@ namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
     shared_tier_.tier.reset();
+    tier_profile_.report();
     overlay_.clear();
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
@@ -109,10 +110,12 @@ void DsModel::release_replacement_ram(int layer, int expert) const {
 }
 
 std::unique_ptr<ExpertRam> DsModel::acquire_expert_ram(uint64_t bytes) const {
+    TierScope scope(tier_profile_,TierProfile::Acquire);
     size_t best = swap_pool_.size();
     for (size_t i = 0; i < swap_pool_.size(); ++i)
         if (swap_pool_[i]->allocated() >= bytes && (best == swap_pool_.size() || swap_pool_[i]->allocated() < swap_pool_[best]->allocated())) best=i;
     if (best != swap_pool_.size()) {
+        if (tier_profile_.enabled) ++tier_profile_.calls[TierProfile::RamPoolHit];
         auto ram = std::move(swap_pool_[best]);
         swap_pool_[best] = std::move(swap_pool_.back()); swap_pool_.pop_back();
         swap_pool_bytes_ -= ram->allocated();
@@ -128,13 +131,16 @@ std::unique_ptr<ExpertRam> DsModel::acquire_expert_ram(uint64_t bytes) const {
     }
     if (bytes > room) return nullptr;
     auto ram = std::make_unique<ExpertRam>();
+    if (tier_profile_.enabled) ++tier_profile_.calls[TierProfile::RamPoolMiss];
     if (!ram->allocate(bytes) || ram->allocated() > room) return nullptr;
     return ram;
 }
 
 void DsModel::recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const {
+    TierScope scope(tier_profile_,TierProfile::Recycle);
     constexpr uint64_t capacity = 1ull<<30;
     if (!ram || ram->registered() < ram->bytes || ram->allocated() > capacity-swap_pool_bytes_) {
+        if (ram && tier_profile_.enabled) ++tier_profile_.calls[TierProfile::RamPoolFree];
         ram.reset(); return;
     }
     ram->ready = false;

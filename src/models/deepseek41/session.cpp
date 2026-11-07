@@ -372,6 +372,14 @@ public:
         ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
         // Publish completed cache moves before the request's counters and memory snapshot.
         if (t) t->settle();
+        m_.tier_profile().report("request");
+        if (m_.tier_profile().enabled && m_.pack().engram.present) {
+            const auto stats=m_.engram_reader().snapshot();
+            basalt::log::info("basalt deepseek41","Engram rows: %llu requests, %llu hits, %llu reads, cache %llu/%llu, read p50 %.1f p95 %.1f us",
+                (unsigned long long)stats.requests,(unsigned long long)stats.cache_hits,(unsigned long long)stats.reads,
+                (unsigned long long)m_.engram_reader().cache_size(),(unsigned long long)m_.engram_reader().cache_capacity(),
+                stats.percentile(0.5),stats.percentile(0.95));
+        }
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 

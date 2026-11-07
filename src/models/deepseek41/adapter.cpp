@@ -99,6 +99,7 @@ public:
         else if (a == "--ds-gpu-single-miss") o.gpu_single_miss = true;
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
+        else if (a == "--diag-tier-timing") o.diag_tier_timing = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
         else if (a == "--diag-tier-peer") o.diag_tier_peer = std::atoi(args.next("--diag-tier-peer"));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");

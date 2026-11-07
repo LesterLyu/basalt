@@ -2,6 +2,7 @@
 // Engram table as file ranges.
 #pragma once
 
+#include "models/deepseek41/tier_profile.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/model/adapter.hpp"
@@ -52,6 +53,7 @@ public:
         mutable std::unique_ptr<ExpertRam> ram;
         const uint8_t* host() const { return ram && ram->ready ? ram->data : nullptr; }
     };
+    TierProfile& tier_profile() const { return tier_profile_; }
     bool has_overlay() const { return overlay_bytes_ != 0; }
     uint64_t initial_overlay_ram_budget() const { return overlay_ram_budget_; }
     bool read_initial_replacement(int layer, int expert, uint8_t* to, std::string& err) const;
@@ -148,6 +150,7 @@ public:
 
 private:
     CacheFormat cache_format_ = CacheFormat::Fp8;
+    mutable TierProfile tier_profile_;
     std::vector<Replacement> overlay_;
     mutable std::vector<std::unique_ptr<ExpertRam>> swap_pool_;
     mutable uint64_t swap_pool_bytes_ = 0;

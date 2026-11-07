@@ -98,6 +98,7 @@ struct LoadRequest {
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
     std::string expert_overlay;       ///< optional target expert replacement pack
     int prefill_chunk = 16384;        ///< maximum prompt chunk, subject to available memory
+    bool diag_tier_timing = false;
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     bool gpu_single_miss = false;     ///< fetch a lone RAM expert for the main GPU
