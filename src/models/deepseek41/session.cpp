@@ -82,7 +82,8 @@ public:
         if (ops_) ops_->memory_usage(usage);
         if (prefill_) prefill_->memory_usage(usage);
         if (vis_) usage.device(m_.device(), "vision", vis_->device_bytes());
-        if (drafter_) usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
+        if (drafter_ && usage.claim(drafter_.get()))
+            usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
     }
     bool init(std::string& err) {
         // the layer's chain runs ahead of the mixes branch, one step below the attention's branches, which hold the chain

@@ -524,6 +524,7 @@ private:
         return dc;
     }
     void slot_init(BSlot& sl) override {
+        if (gguard && req_bias_present) sl.grammar_bias = req_bias;
         sl.row_wait_us = row_wait_us_;
         row_wait_us_ = 0;  // the batch reports the whole request at BDONE
     }
@@ -599,7 +600,7 @@ bool SessionRuntime::next_batch_window() {
             // the first pick the grammar refuses is drawn again under its mask, and the window ends there
             const int miss = sl.guard->scan(out_.data(), a + 1);
             if (miss >= 0) {
-                sl.guard->mask_bias({}, grammar_bias);
+                sl.guard->mask_bias(sl.grammar_bias, grammar_bias);
                 int32_t y = -1;
                 if (const basalt::model::Result r = session().resample_row(miss, grammar_bias.data(), y); !r.ok()) return failed(r.message);
                 out_[(size_t) miss] = y;
@@ -652,6 +653,7 @@ bool SessionRuntime::next_batch_window() {
             sl.cached = o.prompt_cache > 0;
             sl.idle_busy = busy_now();
             sl.guard.reset();
+            sl.grammar_bias.clear();
         }
         std::fflush(stdout);
     }
