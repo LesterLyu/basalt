@@ -330,6 +330,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.diag_dump = o.diag_dump;
         lreq.diag_tier_ram = o.diag_tier_ram;
         lreq.diag_tier_vram = o.diag_tier_vram;
+        lreq.diag_tier_peer = o.diag_tier_peer;
         lreq.peer_devices = o.peer_devices;
         lreq.max_context = o.max_context;
         lreq.sessions = std::max(o.batch, 1);
@@ -355,6 +356,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.profile_dir = std::string(BASALT_SOURCE_DIR) + "/data/profiles";
         lreq.draft_experts = o.draft_experts;
         lreq.expert_overlay = o.expert_overlay;
+        lreq.prefill_chunk = o.prefill_chunk;
         lreq.gpu_single_miss = o.gpu_single_miss;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         const basalt::model::Result r = adapter->load(lreq, loaded);
