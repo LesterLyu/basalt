@@ -668,14 +668,25 @@ def make_handler(target: Service | Router):
 
             def events():
                 yield from asm.start()
+                last = time.monotonic()
                 done = None
                 for kind, x in self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
-                    if kind == "ping":
-                        yield None
-                    elif kind == "event":
-                        yield from asm.feed(x)
+                    if kind == "event":
+                        out = asm.feed(x)
+                        if out:
+                            yield from out
+                            last = time.monotonic()
+                            continue
                     elif kind == "done":
                         done = x
+                        continue
+                    # Custom inputs and validated JSON can be held even while the engine emits events.
+                    # Count what reaches the client, rather than treating buffered pieces as output.
+                    if time.monotonic() - last >= 15:
+                        yield asm.in_progress()
+                        last = time.monotonic()
+                    elif kind == "ping":
+                        yield None
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done)
             try:
@@ -703,7 +714,6 @@ def make_handler(target: Service | Router):
                     return self._json(err.status, err.body())
                 return self._json(200, result)
             self._sse()
-            last = time.monotonic()
 
             def send(e):
                 self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
@@ -712,15 +722,9 @@ def make_handler(target: Service | Router):
             try:
                 for e in items:
                     if e is None:
-                        # clients' idle timers count events, not SSE comments: send in_progress every 15 s
-                        if time.monotonic() - last >= 15:
-                            send(asm.in_progress())
-                            last = time.monotonic()
-                        else:
-                            self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.write(b": keep-alive\n\n")
                     else:
                         send(e)
-                        last = time.monotonic()
                     self.wfile.flush()
             except OSError:
                 cancel.set()                                 # client left: stop the engine
