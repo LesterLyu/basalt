@@ -740,7 +740,7 @@ public:
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer();
         PeerArm armed;
-        if (peer) {
+        if (peer && !m_.has_overlay()) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             if (!peer->arm(limited, h_x_, T, K, policy::peer_groups(T), err)) return false;
@@ -772,7 +772,7 @@ public:
         const int n_fetched = tier_->fetch(il, lk);
         // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
         // experts it fetched over its own link are planned beside the ones it holds
-        if (peer) {
+        if (peer && !m_.has_overlay()) {
             int32_t kind[ExpertTier::kMaxK] = {};
             for (int r = 0; r < T * K; ++r) kind[r] = !lk.peer[uidx[r]] ? 0 : lk.fetched[uidx[r]] ? 3 : 2;
             if (!peer->raise(il, h_ids_, kind, err)) return false;
@@ -790,11 +790,23 @@ public:
             join.tier = tier_.get();
         }
 
+        // the second card's share first: its rows are the last of the two cards' to land
+        if (peer && m_.has_overlay()) {
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
+            for (int r = 0; r < T*K; ++r) if (const auto* v = m_.replacement(il,h_ids_[r])) layouts[r] = &v->layout;
+            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
+        }
+
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
         const auto make_plan = [&](WindowPlan& pl, bool fetched, int& entries) {
             int ng = 0, ne = 0;
             for (int i = 0; i < nu; ++i) {
                 if (!lk.dev[i] || lk.fetched[i] != fetched) continue;
+                if (m_.replacement(il, lk.experts[i])) continue;
                 pl.ptr[ng] = (unsigned long long) lk.dev[i];
                 pl.start[ng] = ne;
                 for (int j = 0; j < use[i].nt; ++j) {
@@ -822,10 +834,11 @@ public:
         if (n_fetched) {
             const int ng = make_plan(plan, true, entries);
             tier_->await_fetch(st);
-            gpu_share(plan, ex_plan2_, ng, entries);
+            if (ng) gpu_share(plan, ex_plan2_, ng, entries);
         }
         // the second card's fetched experts run once their copies land, long after these launches
-        if (peer && !peer->run_fetched(err)) return false;
+        if (peer && !m_.has_overlay() && !peer->run_fetched(err)) return false;
+        if (m_.has_overlay()) run_overlay(il, T, K, h_ids_, lk, stream);
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         WindowRowPtrs rp{};
@@ -888,7 +901,7 @@ public:
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer();
         PeerArm armed;
-        if (peer) {
+        if (peer && !m_.has_overlay()) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
             if (!peer->arm(limited, h_x_, 1, K, policy::peer_groups(1), err)) return false;
@@ -902,7 +915,7 @@ public:
         const int n_fetched = tier_->fetch(il, lk);
         // the second card's plan first: its share waits for it, and its rows are the last of the two cards' to land; the
         // experts it fetched over its own link are planned beside the ones it holds
-        if (peer) {
+        if (peer && !m_.has_overlay()) {
             int32_t kind[ExpertTier::kMaxK] = {};
             for (int k = 0; k < K; ++k) kind[k] = !lk.peer[k] ? 0 : lk.fetched[k] ? 3 : 2;
             if (!peer->raise(il, lk.experts, kind, err)) return false;
@@ -920,12 +933,24 @@ public:
             join.tier = tier_.get();
         }
 
+        // the second card's share first: its rows are the last of the two cards' to land
+        if (peer && m_.has_overlay()) {
+            int32_t kind[ExpertTier::kMaxK] = {};
+            for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
+            kernels::NativeExpertLayout limited = L;
+            limited.swiglu_limit = g_.clamp_exp[(size_t) il];
+            const kernels::NativeExpertLayout* layouts[ExpertTier::kMaxK]{};
+            for (int r = 0; r < K; ++r) if (const auto* v = m_.replacement(il,lk.experts[r])) layouts[r] = &v->layout;
+            if (!peer->launch_window(il, limited, h_x_, lk.experts, 1, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
+        }
+
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
         // fetched ones in a second plan, once their copies landed, so the hits and the shared expert do not wait for them
         const auto make_plan = [&](ExpertPlan& pl, bool fetched) {
             int m = 0;
             for (int k = 0; k < K; ++k) {
                 if (!lk.dev[k] || lk.fetched[k] != fetched) continue;
+                if (m_.replacement(il, lk.experts[k])) continue;
                 pl.ptr[m] = (unsigned long long) lk.dev[k];
                 pl.start[m] = m;
                 pl.dst[m] = k;
@@ -969,15 +994,18 @@ public:
         }
         if (n_fetched) {
             ExpertPlan plan2;
-            make_plan(plan2, true);
+            const int ng = make_plan(plan2, true);
             tier_->await_fetch(st);
-            put_words(&plan2, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
-            ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
-            kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok, n_fetched,
-                                                   n_fetched, ex_xq_, ex_scr_, ex_rows_, stream);
+            if (ng) {
+                put_words(&plan2, ex_plan2_, (int) (sizeof(ExpertPlan) / 4), stream);
+                ExpertPlan* dp = (ExpertPlan*) ex_plan2_;
+                kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok,
+                                                       ng, ng, ex_xq_, ex_scr_, ex_rows_, stream);
+            }
         }
         // the second card's fetched experts run once their copies land, long after these launches
-        if (peer && !peer->run_fetched(err)) return false;
+        if (peer && !m_.has_overlay() && !peer->run_fetched(err)) return false;
+        if (m_.has_overlay()) run_overlay(il, 1, K, lk.experts, lk, stream);
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         RowPtrs rp{};
@@ -1035,6 +1063,32 @@ private:
         allocated_bytes_ += bytes;
         *p = v;
         return true;
+    }
+    void run_overlay(int layer, int rows, int k, const int32_t* ids, const ExpertTier::Lookup& lk, void* stream) {
+        bool done[ExpertTier::kMaxK]{};
+        for (int u = 0; u < lk.k; ++u) {
+            const auto* v = m_.replacement(layer, lk.experts[u]);
+            if (!v || !lk.dev[u] || done[u]) continue;
+            WindowPlan p{};
+            int groups = 0, entries = 0;
+            for (int j = u; j < lk.k; ++j) {
+                const auto* w = m_.replacement(layer, lk.experts[j]);
+                if (!w || !lk.dev[j] || w->layout.gu_type != v->layout.gu_type || w->layout.d_type != v->layout.d_type) continue;
+                done[j] = true;
+                p.ptr[groups] = (unsigned long long)lk.dev[j];
+                p.start[groups++] = entries;
+                for (int r = 0; r < rows * k; ++r) if (ids[r] == lk.experts[j]) {
+                    p.dst[entries] = r; p.tok[entries++] = r / k;
+                }
+            }
+            p.start[groups] = entries;
+            p.ng[0] = groups;
+            // Plan words are passed by value; scratch and device metadata are reused in stream order.
+            put_words(&p, ex_plan2_, (int)(sizeof(p)/4), stream);
+            auto* dp = (WindowPlan*)ex_plan2_;
+            kernels::native_expert_grouped_clamped(v->layout, g_.clamp_exp[layer], dp->ptr, dp->start, dp->ng,
+                                                   dp->dst, dp->tok, groups, entries, ex_xq_, ex_scr_, ex_rows_, stream);
+        }
     }
     static bool oom(std::string& err) {
         err = "out of device memory for the attention state";

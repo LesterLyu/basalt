@@ -1,9 +1,9 @@
 // src/models/deepseek41/tier.hpp - where the routed experts of a DeepSeek-V4.1 pack live while a token runs.
 //
 // An expert's home is a slot of the main card, a slot of a second card, the pinned RAM tier or the pack file mapped
-// read-only (policy::Homes); the routing order deals them out at the start. The main card's other slots (shared
-// core::ExpertCache storage) hold copies of pinned experts; its homes and copies share a per-layer LRU, and a home that
-// loses its slot, on either card, goes to RAM, into the place of the expert taking the slot. The GPUs compute the experts they
+// read-only (policy::Homes); the routing order deals them out at the start. The main card's reclaimable cache and its
+// permanent homes share a per-layer LRU. Both GPUs own resident weights exclusively; an evicted expert goes to RAM
+// before its GPU slot is overwritten. The GPUs compute the experts they
 // hold; the CPU pool computes the rest from RAM or the mapped file while the GPUs work, and the pinned experts it
 // computed are copied into the main card's LRU on a side stream so the next token finds them there.
 #pragma once
@@ -75,7 +75,7 @@ public:
     bool open(const Reserve& reserve, float* h_rows, std::string& err);
 
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
-    /// allocated); `grow` takes the memory freed after them as extra slots. Residency in those slots is dropped.
+    /// allocated); `grow` takes the memory freed after them as extra slots. Weights return to RAM before release.
     void shrink();
     void grow();
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
@@ -141,6 +141,7 @@ public:
     PromptHost& host() { return host_; }
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
+    const kernels::cpu::NativeFmt& fmt(int layer, int expert) const;
 
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return (int64_t) n_layers_ * (per_layer_ + ext_per_layer_); }
@@ -163,6 +164,7 @@ private:
     struct Pending {
         int layer, expert, slot, event;
         int out = -1, place = -1;
+        bool home = false;
     };
     /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` (on the out stream), then `src`
     /// into `dst` once they are out.
@@ -171,7 +173,7 @@ private:
         uint8_t* dst;
         const uint8_t* src;
         uint8_t* home_to;
-        uint64_t bytes, off = 0, home_off = 0;
+        uint64_t bytes, off = 0, home_off = 0, home_bytes = 0;
     };
     /// `in` on its way into the second card's `slot`, its pieces waiting for an idle bus; `out`, which held it, on its
     /// way to RAM place `place`: the slot's bytes out to `to` first, then `from` in.
@@ -179,8 +181,8 @@ private:
         int layer, in, out, slot, place;
         uint8_t* to;
         const uint8_t* from;
-        uint64_t bytes, out_off = 0, in_off = 0;
-        int64_t in_mark = -1;   ///< the second card's mark behind its last piece
+        uint64_t out_bytes, in_bytes, out_off = 0, in_off = 0;
+        int64_t in_mark = -1;   ///< the second card mark behind its last piece
     };
     /// Issues what is left of `layer`'s queued copies (>= 0), then up to `pieces` pieces of the others, oldest first:
     /// the main card's and the second card's.
@@ -201,9 +203,20 @@ private:
     bool load_rank(std::string& err);
     void seed_copies(int64_t n);
     void preread();
-    bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
+    bool pinned(int layer, int e) const;
+    uint64_t expert_bytes(int layer, int e) const;
+    uint8_t* ram_place(int layer, int place) const;
+    bool ensure_spare(int layer);
+    void return_place(int layer, int place);
+    void pack_extra_ram();
+    uint64_t resident_ram_bytes() const;
+    bool restore_primary(int64_t first, std::string& err);
+    void land_home(int layer, int in, int out, int place);
     const uint8_t* blob_of(int layer, int e) const;
     const uint8_t* slot_ptr(int32_t slot) const;
+    uint64_t slot_capacity(int32_t slot) const;
+    std::vector<int64_t> slot_sizes(int n, int rank_start = 0, bool seed = false, bool conservative = false) const;
+    int slots_fit(uint64_t free, uint64_t keep, int maximum, int rank_start = 0, bool seed = false, bool conservative = false) const;
     uint64_t slot_total() const { return (uint64_t) n_layers_ * (uint64_t) (per_layer_ + ext_per_layer_); }
     void finish_swaps();
     void start_swaps();
@@ -214,9 +227,8 @@ private:
     int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false,
                   bool later = false);
     /// The least recently used free slot of the layer's main card share, or -1; `best` gets its last use.
-    int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
-    /// Moves (layer, e) into the second card when the expert it replaces there was last used policy::kPeerMoveAge
-    /// lookups before the main card's oldest.
+    int32_t oldest_slot(int layer, bool homes_too, uint64_t& best, uint64_t bytes = 0) const;
+    /// Moves into the helper only when its victim is policy::kPeerMoveAge older than the main card's.
     bool move_to_peer(int layer, int e, const uint8_t* src);
 
     const DsModel& m_;
@@ -227,6 +239,8 @@ private:
     int64_t ext_per_layer_ = 0;             ///< slots each layer owns in `ext_`
     bool unread_said_ = false;              ///< `grow` has said that the runtime could not answer
     int64_t lent_per_layer_ = 0;            ///< base slots given up by lend_all(), 0 when none
+    bool exclusive_cache_ = false;         ///< primary cache entries own their weights without RAM copies
+    uint64_t returned_experts_ = 0, returned_bytes_ = 0;
     std::vector<int32_t> res_;              ///< [layer * n_expert + e] VRAM slot or -1
     std::vector<uint64_t> stamp_;           ///< [layer * n_expert + e] last use
     std::vector<int32_t> owner_;            ///< [slot] expert it holds or is receiving, or -1
@@ -246,7 +260,12 @@ private:
     cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind
     bool gap_marked_ = false;               ///< gap_ev_ was recorded for the next pump
     uint64_t tick_ = 0;
-    uint64_t one_each_ = 0, reserve_ = 0, modules_ = 0;
+    uint64_t reserve_ = 0, modules_ = 0;
+    std::vector<std::vector<uint64_t>> sorted_blob_bytes_;
+    int64_t overlay_hits_ = 0, overlay_copies_ = 0, overlay_cpu_ = 0, overlay_peer_ = 0, overlay_swaps_ = 0;
+    struct ExtraRam { uint8_t* ptr = nullptr; uint64_t mapped = 0; core::RamPin pin; };
+    std::vector<std::vector<ExtraRam>> extra_ram_;
+    std::vector<std::vector<int>> free_places_;
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
@@ -254,9 +273,14 @@ private:
     bool profile_peer_exchange_ = false;
     uint64_t peer_exchanges_ = 0, peer_exchange_ns_ = 0, peer_read_ns_ = 0, peer_host_ns_ = 0, peer_write_ns_ = 0;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
-    std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)
+    std::vector<uint8_t*> ram_;             ///< [layer] compact pinned experts and a spare when the layer has RAM homes
+    std::vector<uint64_t> ram_bytes_;       ///< actual allocated span per layer, including its spare
     policy::Homes homes_;
+    std::vector<policy::Homes> layer_homes_;
+    std::vector<int> base_count_;          ///< effective base experts; replacement weights have separate RAM backing
     std::vector<int32_t> rank_;             ///< [layer * n_expert + rank] expert; empty: the file's order
+    std::vector<std::vector<int>> initial_seeds_; ///< ranked host candidates while initial placement is planned
+    std::vector<std::vector<int>> preread_experts_; ///< immutable initial file-backed ranking for the reader thread
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1

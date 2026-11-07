@@ -371,7 +371,9 @@ public:
 
     ExpertCounts expert_counts() const override {
         std::string e;
-        const ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr;
+        // Publish completed cache moves before the request's counters and memory snapshot.
+        if (t) t->settle();
         return t == nullptr ? ExpertCounts{} : ExpertCounts{t->hits(), t->lookups(), t->offloaded(), t->file_lookups()};
     }
 
@@ -556,7 +558,7 @@ private:
         const bool beside = short_prompt_;
         const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
         if (beside) tokens = prefillp::kShortChunk;   // these workspaces stay for the next short read, whatever its size
-        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, margin, tokens);
+        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b, margin, tokens, m_.tiers().prefill_chunk);
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
             return false;

@@ -1,5 +1,8 @@
 // src/models/deepseek41/tier_policy_test.cpp - the tier admission and placement rules on synthetic id streams.
 #include "models/deepseek41/tier_policy.hpp"
+#include "models/deepseek41/tier_slots.hpp"
+#include <algorithm>
+#include <random>
 
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +20,31 @@ static int g_fail = 0;
     } while (0)
 
 int main() {
+    // Sparse larger formats must not inflate every slot; initial ranked subsets still fit,
+    // even when assigned in arbitrary order by smallest fitting free slot.
+    std::mt19937 rng(17);
+    for (int trial = 0; trial < 12; ++trial) {
+        std::vector<uint64_t> population(384, 7);
+        for (int i = 0; i < 25; ++i) population[i] = 8 + rng()%5;
+        std::sort(population.begin(),population.end());
+        for (int n : {1,6,24,32,48,66,128,384}) {
+            auto shuffled = population;
+            std::shuffle(shuffled.begin(),shuffled.end(),rng);
+            std::vector<uint64_t> initial(shuffled.begin(),shuffled.begin()+n);
+            const auto sizes = mixed_slot_sizes(population,initial);
+            CHECK(sizes.back()==population.back());
+            uint64_t total = 0, bound = 0;
+            for (int i = 0; i < n; ++i) { total += sizes[i]; bound += population[population.size()-n+i]; }
+            CHECK(total <= bound);
+            std::vector<bool> used(n,false);
+            for (const auto bytes : initial) {
+                int found = -1;
+                for (int i = 0; i < n; ++i) if (!used[i] && sizes[i] >= (int64_t)bytes) { found=i; break; }
+                CHECK(found >= 0);
+                if (found >= 0) used[found]=true;
+            }
+        }
+    }
     // admission window: only a repeat inside the window counts, the first miss never does
     CHECK(!repeat_miss(0, 100, kPromoteWindow));
     CHECK(repeat_miss(10 + 1, 10 + kPromoteWindow, kPromoteWindow));

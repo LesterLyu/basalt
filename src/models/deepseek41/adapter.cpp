@@ -43,6 +43,8 @@ public:
         CacheFormat fmt = CacheFormat::Fp8;
         if (!req.kv.empty() && !ctxp::cache_format(req.kv, fmt)) return {model::Status::Error, "deepseek41: --kv " + req.kv + ": fp8 or fp16"};
         m->set_cache_format(fmt);
+        if (!req.expert_overlay.empty() && !m->load_overlay(req.expert_overlay, err))
+            return {model::Status::Error, "deepseek41: expert overlay: " + err};
         if (!m->resolve_context(req.max_context, err)) return {model::Status::Error, err};
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
@@ -92,10 +94,13 @@ public:
         else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
         else if (a == "--kv") o.kv = args.next("--kv");
         else if (a == "--draft-experts") o.draft_experts = std::atoi(args.next("--draft-experts"));
+        else if (a == "--expert-overlay") o.expert_overlay = args.next("--expert-overlay");
+        else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(args.next("--prefill-chunk"));
         else if (a == "--ds-gpu-single-miss") o.gpu_single_miss = true;
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;
+        else if (a == "--diag-tier-peer") o.diag_tier_peer = std::atoi(args.next("--diag-tier-peer"));
         else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
         else return false;
         return true;
@@ -108,6 +113,15 @@ public:
         if (!ctxp::cache_format(o.kv, fmt)) {
             basalt::log::error("basalt deepseek41", "--kv %s: DeepSeek's caches are fp8 (the default: FP8 window rows, FP4 "
                                "compressed rows and index keys) or fp16", o.kv.c_str());
+            return 2;
+        }
+        if (o.prefill_chunk < prefillp::kMinChunk || o.prefill_chunk > prefillp::kMaxChunk ||
+            (o.prefill_chunk & (o.prefill_chunk - 1)) != 0) {
+            basalt::log::error("basalt deepseek41", "--prefill-chunk: a power of two from 256 through 16384");
+            return 2;
+        }
+        if (!o.expert_overlay.empty() && o.conversation_cache_disk_mib > 0) {
+            basalt::log::error("basalt deepseek41", "disk conversation cache must be off with --expert-overlay");
             return 2;
         }
         if (o.draft_experts < 0 || o.draft_experts > 128 || o.draft_experts % 32 != 0) {

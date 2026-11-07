@@ -72,6 +72,7 @@ public:
     void slot_in(int32_t slot, const uint8_t* in, uint64_t off, uint64_t n);
     /// The copies queued from now on start after `ev` (an event of any card).
     void copies_after(cudaEvent_t ev);
+    void exchange_slot(int32_t slot, uint8_t* out, uint64_t out_bytes, const uint8_t* in, uint64_t in_bytes);
     bool read_wait(std::string& err);
     /// A mark behind the pieces queued so far; `read_until` waits until they landed.
     int64_t mark_in();
@@ -97,6 +98,21 @@ public:
     /// Queues the entries the last `raise` planned in scratch slots behind their copies and the share: the grouped kernels
     /// over the share's activations, the scatter into open_plain's rows.  `finish` waits for them too.
     bool run_fetched(std::string& err);
+    bool read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes, std::string& err);
+    /// One token's share over the pinned activation `x`, in the layout given; the rows land in open_plain's rows.
+    bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
+                      const int32_t* kind, std::string& err);
+    /// The share of a window of `n_tok` rows over the pinned activations `x` [n_tok][n_embd]: entry t * k + j computes
+    /// ids[t * k + j] over row t where kind says so; the rows land at that entry of open_plain's rows.
+    bool launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
+                       int64_t k, const int32_t* kind, std::string& err,
+                       const kernels::NativeExpertLayout* const* layouts = nullptr);
+    /// `n` rows, each with its own activation in `x` (pinned, portable): entry i computes expert ids[i] over x[i] and its row
+    /// lands at out[i], `out` as this card addresses mapped host memory (`map_rows`). At most kRowBatch entries; `finish` waits.
+    static constexpr int64_t kRowBatch = 80;
+    bool launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n, float* out,
+                     std::string& err, const kernels::NativeExpertLayout* const* layouts = nullptr);
+    float* map_rows(float* host, std::string& err);
     /// A slot's bytes for an expert of `layer`.
     static uint64_t slot_bytes(int64_t layer);
     void close();
@@ -256,9 +272,10 @@ private:
     bool idle(std::string& err);
     /// The plan of a share in h_meta_ (and row_of_): its groups and entries, or false when an entry is not resident.
     bool plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups, int& rows,
-              std::string& err);
+              std::string& err, int plan_index = 0);
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
-                       int64_t k, const int32_t* kind, std::string& err, float* out);
+                       int64_t k, const int32_t* kind, std::string& err, float* out,
+                       const kernels::NativeExpertLayout* const* layouts = nullptr, int plan = 0);
 };
 
 }  // namespace basalt::core

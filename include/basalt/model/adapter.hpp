@@ -77,6 +77,7 @@ struct LoadRequest {
     std::string diag_dump;            ///< diagnostic: directory for per-layer tensor dumps (empty = off)
     int diag_tier_ram = -1;           ///< diagnostic: fixed RAM-tier experts per layer (-1 = sized from free memory)
     int diag_tier_vram = -1;          ///< diagnostic: fixed VRAM-tier experts per layer (-1 = sized from free memory)
+    int diag_tier_peer = -1;          ///< diagnostic: helper-tier cap per layer (-1 = sized from free memory)
     std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
     int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
@@ -95,6 +96,8 @@ struct LoadRequest {
     int drafter_device = -1;          ///< diagnostic: the CUDA device it runs on (-1: the main card)
     std::string profile_dir;          ///< the engine's data/profiles, where a model finds the files its name keys
     int draft_experts = 32;           ///< the drafter's routed experts each stage keeps (0: all)
+    std::string expert_overlay;       ///< optional target expert replacement pack
+    int prefill_chunk = 16384;        ///< maximum prompt chunk, subject to available memory
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     bool gpu_single_miss = false;     ///< fetch a lone RAM expert for the main GPU

@@ -1,6 +1,9 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
 #include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/vmm.hpp"
+#include "basalt/core/expert_source.hpp"
+#include "basalt/platform/memory.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/model.hpp"
 
@@ -16,14 +19,97 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <sstream>
 
 namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
+    shared_tier_.tier.reset();
+    overlay_.clear();
     for (auto& [name, t] : dev_)
         if (t.ptr) cudaFree(t.ptr);
     if (embd_fd_ >= 0) platform::close_fd(embd_fd_);
     if (experts_fd_ >= 0) platform::close_fd(experts_fd_);
+}
+
+bool DsModel::load_overlay(const std::string& path, std::string& err) {
+    core::ModelFile file;
+    if (!file.open(path, err)) return false;
+    auto layout = file.range("overlay.layout"), header = file.range("overlay.base-header"), data = file.range("experts");
+    if (!layout.bytes || layout.bytes > 4*1024*1024 || header.bytes != core::kHeaderBytes || !data.bytes) {
+        err = "missing or invalid overlay section"; return false;
+    }
+    std::vector<uint8_t> ref, actual(core::kHeaderBytes), text;
+    if (!file.read("overlay.base-header", ref, err) ||
+        !core::read_range_at(core::FileRange(path_, 0, core::kHeaderBytes), 0, actual.data(), actual.size(), err) ||
+        !file.read("overlay.layout", text, err)) return false;
+    if (ref != actual) { err = "overlay belongs to a different base pack"; return false; }
+    std::istringstream in(std::string(text.begin(), text.end()));
+    std::string magic; in >> magic;
+    if (magic != "BASALT_DS_EXPERTS_V1") {err = "unknown overlay format"; return false;}
+    const auto& g = geo();
+    overlay_.resize((size_t) g.n_layers*g.n_expert);
+    std::vector<std::pair<size_t,uint64_t>> entries;
+    uint64_t cursor = 0;
+    while (in >> std::ws && !in.eof()) {
+        int l,e,gu,d; uint64_t off,bytes;
+        if (!(in >> l >> e >> gu >> d >> off >> bytes) || l<0 || l>=g.n_layers || e<0 || e>=g.n_expert ||
+            off!=cursor || !bytes || bytes>data.bytes-cursor ||
+            !((gu==19 || gu==16 || gu==17 || gu==22) && (d==10 || d==16 || d==17 || d==18 || d==19 || d==22))) {
+            err="invalid overlay entry or unsupported format"; return false;
+        }
+        const size_t key=(size_t)l*g.n_expert+e;
+        auto& ent=overlay_[key];
+        if (ent.layout.bytes) {err="duplicate overlay expert"; return false;}
+        ent.layout=kernels::native_expert_layout(gu,d,g.n_embd,g.n_ff_exp);
+        ent.layout.swiglu_limit = g.clamp_exp[l];
+        if (!kernels::cpu::native_fmt(gu,d,g.n_embd,g.n_ff_exp,ent.cpu,err,g.clamp_exp[l])) return false;
+        if (ent.layout.bytes!=bytes) {err="overlay expert size does not match quantization"; return false;}
+        ent.offset = off;
+        entries.emplace_back(key,off); cursor+=bytes;
+    }
+    if (cursor!=data.bytes || entries.empty()) {err="incomplete overlay layout"; return false;}
+    overlay_bytes_=cursor;
+    overlay_source_ = data;
+    const uint64_t grain = platform::kDirectHostVmmExchange ? core::vmm::host_granularity() : 0;
+    overlay_ram_budget_ = 0;
+    for (const auto& entry : entries) {
+        const auto bytes = overlay_[entry.first].layout.bytes;
+        overlay_ram_budget_ += grain ? (bytes+grain-1)/grain*grain : bytes;
+    }
+    basalt::log::info("basalt deepseek41","expert overlay: %zu replacements, %.2f GiB weights; loading after tier placement",
+                    entries.size(),cursor/1073741824.);
+    return true;
+}
+
+bool DsModel::read_initial_replacement(int layer, int expert, uint8_t* to, std::string& err) const {
+    const auto* v = replacement(layer,expert);
+    if (!v || !to) { err = "invalid initial replacement destination"; return false; }
+    return core::read_range_at(overlay_source_,v->offset,to,v->layout.bytes,err);
+}
+
+uint8_t* DsModel::prepare_replacement_ram(int layer, int expert) const {
+    const auto* v = replacement(layer,expert);
+    if (!v) return nullptr;
+    if (v->ram) return v->ram->data;
+    core::detail::HostMemory hm;
+    if (!core::detail::host_available_memory(hm)) return nullptr;
+    const auto room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
+    if (v->layout.bytes > room) return nullptr;
+    auto ram = std::make_unique<ExpertRam>();
+    if (!ram->allocate(v->layout.bytes) || ram->allocated() > room) return nullptr;
+    auto* data = ram->data;
+    v->ram = std::move(ram);
+    return data;
+}
+
+void DsModel::publish_replacement_ram(int layer, int expert) const {
+    const auto* v = replacement(layer,expert);
+    if (v && v->ram) v->ram->ready = true;
+}
+
+void DsModel::release_replacement_ram(int layer, int expert) const {
+    if (const auto* v = replacement(layer,expert)) v->ram.reset();
 }
 
 bool DsModel::load(const std::string& path, std::string& err) {
@@ -140,6 +226,7 @@ prefillp::Dims DsModel::prompt_dims() const {
     d.n_expert = g.n_expert;
     d.n_ff_exp = g.n_ff_exp;
     d.engram_cols = (int64_t) pack_.engram.hash.n_cols() * 256;
+    d.replacement_blob_bytes = overlay_max_bytes();
     for (const ExpertLayer& e : pack_.experts) {
         d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
     }

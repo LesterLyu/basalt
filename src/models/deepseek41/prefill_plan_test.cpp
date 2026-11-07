@@ -15,6 +15,25 @@ static int g_fail = 0;
     } while (0)
 
 int main() {
+    // A release beyond the producer's current position must not overwrite rows within the same batch.
+    for (int64_t cap : {1, 32, 240}) {
+        CHECK(ring_read_room(0, 0, cap) == cap);
+        CHECK(ring_read_room(cap, 0, cap) == 0);
+        CHECK(ring_read_room(cap + 1, 0, cap) == 0);
+        CHECK(ring_read_room(10, 1000, cap) == cap);
+        for (int64_t next = 0; next < cap * 3; ++next)
+            for (int64_t released : {int64_t(0), cap, cap * 2, cap * 10}) {
+                const auto n = ring_read_room(next, released, cap);
+                CHECK(n >= 0 && n <= cap);
+                if (n) CHECK(next + n <= released + cap);
+                std::vector<bool> used((size_t) cap);
+                for (int64_t i = 0; i < n; ++i) {
+                    const size_t slot = (size_t) ((next + i) % cap);
+                    CHECK(!used[slot]);
+                    used[slot] = true;
+                }
+            }
+    }
     constexpr uint64_t GiB = 1ull << 30;
     // a read's rows left short: nothing from one window before its stop on reads one, at the last layer either
     {
@@ -88,6 +107,13 @@ int main() {
         CHECK(plan_chunk(a, workspace_bytes(a, kShortChunk) + kShortMargin, kShortMargin, kShortChunk).chunk == kShortChunk);
         CHECK(plan_chunk(a, workspace_bytes(d, kShortChunk) + kShortMargin, kShortMargin, kShortChunk).chunk < kShortChunk);
     }
+    // Replacement prompts use the host read-ahead ring and one device blob, not six device groups.
+    Dims overlay = d;
+    overlay.replacement_blob_bytes = 12ull << 20;
+    CHECK(ahead_bytes(overlay) == 0);
+    CHECK(chunk_bytes(overlay, 16384, kLong) == workspace_bytes(d, 16384) + overlay.replacement_blob_bytes);
+    CHECK(plan_chunk(overlay, chunk_bytes(overlay, 16384, kLong) + kMargin, kMargin, kLong).chunk == 16384);
+    CHECK(plan_chunk(overlay, 24 * GiB, kMargin, kLong, 8192).chunk == 8192);
 
     // give-back: a short context keeps what it has; a long one drops to the kept positions
     const std::vector<int> ratios = {2, 2, 2, 1};

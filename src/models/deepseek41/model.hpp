@@ -3,14 +3,19 @@
 #pragma once
 
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/core/ram_load.hpp"
+#include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/vision/mmproj.hpp"
 #include "models/deepseek41/pack.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
+#include "models/deepseek41/expert_ram.hpp"
 
 #include <map>
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,6 +44,33 @@ public:
     ~DsModel() override;
     /// Reads the pack and uploads every dense tensor except the token embedding (read per token from the file).
     bool load(const std::string& path, std::string& err);
+    bool load_overlay(const std::string& path, std::string& err);
+    struct Replacement {
+        kernels::NativeExpertLayout layout;
+        kernels::cpu::NativeFmt cpu;
+        uint64_t offset = 0;
+        mutable std::unique_ptr<ExpertRam> ram;
+        const uint8_t* host() const { return ram && ram->ready ? ram->data : nullptr; }
+    };
+    bool has_overlay() const { return overlay_bytes_ != 0; }
+    uint64_t initial_overlay_ram_budget() const { return overlay_ram_budget_; }
+    bool read_initial_replacement(int layer, int expert, uint8_t* to, std::string& err) const;
+    uint8_t* prepare_replacement_ram(int layer, int expert) const;
+    void publish_replacement_ram(int layer, int expert) const;
+    void release_replacement_ram(int layer, int expert) const;
+    uint64_t overlay_max_bytes(int layer = -1) const {
+        uint64_t bytes = 0;
+        if (has_overlay())
+            for (int l = 0; l < geo().n_layers; ++l) if (layer < 0 || l == layer)
+                for (int e = 0; e < geo().n_expert; ++e)
+                    bytes = std::max<uint64_t>(bytes, overlay_[(size_t) l * geo().n_expert + e].layout.bytes);
+        return bytes;
+    }
+    const Replacement* replacement(int l, int e) const {
+        if (!has_overlay()) return nullptr;
+        const auto& v = overlay_[(size_t) l * geo().n_expert + e];
+        return v.layout.bytes ? &v : nullptr;
+    }
 
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_ ? ctx_ : ctxp_default(); }
@@ -52,6 +84,11 @@ public:
 
     void memory_usage(core::MemoryUsage& usage) const override {
         if (!usage.claim(this)) return;
+        for (const auto& v : overlay_) if (v.ram) {
+            usage.host["resident_experts"] += v.ram->allocated();
+            usage.host["pinned_experts"] += v.ram->registered();
+            usage.host["locked_experts"] += v.ram->pin.locked_bytes;
+        }
         for (const auto& [name, t] : dev_) if (t.ptr) usage.device(device_, "weights", t.bytes);
     }
     const Pack& pack() const { return pack_; }
@@ -107,6 +144,10 @@ public:
 
 private:
     CacheFormat cache_format_ = CacheFormat::Fp8;
+    std::vector<Replacement> overlay_;
+    size_t overlay_bytes_ = 0;
+    uint64_t overlay_ram_budget_ = 0;
+    core::FileRange overlay_source_;
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;

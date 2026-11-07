@@ -40,6 +40,8 @@ struct CommonOptions {
     /// Slots of VRAM-resident experts.  **0 = off, and off is the default.**  Switching the cache on moves work off the
     /// CPU pool (the model's hit kernel).
     int expert_cache = 0;
+    std::string expert_overlay;
+    int prefill_chunk = 16384;        ///< maximum prompt chunk; the engine shrinks it to fit available memory
     /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
     /// (-1 = adapt_swaps).
@@ -94,6 +96,7 @@ struct CommonOptions {
     bool diag_tier_frozen = false;     ///< --diag-tier-frozen: the VRAM tier keeps what it holds
     std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes
+    int diag_tier_peer = -1;         ///< diagnostic cap for the helper's experts per layer
     bool diag_serial_prompt = false;       ///< --diag-serial-prompt: an adapter model reads its prompt one decode step at a time
     std::string diag_logits;               ///< --diag-logits FILE: an adapter model writes the logits of each decoded row
     std::vector<std::string> images;       ///< --image FILE ... with --image-at N: the picture's block goes before token N

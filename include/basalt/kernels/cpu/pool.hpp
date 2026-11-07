@@ -39,6 +39,7 @@ namespace basalt::kernels::cpu {
 /// One expert for the `nt` tokens of a verify window that were routed to it.  Every token's output is bitwise the
 /// single-token job's.
 struct ExpertJobMulti {
+    const NativeFmt* native_format = nullptr; ///< optional per-expert format; geometry must match the batch
     const uint8_t* blob = nullptr;
     int nt = 0;
     const ActQ* act[MAXT] = {};
