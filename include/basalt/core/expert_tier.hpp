@@ -52,6 +52,12 @@ struct ExpertTierSpec {
     int n_embd = 0;     ///< width of an expert's input (the layer's input, or the latent a model projects it to)
     int n_ff = 0;       ///< width of an expert's hidden layer
     std::vector<Layer> layers;
+    struct Replacement {
+        uint64_t offset = 0, bytes = 0;
+        const kernels::cpu::NativeFmt* cpu = nullptr;
+    };
+    FileRange replacement_file;
+    std::vector<Replacement> replacements;    ///< [layer * n_expert + expert]; empty for an unmodified pack
     std::string path;           ///< the pack
     int fd = -1;                ///< a descriptor of it
     FileRange range;            ///< the experts section
@@ -340,6 +346,9 @@ private:
     /// Fills each layer's empty slots with its recall_ experts, then with `ranked_too` the profile's order, and waits for
     /// the copies (a placement the next lookup sees whatever the timing).
     void restore(bool ranked_too);
+    uint64_t expert_bytes(int layer, int id) const;
+    uint64_t ram_stride(int layer) const;
+    const ExpertTierSpec::Replacement* replacement(int layer, int id) const;
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
     /// and starts reading them there; `reading[i]` marks those of `ids`.
@@ -417,6 +426,7 @@ private:
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
+    std::vector<uint64_t> ram_stride_;
     std::vector<core::RamAllocation> ram_allocations_;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)

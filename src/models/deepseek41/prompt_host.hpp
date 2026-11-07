@@ -38,8 +38,10 @@ public:
     uint8_t* ring = nullptr;            ///< [ring_pieces][slot], pinned
     int ring_pieces = 0;
     uint8_t* stage[2] = {};             ///< [kStageExperts][slot] each, pinned: a short read's two launches
+    uint8_t* replacement_stage = nullptr; ///< one helper-owned replacement, copied through RAM without retaining it
     float* hx = nullptr;                ///< [share_rows][n_embd] a short read's activations, pinned
     float* hrows = nullptr;             ///< [kShareRows][n_embd] rows the CPU returns, pinned and mapped
+    float* xb = nullptr;                ///< mixed native replacements sent to the helper
     uint8_t* act = nullptr;             ///< [share_rows][kNativeActBytes] the CPU's quantized activations
     int share_rows = 0;                 ///< most tokens of a short read
     std::vector<float> embed;           ///< [kEmbedRows][4 streams][n_embd]

@@ -86,6 +86,19 @@ ExpertTier::~ExpertTier() {
     cudaFree(zero_row_);
 }
 
+const ExpertTierSpec::Replacement* ExpertTier::replacement(int layer, int id) const {
+    if (s_.replacements.empty()) return nullptr;
+    const auto& r = s_.replacements[(size_t) layer * n_expert_ + id];
+    return r.bytes ? &r : nullptr;
+}
+
+uint64_t ExpertTier::expert_bytes(int layer, int id) const {
+    if (const auto* r = replacement(layer, id)) return r->bytes;
+    return s_.layers[(size_t) layer].blob_bytes;
+}
+
+uint64_t ExpertTier::ram_stride(int layer) const { return ram_stride_[(size_t) layer]; }
+
 bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& reads, std::string& err) {
     cudaGetDevice(&device_);
     const char* profile = std::getenv("BASALT_DS_PROFILE_PEER_EXCHANGE");
@@ -93,9 +106,16 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     n_layers_ = s_.n_layers;
     n_expert_ = s_.n_expert;
     uint64_t one_each = 0, one_each_ram = 0;   // bytes of one slot in every layer, of one RAM place in every layer
-    for (const ExpertTierSpec::Layer& e : s_.layers) {
-        one_each += (e.blob_bytes + 255) / 256 * 256;
-        one_each_ram += e.blob_bytes;
+    ram_stride_.resize((size_t) n_layers_);
+    for (int l = 0; l < n_layers_; ++l) {
+        uint64_t bytes = s_.layers[(size_t) l].blob_bytes;
+        if (!s_.replacements.empty()) {
+            for (int id = 0; id < n_expert_; ++id)
+                bytes = std::max(bytes, expert_bytes(l, id));
+        }
+        ram_stride_[(size_t) l] = bytes;
+        one_each += (bytes + 255) / 256 * 256;
+        one_each_ram += bytes;
     }
     uint64_t free_b = 0, total_b = 0;
     std::string why;
@@ -143,7 +163,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
             // to the rooms (bigger late layers go to more cards), then each block's prompt-share prices are set
             std::vector<uint64_t> rooms, layer_bytes;   // one slot of each layer, as one_each counts them
             for (const auto& p : peers_) rooms.push_back(p->room());
-            for (int l = 0; l < n_layers_; ++l) layer_bytes.push_back((s_.layers[(size_t) l].blob_bytes + 255) / 256 * 256);
+            for (int l = 0; l < n_layers_; ++l) layer_bytes.push_back((ram_stride(l) + 255) / 256 * 256);
             const uint64_t reserve_peer = (uint64_t) s_.peer_reserve_mib << 20;
             blocks_ = core::policy::split_by_bytes(layer_bytes, rooms, reserve_peer, n_expert_, peer_slots);
             for (size_t c = 0; c < blocks_.lo.size(); ++c)
@@ -198,6 +218,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
                                                                (uint64_t) (homes_.ram + homes_.file + 1) * one_each_ram, cache);
         ram_slots = ram_in();
         homes_ = core::policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
+    }
+    if (homes_.file > 0 && !s_.replacements.empty()) {
+        err = s_.name + ": expert overlay requires the expert tiers to fit in RAM and VRAM";
+        return false;
     }
     const uint64_t ram_floor =
         tier_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
@@ -261,7 +285,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
             return false;
         fmt_.push_back(f);
     }
-    act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow, 64);
+    const size_t act_formats = s_.replacements.empty() ? 1 : kMaxK;
+    act_ = (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * kMaxWindow * act_formats, 64);
     const kernels::cpu::PoolAffinity affinity = s_.pool_affinity_given ? s_.pool_affinity : kernels::cpu::PoolAffinity::All;
     pool_ = std::make_unique<kernels::cpu::ExpertPool>(
         kernels::cpu::start_pool_workers(s_.pool_workers, s_.pool_affinity_given, affinity), affinity);
@@ -418,7 +443,7 @@ void ExpertTier::probe_env(program::ProbeEnv& env) {
 
 bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     uint64_t max_blob = 0;
-    for (const ExpertTierSpec::Layer& e : s_.layers) max_blob = std::max<uint64_t>(max_blob, e.blob_bytes);
+    for (const uint64_t bytes : ram_stride_) max_blob = std::max(max_blob, bytes);
     cover_ = homes_.ram;
     ram_.assign((size_t) n_layers_, nullptr);
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
@@ -431,7 +456,7 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
         for (size_t c = 0; c < peers_.size(); ++c) {
             std::vector<int64_t> sizes;
             for (int l = blocks_.lo[c]; l < blocks_.hi[c]; ++l)
-                for (int s = 0; s < homes_.peer; ++s) sizes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
+                for (int s = 0; s < homes_.peer; ++s) sizes.push_back((int64_t) ram_stride(l));
             if (!peers_[c]->open_slots(sizes, err)) return false;
             // scratch slots for the misses the card fetches over its own link, in what its homes leave above its reserve
             const uint64_t keep = (uint64_t) s_.peer_reserve_mib << 20, room = peers_[c]->room();
@@ -480,9 +505,8 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     // the layout: one span per layer, each with its swap spare
     ram_allocations_.resize((size_t) n_layers_);
     for (int l = 0; l < n_layers_; ++l) {
-        const ExpertTierSpec::Layer& el = s_.layers[(size_t) l];
         if (cover_ <= 0) continue;
-        const uint64_t span = el.blob_bytes * (uint64_t) (cover_ + 1);
+        const uint64_t span = ram_stride(l) * (uint64_t) (cover_ + 1);
         if (!ram_allocations_[(size_t) l].allocate(span)) {
             err = s_.name + ": cannot allocate the RAM expert tier";
             return false;
@@ -492,6 +516,7 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     // every expert's blob: into its RAM place, and onto the card that is its home, in the start's pass (the file's
     // share is not read)
     const int experts_file = plan.file_fd(s_.fd);
+    const int replacement_file = s_.replacements.empty() ? -1 : plan.file(s_.replacement_file.path);
     int main_device = 0;
     if (cudaGetDevice(&main_device) != cudaSuccess) main_device = 0;
     for (int l = 0; l < n_layers_; ++l) {
@@ -502,8 +527,13 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
             it.file = experts_file;
             it.off = s_.range.offset + el.offset + (uint64_t) e * el.blob_bytes;
             it.bytes = el.blob_bytes;
+            if (const auto* r = replacement(l, e)) {
+                it.file = replacement_file;
+                it.off = s_.replacement_file.offset + r->offset;
+                it.bytes = r->bytes;
+            }
             if (ram_idx_[idx] >= 0) {
-                it.host = ram_[(size_t) l] + (size_t) ram_idx_[idx] * (size_t) el.blob_bytes;
+                it.host = ram_[(size_t) l] + (size_t) ram_idx_[idx] * ram_stride(l);
                 plan.add(it);
                 it.host = nullptr;
             }
@@ -692,7 +722,7 @@ void ExpertTier::seed_copies(int64_t n_each, bool base_shares) {
 const uint8_t* ExpertTier::blob_of(int layer, int e) const {
     const ExpertTierSpec::Layer& el = s_.layers[(size_t) layer];
     const int32_t r = ram_idx_[(size_t) layer * n_expert_ + e];
-    if (r >= 0) return ram_[(size_t) layer] + (size_t) r * el.blob_bytes;
+    if (r >= 0) return ram_[(size_t) layer] + (size_t) r * ram_stride(layer);
     if (!file_.data()) return nullptr;
     return file_.data() + s_.range.offset + el.offset + (uint64_t) e * el.blob_bytes;
 }
@@ -893,6 +923,15 @@ ExpertTier::Source ExpertTier::locate(int layer, int e) const {
 
 void ExpertTier::start_cpu(int layer, const float* x, const Lookup& lk, float* rows, bool reading) {
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
+    if (!s_.replacements.empty()) {
+        Use use[kMaxK]{};
+        for (int i = 0; i < lk.k; ++i) {
+            use[i].nt = 1;
+            use[i].row[0] = i;
+        }
+        start_cpu_window(layer, x, lk, use, rows, reading);
+        return;
+    }
     int n = 0;
     for (int i = 0; i < lk.k; ++i) {
         if (lk.dev[i] || lk.peer[i] || lk.dropped[i] || lk.reading[i] != reading) continue;
@@ -911,6 +950,36 @@ void ExpertTier::start_cpu(int layer, const float* x, const Lookup& lk, float* r
 void ExpertTier::start_cpu_window(int layer, const float* x, const Lookup& lk, const Use* use, float* rows, bool reading) {
     const kernels::cpu::NativeFmt& f = fmt_[(size_t) layer];
     const size_t n_embd = (size_t) s_.n_embd;
+    if (!s_.replacements.empty()) {
+        int types[kMaxK]{};
+        bool quantized[kMaxK][kMaxWindow]{};
+        int count = 0, formats = 0;
+        for (int i = 0; i < lk.k; ++i) {
+            if (lk.dev[i] || lk.peer[i] || lk.dropped[i] || lk.reading[i] != reading) continue;
+            const auto* r = replacement(layer, lk.experts[i]);
+            const auto& format = r ? *r->cpu : f;
+            int q = 0;
+            while (q < formats && types[q] != format.gu_act) ++q;
+            if (q == formats) types[formats++] = format.gu_act;
+            auto& job = cpu_jobs_[count++];
+            job = {};
+            job.native_format = &format;
+            job.blob = lk.host[i];
+            job.nt = use[i].nt;
+            for (int j = 0; j < job.nt; ++j) {
+                const int t = use[i].tok[j];
+                auto* act = act_ + ((size_t) q * kMaxWindow + t) * kernels::cpu::kNativeActBytes;
+                if (!quantized[q][t]) {
+                    kernels::cpu::native_quant_act(format, x + (size_t) t * n_embd, act);
+                    quantized[q][t] = true;
+                }
+                job.nact[j] = act;
+                job.out[j] = rows + (size_t) use[i].row[j] * n_embd;
+            }
+        }
+        if (count) pool_->start_split_multi_native(f, cpu_jobs_, count);
+        return;
+    }
     bool quantized[kMaxWindow] = {};
     int n = 0;
     for (int i = 0; i < lk.k; ++i) {
@@ -974,6 +1043,7 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     uint64_t oldest = ~0ull;
     for (int64_t s = (int64_t) layer * homes_.peer; s < (int64_t) (layer + 1) * homes_.peer; ++s) {
         const uint64_t st = stamp_[base + peer_owner_[(size_t) s]];
+        if (!s_.replacements.empty() && expert_bytes(layer, e) != expert_bytes(layer, peer_owner_[(size_t) s])) continue;
         if (st != tick_ && st < oldest) {   // not in use by this very lookup
             oldest = st;
             slot = (int32_t) s;
@@ -986,10 +1056,10 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     if (slot < 0 || oldest + core::policy::kPeerMoveAge >= on_main) return false;
     const int32_t place = spare_[(size_t) layer];
     spare_[(size_t) layer] = -1;
-    const uint64_t bytes = s_.layers[(size_t) layer].blob_bytes;
+    const uint64_t bytes = expert_bytes(layer, e);
     // `slot` is global (peer_owner_'s); the card is told its own number for it
     const int32_t local = core::policy::local_slot(blocks_, homes_.peer, layer, (int) (slot - (int64_t) layer * homes_.peer));
-    peer_moves_.push_back({layer, e, peer_owner_[(size_t) slot], local, place, ram_[(size_t) layer] + (size_t) place * bytes, src, bytes});
+    peer_moves_.push_back({layer, e, peer_owner_[(size_t) slot], local, place, ram_[(size_t) layer] + (size_t) place * ram_stride(layer), src, bytes});
     peer_owner_[(size_t) slot] = e;
     ++promoted_;
     return true;
@@ -1004,13 +1074,14 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     const int32_t slot = oldest_slot(layer, homes_too, best);
     if (slot < 0 || best == tick_) return -1;   // every slot is in use by this very lookup
     const int32_t o = owner_[(size_t) slot];
+    const bool home = homes_.main > 0 && slot < base_slots();
+    if (!s_.replacements.empty() && home && o >= 0 && expert_bytes(layer, e) != expert_bytes(layer, o)) return -1;
     if (o >= 0) res_[(size_t) layer * n_expert_ + o] = -1;
     owner_[(size_t) slot] = e;
     busy_[(size_t) slot] = 1;
     stamp_[(size_t) layer * n_expert_ + e] = tick_;
-    const uint64_t bytes = s_.layers[(size_t) layer].blob_bytes;
+    const uint64_t bytes = expert_bytes(layer, e);
     uint8_t* dst = const_cast<uint8_t*>(slot_ptr(slot));
-    const bool home = homes_.main > 0 && slot < base_slots();
     int32_t place = -1;
     const uint64_t piece = whole ? bytes : core::policy::kPieceBytes;
     const auto pieces = [&](uint8_t* to, const uint8_t* from, cudaMemcpyKind kind) {
@@ -1026,11 +1097,11 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
     ++promoted_;
     ++claims_;
     if (later) {
-        Queued q{{layer, e, slot, ev, home ? o : -1, place}, dst, src, home ? ram_[(size_t) layer] + (size_t) place * bytes : nullptr, bytes};
+        Queued q{{layer, e, slot, ev, home ? o : -1, place}, dst, src, home ? ram_[(size_t) layer] + (size_t) place * ram_stride(layer) : nullptr, bytes};
         queue_.push_back(q);
         return slot;
     }
-    if (home) pieces(ram_[(size_t) layer] + (size_t) place * bytes, dst, cudaMemcpyDeviceToHost);
+    if (home) pieces(ram_[(size_t) layer] + (size_t) place * ram_stride(layer), dst, cudaMemcpyDeviceToHost);
     pieces(dst, src, cudaMemcpyHostToDevice);
     cudaEventRecord(events_[(size_t) ev], stream);
     pending_.push_back({layer, e, slot, ev, home ? o : -1, place});
@@ -1152,7 +1223,6 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
     // main card's link alone would have given it.
     core::PeerExperts* pc = peer_for(layer);   // this layer's second card: it computes the experts it fetches
     int far = pc ? std::min(core::policy::peer_bus_count(np, nf), pc->scratch_free()) : 0;
-    const uint64_t bytes = s_.layers[(size_t) layer].blob_bytes;
     int started = 0;
     for (int i = lk.k - 1; i >= 0 && left > 0; --i) {
         if (lk.dev[i] || !eligible(i)) continue;   // pinned sources only
@@ -1161,7 +1231,7 @@ int ExpertTier::fetch(int layer, Lookup& lk) {
                                      : claim(layer, lk.experts[i], lk.host[i], fetch_stream_, false, /*whole=*/true);
         if (slot < 0) continue;
         if (far > 0) {
-            lk.peer[i] = pc->fetch(lk.experts[i], lk.host[i], bytes);
+            lk.peer[i] = pc->fetch(lk.experts[i], lk.host[i], expert_bytes(layer, lk.experts[i]));
             --far;
         } else {
             lk.dev[i] = slot_ptr(slot);
@@ -1323,7 +1393,7 @@ bool ExpertTier::open_base(int64_t per_layer, std::string& err) {
         for (int64_t i = 0; i < nb; ++i) phys_[(size_t) order[(size_t) i]] = (int32_t) i;
     }
     std::vector<int64_t> slot_bytes;
-    for (int32_t s : order) slot_bytes.push_back((int64_t) s_.layers[(size_t) layer_of[(size_t) s]].blob_bytes);
+    for (int32_t s : order) slot_bytes.push_back((int64_t) ram_stride(layer_of[(size_t) s]));
     cache_.set_segment_bytes(seg ? (int64_t) s_.lend_segment : 0);
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
         phys_.clear();
@@ -1380,7 +1450,7 @@ void ExpertTier::keep_hottest(const std::vector<int64_t>& keep) {
             while (owner_[(size_t) d] >= 0 && hot[(size_t) owner_[(size_t) d]]) ++d;
             const int e = owner_[(size_t) src];
             if (owner_[(size_t) d] >= 0) res_[base + owner_[(size_t) d]] = -1;
-            cudaMemcpyAsync(const_cast<uint8_t*>(slot_ptr((int32_t) d)), slot_ptr(src), s_.layers[(size_t) l].blob_bytes, cudaMemcpyDeviceToDevice,
+            cudaMemcpyAsync(const_cast<uint8_t*>(slot_ptr((int32_t) d)), slot_ptr(src), expert_bytes(l, e), cudaMemcpyDeviceToDevice,
                             copy_stream_);
             owner_[(size_t) d] = e;
             res_[base + e] = (int32_t) d;
@@ -1539,7 +1609,7 @@ void ExpertTier::grow() {
     const int64_t n = ext_n_;
     std::vector<int64_t> slot_bytes;
     for (int l = 0; l < n_layers_; ++l)
-        for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) s_.layers[(size_t) l].blob_bytes);
+        for (int64_t s = 0; s < n; ++s) slot_bytes.push_back((int64_t) ram_stride(l));
     std::string err;
     if (!ext_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
         basalt::log::warn(s_.area.c_str(), "VRAM expert tier cannot take back its %lld slots per layer beside the prompt workspaces: %s",
