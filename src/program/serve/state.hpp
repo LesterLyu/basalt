@@ -301,6 +301,7 @@ public:
         // scanned, the first refused one is resampled under the mask, and the segment ends there
         std::unique_ptr<basalt::program::grammar::Guard> guard;
         int lp_top = -1;   ///< the request's logprobs=K: a BP line ahead of the BT line for every kept pick (-1: off)
+        std::vector<float> grammar_bias;  ///< request logit bias for masked redraws
         // the drafter's side of the slot: the drafts its session left for the slot's next window and their chances, its
         // prompt-lookup history and last proposal
         int32_t dr[basalt::spec::DraftPolicy::kMaxT] = {};

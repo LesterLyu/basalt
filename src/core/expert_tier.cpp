@@ -693,6 +693,7 @@ const uint8_t* ExpertTier::blob_of(int layer, int e) const {
     const ExpertTierSpec::Layer& el = s_.layers[(size_t) layer];
     const int32_t r = ram_idx_[(size_t) layer * n_expert_ + e];
     if (r >= 0) return ram_[(size_t) layer] + (size_t) r * el.blob_bytes;
+    if (!file_.data()) return nullptr;
     return file_.data() + s_.range.offset + el.offset + (uint64_t) e * el.blob_bytes;
 }
 
@@ -830,6 +831,10 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         } else {
             lk.dev[i] = nullptr;
             lk.host[i] = blob_of(layer, e);
+            if (!lk.host[i]) {
+                err = s_.name + ": no backing for routed expert " + std::to_string(e) + " in layer " + std::to_string(layer);
+                return false;
+            }
             lk.again[i] = s_.admit_uses > 0 ? core::policy::count_use(uses_[idx], s_.admit_uses)
                                             : core::policy::repeat_miss(last_miss_[idx], token_, core::policy::kPromoteWindow);
             ++(pinned(layer, e) && !lk.reading[i] ? ram_hits_ : file_hits_);

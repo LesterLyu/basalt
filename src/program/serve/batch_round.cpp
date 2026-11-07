@@ -119,7 +119,7 @@ bool Runtime::slot_window_accept(int b, SlotWin& w) {
             int32_t y = -1;
             std::string why;
             const basalt::program::grammar::Redraw verdict = sl.guard->redraw(
-                {},
+                sl.grammar_bias,
                 [&](const std::vector<float>& bias, int32_t& t) {
                     const basalt::model::Result r = s.resample_row(miss, bias.data(), t);
                     if (!r.ok()) why = r.message;
@@ -204,6 +204,7 @@ bool Runtime::slot_window_end(int b, SlotWin& w) {
         sl.cached = o.prompt_cache > 0;
         sl.idle_busy = busy_now();
         sl.guard.reset();
+        sl.grammar_bias.clear();
     }
     std::fflush(stdout);
     return true;

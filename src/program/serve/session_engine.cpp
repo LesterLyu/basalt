@@ -587,6 +587,7 @@ private:
     Flow slot_bind() override { rt_.set_active(slot_b); return Flow::proceed; }
     // a slot's prompt lookup history: the conversation, then the token its first window feeds
     void slot_init(BSlot& sl) override {
+        if (gguard && req_bias_present) sl.grammar_bias = req_bias;
         sl.row_wait_us = row_wait_us_;
         row_wait_us_ = 0;  // the batch reports the whole request at BDONE
         if (!rt_.lookup_on()) return;
