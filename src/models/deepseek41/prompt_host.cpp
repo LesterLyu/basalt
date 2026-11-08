@@ -1,6 +1,5 @@
 // src/models/deepseek41/prompt_host.cpp - see prompt_host.hpp.
 #include "models/deepseek41/prompt_host.hpp"
-#include "basalt/core/peer_experts.hpp"
 
 #include "basalt/ggml/ggml.h"
 #include "basalt/kernels/cpu/native_expert.hpp"
@@ -28,7 +27,7 @@ uint64_t staged_stride(const ExpertLayer& e) {
 }
 
 PromptHost::~PromptHost() {
-    for (void* p : {(void*) ring, (void*) stage[0], (void*) stage[1], (void*) replacement_stage, (void*) hx, (void*) hrows, (void*) xb})
+    for (void* p : {(void*) ring, (void*) stage[0], (void*) stage[1], (void*) replacement_stage, (void*) hx, (void*) hrows})
         if (p) cudaFreeHost(p);
     platform::free_aligned(act);
 }
@@ -55,7 +54,6 @@ bool PromptHost::open(const DsModel& m, int pieces, int slots, bool vision, std:
               pin(hx, (size_t) share_rows * n * 4, m.has_overlay() ? kMapped : kPortable) &&
               pin(hrows, (size_t) prefillp::kShareRows * n * 4, kMapped);
     act = ok ? (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * (size_t) share_rows, 64) : nullptr;
-    if (ok && m.has_overlay()) ok = pin(xb,(size_t)core::PeerExperts::kRowBatch*n*4,kPortable);
     if (!ok || !act) {
         cudaGetLastError();
         err = "deepseek41: out of host memory for the prompt path's buffers";
@@ -64,7 +62,7 @@ bool PromptHost::open(const DsModel& m, int pieces, int slots, bool vision, std:
     bytes_ = pinned_ + kernels::cpu::kNativeActBytes * (size_t) share_rows;
     expert_staging_bytes_ = (uint64_t)2 * prefillp::kStageExperts * slot + m.overlay_max_bytes();
     activation_bytes_ = (uint64_t)share_rows * n * 4 + (uint64_t)prefillp::kShareRows * n * 4 +
-                        kernels::cpu::kNativeActBytes * (uint64_t)share_rows + (xb ? core::PeerExperts::kRowBatch*n*4 : 0);
+                        kernels::cpu::kNativeActBytes * (uint64_t)share_rows;
     // pages written once now, so the free memory the tier reads already lacks them
     auto take = [&](auto& v, size_t count) {
         v.assign(count, 0);
