@@ -49,7 +49,7 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             }
         const size_t scales_at = peer_scales_at(std::max(P.T_max, P.T_fp4));
         // the layer's activations as FP4 once per token (the primary's bytes), on the peer before its first launch
-        L.quantize = [scales_at](const float* x, int tokens, void* dst, void* stream) {
+        L.quantize = [scales_at](const float* x, int tokens, void* dst, void*, void* stream) {
             fp4::quantize_tokens(x, tokens, N, N, dst, (float*) ((uint8_t*) dst + scales_at), stream);
         };
         L.stage = [](const std::vector<std::pair<const uint8_t*, bool>>&, uint8_t*, void*) {};

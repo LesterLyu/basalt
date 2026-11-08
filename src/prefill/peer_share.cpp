@@ -32,10 +32,6 @@
 namespace basalt::prefill {
 namespace {
 
-// The main card quantizes a layer's activations this many rows at a time into its own memory and its copy engine moves
-// them to the host: a kernel writing to mapped host memory would hold the main card's SMs for the whole transfer.
-constexpr int64_t kQuantRows = 2048;
-
 int64_t max_launches(const PeerShare::Dims& d) {
     // a launch closes at its rows, at its experts, or splits an expert: at most one launch more per expert
     return (d.max_rows + d.launch_rows - 1) / d.launch_rows + d.n_expert + 1;
@@ -45,7 +41,8 @@ int64_t max_launches(const PeerShare::Dims& d) {
 std::vector<std::pair<size_t, size_t>> cut_groups(const std::vector<PeerShare::Expert>& experts, int per) {
     std::vector<std::pair<size_t, size_t>> g;
     for (size_t i = 0; i < experts.size(); ++i)
-        if (g.empty() || experts[i].group || i - g.back().first == (size_t) per) g.push_back({i, i + 1});
+        if (g.empty() || experts[i].group || experts[i].layer != experts[g.back().first].layer ||
+            i - g.back().first == (size_t) per) g.push_back({i, i + 1});
         else g.back().second = i + 1;
     return g;
 }
@@ -348,7 +345,8 @@ void PeerShare::prepare(const Layer& L, const std::vector<Expert>& experts) {
         }
         const uint64_t gi = m.group++;
         Impl* w = &m;
-        m.post([w, L, blobs = std::move(blobs), gi] { w->stage_group(L, blobs, gi); });
+        const Layer group_layer = experts[i0].layer ? *experts[i0].layer : L;
+        m.post([w, group_layer, blobs = std::move(blobs), gi] { w->stage_group(group_layer, blobs, gi); });
     }
 }
 
@@ -379,6 +377,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
     };
     struct Group {
         size_t i0 = 0, i1 = 0;
+        Layer layer;
         std::vector<Cut> launches;
     };
     std::vector<Group> groups;
@@ -388,6 +387,12 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         Group g;
         g.i0 = i0;
         g.i1 = i1;
+        g.layer = experts[i0].layer ? *experts[i0].layer : L;
+        if (!g.layer.stage && (g.layer.blob_bytes > g.layer.stride ||
+            g.layer.stride * (i1-i0) > d.group_bytes)) {
+            err = "peer share: an expert group does not fit the share's buffers";
+            return false;
+        }
         // the group's rows, cut into launches of at most launch_rows rows
         Cut l;
         int k0 = 0;
@@ -434,7 +439,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         cudaStreamWaitEvent(m.s_rows, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);
         if (L.quantize) {
-            L.quantize(x, n_tokens, m.hxq, m.s_main);
+            L.quantize(x, n_tokens, m.hxq, m.dxq, m.s_main);
         } else {   // block column kb of row r lies at (kb n_tokens + r) blocks: a piece's rows are a strided copy
             const size_t kb = (size_t) mmq::q8_blocks(d.n_embd);
             const size_t bb = (mmq::q8_bytes(1, d.n_embd) - mmq::q8_bytes(0, d.n_embd)) / kb;   // bytes of one block
@@ -473,7 +478,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         bool first = true;
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             const Group& g = groups[gi];
-            if ((int) gi >= prepared) m.stage_group(L, blobs[gi], nums[gi]);
+            if ((int) gi >= prepared) m.stage_group(g.layer, blobs[gi], nums[gi]);
             const int sb = (int) (nums[gi] % (uint64_t) d.stage_bufs);
             const core::OnDevice od(m.peer);
             if (!g.launches.empty()) cudaStreamWaitEvent(ps, m.ev_staged[sb], 0);
@@ -485,6 +490,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 lv.n = l.n;
                 lv.blob = all_blobs.data() + g.i0 + l.q0;
                 lv.tok = m.tok_dev + l.r0;
+                lv.ident = m.ident;
                 lv.bounds = m.bounds_dev + l.b0;
                 lv.bounds_host = bounds + l.b0;
                 lv.rows = l.rows;
@@ -493,12 +499,14 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 lv.n_tokens = n_tokens;
                 lv.first = first;
                 lv.out = m.out[b];
+                lv.scratch = m.gu;
+                lv.quantized = m.xq[b];
                 first = false;
-                if (L.products) {
+                if (g.layer.products) {
                     cudaStreamWaitEvent(ps, m.ev_out[b], 0);   // the last rows out of this buffer have left
-                    L.products(lv, ps);
+                    g.layer.products(lv, ps);
                 } else {
-                    m.products(L, lv, b, ps);
+                    m.products(g.layer, lv, b, ps);
                 }
                 cudaEventRecord(m.ev_done[b], ps);
                 // the rows out, once the main card has copied the last ones from there

@@ -3098,6 +3098,22 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
     }
 }
 
+__device__ void gather_q8_1_rows_device(const uint32_t* x, const int32_t* tokens, int words, uint32_t* y,
+                                      int row, int lane) {
+    for (int i=lane;i<words;i+=256) y[(size_t)row*words+i]=x[(size_t)tokens[row]*words+i];
+}
+
+__global__ void gather_q8_1_rows_kernel(const uint32_t* x, const int32_t* tokens, int words, uint32_t* y) {
+    gather_q8_1_rows_device(x,tokens,words,y,blockIdx.x,threadIdx.x);
+}
+
+void gather_q8_1_rows(const void* x, const int32_t* tokens, int64_t rows, int64_t cols, void* y, void* stream) {
+    if (rows <= 0) return;
+    gather_q8_1_rows_kernel<<<(unsigned)rows,256,0,(cudaStream_t)stream>>>((const uint32_t*)x,tokens,
+        (int)(cols/32*sizeof(block_q8_1)/4),(uint32_t*)y);
+    check("gather_q8_1_rows");
+}
+
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;

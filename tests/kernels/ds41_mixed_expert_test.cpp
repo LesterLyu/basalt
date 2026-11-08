@@ -2,7 +2,9 @@
 #include "basalt/core/model_file.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "models/deepseek41/expert_ram.hpp"
+#include "models/deepseek41/prefill_native.hpp"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
@@ -165,6 +167,78 @@ int main(int argc, char** argv) try {
         }
     }
     cudaFree(scratch); cudaFree(xq); cudaFree(dy); cudaFree(dx);
+    // Long prompt batches retain the single-row result, including repeated and permuted token indices.
+    constexpr int B = basalt::models::deepseek41::kNativePromptRows;
+    Host batch_x((size_t)B*H*4), mapped_q(kg::native_q8_1_bytes(H)*B);
+    auto* batch = (float*)batch_x.p;
+    for (int i=0;i<B*H;++i) batch[i]=normal(rng);
+    for (int device : {0,1}) {
+        ck(cudaSetDevice(device));
+        float *bx=nullptr,*by=nullptr;
+        void *bq=nullptr,*bg=nullptr,*bs=nullptr,*single=nullptr;
+        int32_t *bt=nullptr,*bd=nullptr;
+        ck(cudaMalloc((void**)&bx,(size_t)B*H*4));
+        ck(cudaMalloc((void**)&by,(size_t)B*H*4));
+        ck(cudaMalloc(&bq,kg::native_q8_1_bytes(H)*B));
+        ck(cudaMalloc(&bg,kg::native_q8_1_bytes(H)*B));
+        ck(cudaMalloc(&bs,kg::gated_mlp_scratch_bytes(B,FF)+32));
+        ck(cudaMalloc(&single,kg::gated_mlp_scratch_bytes(1,FF)));
+        ck(cudaMalloc((void**)&bt,B*4)); ck(cudaMalloc((void**)&bd,B*4));
+        ck(cudaMemcpy(bx,batch,(size_t)B*H*4,cudaMemcpyHostToDevice));
+        kg::quantize_q8_1_rows(bx,B,H,bq,nullptr);
+        ck(cudaMemcpy(mapped_q.p,bq,kg::native_q8_1_bytes(H)*B,cudaMemcpyDeviceToHost));
+        for (int e=0;e<E;++e) {
+            const void* blob=device ? peer.slot_ptr(0,e) : primary.slot_ptr(0,e);
+            std::vector<float> reference((size_t)B*H),got(reference.size());
+            std::vector<int32_t> tok(B),dst(B);
+            for (int t=0;t<B;++t) {
+                tok[t]=(t*7+3)%(B/2); dst[t]=(t*13)%B;
+                kg::gated_mlp_clamped(experts[e].gpu,10.f,blob,1,1,
+                    (uint8_t*)bq+kg::native_q8_1_bytes(H)*tok[t],single,by,nullptr);
+                ck(cudaMemcpy(reference.data()+(size_t)dst[t]*H,by,H*4,cudaMemcpyDeviceToHost));
+            }
+            ck(cudaMemcpy(bt,tok.data(),B*4,cudaMemcpyHostToDevice));
+            ck(cudaMemcpy(bd,dst.data(),B*4,cudaMemcpyHostToDevice));
+            kg::gather_q8_1_rows(mapped_q.p,bt,B,H,bg,nullptr);
+            std::vector<uint8_t> gathered(kg::native_q8_1_bytes(H)*B);
+            ck(cudaMemcpy(gathered.data(),bg,gathered.size(),cudaMemcpyDeviceToHost));
+            const size_t row_bytes=kg::native_q8_1_bytes(H);
+            for (int t=0;t<B;++t)
+                require(!std::memcmp(gathered.data()+t*row_bytes,(uint8_t*)mapped_q.p+tok[t]*row_bytes,row_bytes),
+                        "q8 gather vs CPU byte-copy reference");
+            for (bool mapped : {false,true}) {
+                for (int count : {1,31,80,256}) {
+                    ck(cudaMemset(by,0,(size_t)B*H*4));
+                    basalt::models::deepseek41::native_prompt_rows(experts[e].gpu,10.f,blob,mapped?mapped_q.p:bq,
+                        bt,bd,count,bs,by,nullptr);
+                    ck(cudaMemcpy(got.data(),by,(size_t)B*H*4,cudaMemcpyDeviceToHost));
+                    for (int t=0;t<count;++t)
+                        require(!std::memcmp(got.data()+(size_t)dst[t]*H,reference.data()+(size_t)dst[t]*H,H*4),
+                                "native prompt batch vs single-row output");
+                }
+            }
+            if (e==0) {
+                cudaEvent_t begin,end; ck(cudaEventCreate(&begin));ck(cudaEventCreate(&end));
+                ck(cudaEventRecord(begin));
+                for (int t=0;t<B;++t)
+                    kg::gated_mlp_clamped(experts[e].gpu,10.f,blob,1,1,
+                        (uint8_t*)bq+row_bytes*tok[t],single,by,nullptr);
+                ck(cudaEventRecord(end));ck(cudaEventSynchronize(end));
+                float serial_ms=0,batch_ms=0;ck(cudaEventElapsedTime(&serial_ms,begin,end));
+                ck(cudaEventRecord(begin));
+                for (int repeat=0;repeat<10;++repeat)
+                    basalt::models::deepseek41::native_prompt_rows(experts[e].gpu,10.f,blob,bq,bt,bd,B,bs,by,nullptr);
+                ck(cudaEventRecord(end));ck(cudaEventSynchronize(end));
+                ck(cudaEventElapsedTime(&batch_ms,begin,end));
+                const double us=batch_ms*100.;
+                std::printf("prompt GPU %d, 256 rows: serial %.1f us, batch %.1f us, %.2f TFLOP/s\n",
+                    device,serial_ms*1000.,us,6.*H*FF*B/(us*1e6));
+                cudaEventDestroy(end);cudaEventDestroy(begin);
+            }
+        }
+        std::printf("prompt GPU %d: %d formats, 1/31/80/256 rows, permuted device/mapped inputs: bitwise equal\n",device,E);
+        cudaFree(bd);cudaFree(bt);cudaFree(single);cudaFree(bs);cudaFree(bg);cudaFree(bq);cudaFree(by);cudaFree(bx);
+    }
     // GPU-exclusive homes drop the allocation and reconstruct the same bytes from VRAM.
     for (int round = 0; round < 4; ++round) for (int i = 0; i < E; ++i) {
         auto ram = std::make_unique<basalt::models::deepseek41::ExpertRam>();

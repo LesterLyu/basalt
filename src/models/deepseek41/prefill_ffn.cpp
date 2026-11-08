@@ -21,6 +21,7 @@
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/ops.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
+#include "models/deepseek41/prefill_native.hpp"
 #include "models/deepseek41/tier.hpp"
 
 #include <cuda_runtime.h>
@@ -55,6 +56,7 @@ ExpertTails tails_of(const ExpertLayer& el, const uint8_t* blobs, const int32_t*
     t.n = n;
     return t;
 }
+constexpr int kTransferRows = prefill::PeerShare::kQuantRows;
 
 class Impl final : public PrefillFfn {
 public:
@@ -91,6 +93,11 @@ public:
             return false;
         }
         PromptHost& host = tier_->host();
+        if (m_.has_overlay() && kernels::native_q8_1_bytes(g_.n_embd)*(size_t)cap_ >
+            (size_t)host.share_rows*g_.n_embd*sizeof(float)) {
+            err = "deepseek41: the native prompt inputs do not fit the shared host workspace";
+            return false;
+        }
         slot_ = host.slot;   // the products step from expert to expert in whole blocks of the layer's two formats
         const size_t K = (size_t) g_.n_used, n = (size_t) g_.n_embd;
         max_rows_ = prefillp::stage_rows(K, cap_);
@@ -101,9 +108,7 @@ public:
         ok = ok && dev(gu_, R * 2 * ff * 4) && dev(h_, R * ff * 4);
         ok = ok && dev(ident_, E * 4) && dev(rows_, E * n * 4) && dev(map_, E * 4) && dev(sbnd_, 8 * 4);
         if (m_.has_overlay())
-            ok = ok && dev(overlay_x_, kernels::native_q8_1_bytes(g_.n_embd,1)) &&
-                 dev(overlay_scratch_, kernels::gated_mlp_scratch_bytes(1,g_.n_ff_exp)) &&
-                 dev(overlay_blob_, m_.overlay_max_bytes()) &&
+            ok = ok && dev(overlay_blob_, m_.overlay_max_bytes()) &&
                  cudaEventCreateWithFlags(&replacement_copied_, cudaEventDisableTiming) == cudaSuccess;
         for (int i = 0; i < 2; ++i) {
             Stage& b = stage_[i];
@@ -226,7 +231,7 @@ public:
                 } else if (src.pinned) {
                     cudaMemcpyAsync(dst, src.pinned, L.bytes, cudaMemcpyHostToDevice, copy_);
                 } else if (ahead_ && pf_on_) {
-                    // Keep the overlay path's MMQ groups unchanged; only its weight reads run ahead.
+                    // Ordinary weight reads run ahead of the mixed-format products.
                     const int32_t i = pf_idx_[(size_t) il][(size_t) e];
                     if (i < 0) { err = "deepseek41: missing prefetch entry"; return false; }
                     const int64_t seq = pf_base_[(size_t) il] + i;
@@ -321,8 +326,9 @@ public:
             pos += rows;
         }
         if (ahead_ && pf_on_ && !release_through(pf_base_[(size_t) il + 1], err)) return false;
-        if (!finish_share(share, stream, err)) return false;
         if (m_.has_overlay()) {
+            // The MMQ inputs are no longer live; reuse them for native, row-major activations.
+            kernels::quantize_q8_1_rows(x, T, g_.n_embd, xq1_, stream);
             // Stage each replacement once for all its rows, retaining the decode arithmetic and output positions.
             for (int e = 0; e < g_.n_expert; ++e) {
                 const auto* v = m_.replacement(il,e);
@@ -352,14 +358,17 @@ public:
                     }
                     blob = overlay_blob_;
                 }
-                for (int row : by[e]) {
-                    const int t = row / K;
-                    kernels::quantize_q8_1_rows(x+(size_t)t*g_.n_embd,1,g_.n_embd,overlay_x_,stream);
-                    kernels::gated_mlp_clamped(v->layout,g_.clamp_exp[il],blob,1,1,overlay_x_,overlay_scratch_,
-                                               rows_+(size_t)map_h_[row]*g_.n_embd,stream);
+                for (size_t first = 0; first < by[e].size(); first += kNativePromptRows) {
+                    const int count = (int)std::min<size_t>(kNativePromptRows, by[e].size() - first);
+                    std::vector<int32_t> tokens(count);
+                    for (int i = 0; i < count; ++i) tokens[i] = by[e][first+i] / K;
+                    cudaMemcpyAsync(stage_[0].tok, tokens.data(), count*4, cudaMemcpyHostToDevice, st);
+                    native_prompt_rows(v->layout, g_.clamp_exp[il], blob, xq1_, stage_[0].tok,
+                                ident_ + map_h_[by[e][first]], count, gu_, rows_, stream);
                 }
             }
         }
+        if (!finish_share(share, stream, err)) return false;
         cudaMemcpyAsync(map_, map_h_.data(), (size_t) T * K * 4, cudaMemcpyHostToDevice, st);
         weighted_sum_tokens(rows_, map_, w, T, K, g_.n_embd, out, stream);
         return true;
@@ -402,16 +411,12 @@ private:
         std::vector<int32_t> act_tokens, pair;   // tokens whose activations the CPU needs; each CPU row's (token, slot) pair
         std::vector<const kernels::cpu::NativeFmt*> act_formats;
         std::vector<uint8_t> handled;
-        std::vector<std::pair<int32_t,int32_t>> native_peer;  // (token/slot pair, replacement expert)
         int cpu_rows = 0;
         int64_t cpu_at = 0;                      // the CPU rows' first row in the layer's rows
         bool peer = false;                       // the second card took a share
         std::thread cpu_thread;
-        std::thread peer_thread;
-        std::string peer_error;
         void join() {
             if (cpu_thread.joinable()) cpu_thread.join();
-            if (peer_thread.joinable()) peer_thread.join();
         }
         ~Share() { join(); }
     };
@@ -434,6 +439,24 @@ private:
             const ExpertTails tails = tails_of(el, l.stage + staged_stride(el) * (size_t) l.q0, l.bounds, l.n);
             swiglu_split_clamped(gu, h, l.rows, n_ff, limit, stream, &tails);
         };
+        if (m_.has_overlay()) {
+            sl.quantize = [this, type=el.gu_type](const float* x, int T, void* dst, void* scratch, void* stream) {
+                namespace mmq = basalt::prefill::mmq;
+                const size_t kb = (size_t)mmq::q8_blocks(g_.n_embd);
+                const size_t bb = (mmq::q8_bytes(1,g_.n_embd)-mmq::q8_bytes(0,g_.n_embd))/kb;
+                const size_t native_row = kernels::native_q8_1_bytes(g_.n_embd,1);
+                auto* native = (uint8_t*)tier_->host().hx;
+                for (int t = 0; t < T; t += kTransferRows) {
+                    const int count = std::min(kTransferRows,T-t);
+                    mmq::quantize(x+(size_t)t*g_.n_embd,nullptr,scratch,type,g_.n_embd,g_.n_embd,count,stream);
+                    cudaMemcpy2DAsync((uint8_t*)dst+(size_t)t*bb,T*bb,scratch,count*bb,count*bb,kb,
+                                      cudaMemcpyDeviceToHost,(cudaStream_t)stream);
+                    kernels::quantize_q8_1_rows(x+(size_t)t*g_.n_embd,count,g_.n_embd,scratch,stream);
+                    cudaMemcpyAsync(native+(size_t)t*native_row,scratch,count*native_row,
+                                    cudaMemcpyDeviceToHost,(cudaStream_t)stream);
+                }
+            };
+        }
         return sl;
     }
 
@@ -442,11 +465,14 @@ private:
     bool start_peer(int il, int T, const float* x, const std::vector<std::vector<int32_t>>& by, const std::vector<int>& peer,
                     int64_t at, int64_t& end, void* stream, std::string& err) {
         const int K = g_.n_used;
-        std::vector<std::vector<int32_t>> tok(peer.size());
+        auto order = peer;
+        // Keep the existing MMQ launch groups intact; native-format experts follow them.
+        std::stable_partition(order.begin(),order.end(),[&](int e) { return m_.replacement(il,e)==nullptr; });
+        std::vector<std::vector<int32_t>> tok(order.size());
         std::vector<prefill::PeerShare::Expert> ex;
         end = at;
-        for (size_t i = 0; i < peer.size(); ++i) {
-            const int e = peer[i];
+        for (size_t i = 0; i < order.size(); ++i) {
+            const int e = order[i];
             const ExpertTier::Source src = tier_->locate(il, e);
             for (int32_t p : by[(size_t) e]) {
                 tok[i].push_back(p / K);
@@ -457,6 +483,25 @@ private:
             x1.on_peer = src.peer != nullptr;
             x1.tok = tok[i].data();
             x1.n = (int) tok[i].size();
+            if (const auto* replacement = m_.replacement(il,e)) {
+                auto layer = std::make_shared<prefill::PeerShare::Layer>();
+                const auto L = replacement->layout;
+                layer->blob_bytes = layer->stride = L.bytes;
+                const float limit = g_.clamp_exp[il];
+                const void* native = tier_->host().hx;
+                layer->products = [L,limit,native](const prefill::PeerShare::Launch& launch,void* stream) {
+                    const void* xq = native;
+                    kernels::gather_q8_1_rows(xq,launch.tok,launch.rows,L.n_embd,launch.quantized,stream);
+                    const size_t row_bytes=kernels::native_q8_1_bytes((int)L.n_embd);
+                    for (int first = 0; first < launch.rows; first += kNativePromptRows) {
+                        const int count = (int)std::min<int64_t>(kNativePromptRows,launch.rows-first);
+                        native_prompt_rows(L,limit,launch.stage,(const uint8_t*)launch.quantized+first*row_bytes,
+                                    launch.ident,launch.ident,count,
+                                    launch.scratch,launch.out+(size_t)first*L.n_embd,stream);
+                    }
+                };
+                x1.layer = std::move(layer);
+            }
             ex.push_back(x1);
         }
         return tier_->peer_share()->run(share_layer(il), x, T, ex, rows_ + (size_t) at * (size_t) g_.n_embd, stream, err);
@@ -504,7 +549,8 @@ private:
     bool plan_share(int il, int T, const float* x, const std::vector<std::vector<int32_t>>& by, std::vector<int>& used, Share& s,
                     void* stream, std::string& err) {
         const int K = g_.n_used;
-        if ((int64_t) T * K >= prefillp::kAheadPairs) return true;
+        const bool long_read = (int64_t) T * K >= prefillp::kAheadPairs;
+        if (long_read && !m_.has_overlay()) return true;
         int pinned = 0;
         for (int e : used) pinned += tier_->locate(il, e).pinned != nullptr;
         if (pinned == 0 && !tier_->peer()) return true;
@@ -515,7 +561,7 @@ private:
         int rows = 0;
         // the CPU's: one-row experts, then two-row ones, while the bus would still carry as many experts as it has rows
         std::map<std::pair<int,int>, int32_t> tok_row;
-        for (int c = 1; c <= kCpuRows; ++c) {
+        for (int c = 1; c <= kCpuRows && !long_read; ++c) {
             for (int e : used) {
                 const ExpertTier::Source src = tier_->locate(il, e);
                 if (!src.pinned || (int) by[(size_t) e].size() != c || stays[(size_t) e]) continue;
@@ -569,68 +615,40 @@ private:
             for (int e : ram) ram_rows.push_back((int64_t) by[(size_t) e].size());
             const int take = peer_count(il, ram_rows, main_rows, main_bytes, peer_rows);
             peer.insert(peer.end(), ram.begin(), ram.begin() + take);
-            peer.erase(std::remove_if(peer.begin(),peer.end(),[&](int e) {
-                if (!m_.replacement(il,e)) { stays[e] = 1; return false; }
-                if (!tier_->locate(il,e).peer) return true;
-                if (rows+s.native_peer.size()+by[e].size() <= (size_t)prefillp::kShareRows) {
-                    for (int pair : by[e]) s.native_peer.emplace_back(pair,e);
-                    stays[e] = 1;
-                }
-                return true;
-            }),peer.end());
+            for (int e : peer) stays[e] = 1;
         }
-        if (rows == 0 && peer.empty() && s.native_peer.empty()) return true;
+        if (rows == 0 && peer.empty()) return true;
         used.erase(std::remove_if(used.begin(), used.end(), [&](int e) { return stays[(size_t) e] != 0; }), used.end());
         int64_t at = 0;
         for (int e : used) if (!m_.replacement(il,e)) at += (int64_t) by[(size_t) e].size();
+        // Quantize the CPU's inputs before the peer reuses hx for its row-major q8 activations.
+        if (rows) {
+            if (cudaMemcpy(hx_,x,(size_t)T*n*4,cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = "deepseek41: reading a short read's activations failed";
+                return false;
+            }
+            for (size_t i=0;i<s.act_tokens.size();++i)
+                kernels::cpu::native_quant_act(*s.act_formats[i],hx_+(size_t)s.act_tokens[i]*g_.n_embd,
+                                               act_+i*kernels::cpu::kNativeActBytes);
+            s.cpu_thread = std::thread([this,il,&s] {
+                tier_->pool()->run_split_multi_native(tier_->fmt(il),s.jobs.data(),(int)s.jobs.size());
+            });
+        }
         if (!peer.empty()) {
             if (!start_peer(il, T, x, by, peer, at, at, stream, err)) return false;
             s.peer = true;
         }
         s.cpu_at = at;
         for (size_t i = 0; i < s.pair.size(); ++i) map_h_[(size_t) s.pair[i]] = (int32_t) (at + (int64_t) i);
-        for (size_t i = 0; i < s.native_peer.size(); ++i)
-            map_h_[s.native_peer[i].first] = (int32_t)(at + s.pair.size() + i);
-        if (rows == 0 && s.native_peer.empty()) return true;
-        if (cudaMemcpy(hx_, x, (size_t) T * n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
-            err = "deepseek41: reading a short read's activations failed";
-            return false;
-        }
-        if (rows) s.cpu_thread = std::thread([this, il, &s] {
-            const kernels::cpu::NativeFmt& f = tier_->fmt(il);
-            for (size_t i = 0; i < s.act_tokens.size(); ++i)
-                kernels::cpu::native_quant_act(*s.act_formats[i], hx_ + (size_t) s.act_tokens[i] * g_.n_embd, act_ + i * kernels::cpu::kNativeActBytes);
-            tier_->pool()->run_split_multi_native(f, s.jobs.data(), (int) s.jobs.size());
-        });
-        if (!s.native_peer.empty()) s.peer_thread = std::thread([this, il, &s] {
-            core::PeerExperts* peer = tier_->peer();
-            float* mapped = peer->map_rows(hrows_ + s.pair.size()*g_.n_embd,s.peer_error);
-            if (!mapped) return;
-            int32_t ids[core::PeerExperts::kRowBatch];
-            const kernels::NativeExpertLayout* layouts[core::PeerExperts::kRowBatch];
-            float* input = tier_->host().xb;
-            for (size_t first = 0; first < s.native_peer.size(); first += core::PeerExperts::kRowBatch) {
-                const size_t count = std::min<size_t>(core::PeerExperts::kRowBatch,s.native_peer.size()-first);
-                for (size_t i = 0; i < count; ++i) {
-                    const auto [pair,e] = s.native_peer[first+i];
-                    ids[i] = e;
-                    layouts[i] = &m_.replacement(il,e)->layout;
-                    std::copy_n(hx_ + (size_t)(pair/g_.n_used)*g_.n_embd,g_.n_embd,input+i*g_.n_embd);
-                }
-                if (!peer->launch_rows(il,*layouts[0],input,ids,(int64_t)count,mapped+first*g_.n_embd,s.peer_error,layouts) ||
-                    !peer->finish(nullptr,s.peer_error)) return;
-            }
-        });
         return true;
     }
 
     // The rows of the CPU and the second card join the others'.
     bool finish_share(Share& s, void* stream, std::string& err) {
         s.join();
-        if (!s.peer_error.empty()) { err = s.peer_error; return false; }
         if (s.peer && !tier_->peer_share()->join(stream, err)) return false;
-        if (s.pair.empty() && s.native_peer.empty()) return true;
-        const size_t rows = s.pair.size()+s.native_peer.size(), n = (size_t) g_.n_embd;
+        if (s.pair.empty()) return true;
+        const size_t rows = s.pair.size(), n = (size_t) g_.n_embd;
         cudaMemcpyAsync(rows_ + (size_t) s.cpu_at * n, hrows_, rows * n * 4, cudaMemcpyHostToDevice, (cudaStream_t) stream);
         return true;
     }
@@ -704,7 +722,7 @@ private:
         }
         prepare_peer(0);
         if (m_.has_overlay())
-            basalt::log::info("basalt deepseek41", "overlay prompt: expert read-ahead, unchanged compute groups");
+            basalt::log::info("basalt deepseek41", "overlay prompt: expert read-ahead, native batches and peer share");
         return true;
     }
 
@@ -1069,7 +1087,7 @@ private:
     std::vector<void*> dev_;
     uint64_t allocated_bytes_ = 0;
     void *xq1_ = nullptr, *xq2_ = nullptr;
-    void *overlay_x_ = nullptr, *overlay_scratch_ = nullptr, *overlay_blob_ = nullptr;
+    void* overlay_blob_ = nullptr;
     cudaEvent_t replacement_copied_ = nullptr;
     bool replacement_copy_pending_ = false;
     int32_t *ident_ = nullptr, *sbnd_ = nullptr;

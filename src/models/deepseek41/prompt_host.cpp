@@ -52,7 +52,8 @@ bool PromptHost::open(const DsModel& m, int pieces, int slots, bool vision, std:
               pin(stage[0], (size_t) prefillp::kStageExperts * slot, kPortable) &&
               pin(stage[1], (size_t) prefillp::kStageExperts * slot, kPortable) &&
               pin(replacement_stage, (size_t)m.overlay_max_bytes(), kPortable) &&
-              pin(hx, (size_t) share_rows * n * 4, kPortable) && pin(hrows, (size_t) prefillp::kShareRows * n * 4, kMapped);
+              pin(hx, (size_t) share_rows * n * 4, m.has_overlay() ? kMapped : kPortable) &&
+              pin(hrows, (size_t) prefillp::kShareRows * n * 4, kMapped);
     act = ok ? (uint8_t*) platform::alloc_aligned(kernels::cpu::kNativeActBytes * (size_t) share_rows, 64) : nullptr;
     if (ok && m.has_overlay()) ok = pin(xb,(size_t)core::PeerExperts::kRowBatch*n*4,kPortable);
     if (!ok || !act) {
