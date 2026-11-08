@@ -22,6 +22,7 @@ namespace basalt::prefill {
 class PeerShare {
 public:
     static constexpr int kMaxBufs = 3;       ///< the most buffer sets
+    static constexpr int kQuantRows = 2048;  ///< rows held by the main card's quantization scratch
 
     struct Dims {
         int64_t n_embd = 0, n_ff = 0;   ///< a routed expert's [2 n_ff, n_embd] gate/up and [n_embd, n_ff] down
@@ -52,6 +53,7 @@ public:
         int q0 = 0, n = 0;                        ///< the launch's first expert in the group, and how many
         const uint8_t* const* blob = nullptr;     ///< their blobs, as `run` got them
         const int32_t* tok = nullptr;             ///< device: the token of each of the launch's rows
+        const int32_t* ident = nullptr;           ///< device: consecutive output row indices
         const int32_t* bounds = nullptr;          ///< device: n + 1 row bounds, relative to the launch's first row
         const int32_t* bounds_host = nullptr;     ///< the same bounds on the host
         int64_t rows = 0, max_rows = 0;           ///< its rows, and the most one expert has
@@ -59,6 +61,8 @@ public:
         int n_tokens = 0;
         bool first = false;                       ///< the layer's first launch
         float* out = nullptr;                     ///< rows x n_embd results
+        void* scratch = nullptr;                  ///< launch_rows * 2 * n_ff floats, available to custom products
+        void* quantized = nullptr;                ///< launch_rows of q8 inputs, available to custom products
     };
     /// One layer's formats and steps. The MMQ products read expert q of a launch's group at stage + q gu_stride (gate/up)
     /// and stage + down_off + q d_stride (down).  A layer whose up rows have their own type (`up_type` >= 0, not
@@ -69,8 +73,8 @@ public:
         size_t up_at = 0;
         size_t blob_bytes = 0, stride = 0;        ///< staging by copies: blob i of a group at stage + i stride
         size_t gu_stride = 0, down_off = 0, d_stride = 0;
-        /// Main card: the layer's activations x [n_tokens][n_embd] into `dst`; empty: q8_1 for the MMQ products.
-        std::function<void(const float* x, int n_tokens, void* dst, void* stream)> quantize;
+        /// Main card: activations into `dst`; scratch holds kQuantRows of MMQ q8_1. Empty: the MMQ quantizer.
+        std::function<void(const float* x, int n_tokens, void* dst, void* scratch, void* stream)> quantize;
         /// Second card: a group's blobs into its staged buffer; empty: copies of blob_bytes each.
         std::function<void(const std::vector<std::pair<const uint8_t*, bool>>& blobs, uint8_t* stage, void* stream)> stage;
         /// The step between the MMQ products: gu [rows][2 n_ff] -> h [rows][n_ff].
@@ -86,6 +90,7 @@ public:
         const int32_t* tok = nullptr;
         int n = 0;
         bool group = false;
+        std::shared_ptr<const Layer> layer;        ///< optional formats/products for this expert's group
     };
     /// Starts staging the first groups of the next `run`, whose experts (in that order) are known before its routing:
     /// their copies go on while the main card reads the layer's attention. `run` then takes the same experts, in order.

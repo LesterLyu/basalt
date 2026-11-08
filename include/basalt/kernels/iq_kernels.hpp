@@ -21,6 +21,8 @@ size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 
 /// q8_1 blocks for `n_rows` rows of `n_cols` floats (n_cols a multiple of 32): y is n_rows * n_cols/32 blocks.
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream);
+/// Gather row-major q8_1 blocks without requantization, including from mapped host memory.
+void gather_q8_1_rows(const void* x, const int32_t* tokens, int64_t rows, int64_t cols, void* y, void* stream);
 /// quantize_q8_1_rows that also copies `n_words` 32-bit words from `src` to `dst` in the same launch.  Every pointer
 /// may be mapped host memory: the card's SMs read it, so a copy queued on the card's copy engines does not delay it.
 void quantize_q8_1_rows_copy(const float* x, int64_t n_rows, int64_t n_cols, void* y, const void* src, void* dst,
