@@ -7,6 +7,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/model/adapter.hpp"
 #include "basalt/core/ram_load.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ngram/ple_reader.hpp"
 #include "basalt/models/deepseek41/vision.hpp"
@@ -95,7 +96,7 @@ public:
         }
         usage.host["expert_swap_workspace"] += swap_pool_bytes_;
         if (engram_) usage.host["engram_reader"] += engram_->allocated_bytes();
-        for (const auto& [name, t] : dev_) if (t.ptr) usage.device(device_, "weights", t.bytes);
+        if (dense_) usage.device(device_, "weights", dense_->capacity());
     }
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -160,6 +161,7 @@ private:
     Pack pack_;
     model::ModelDesc desc_;
     std::map<std::string, DevTensor> dev_;
+    std::unique_ptr<core::DeviceArena> dense_;
     std::string diag_dump_, path_;
     int diag_tier_ram_ = -1, diag_tier_vram_ = -1;
     int peer_device_ = -1;
