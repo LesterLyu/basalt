@@ -19,6 +19,39 @@ from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer
 
+
+class CancelledPromptBookkeeping(unittest.TestCase):
+    def test_solo_prefill_keeps_only_completed_rows_for_slot_selection(self):
+        engine = ProcessEngine.__new__(ProcessEngine)
+        engine.slot_held = [[], []]
+        engine.slot_used = [0, 0]
+        engine.slot_busy = [False, False]
+        engine.slot_keys = [None, None]
+        engine.slot_order = [0, 1]
+        prompt = list(range(30))
+        engine.last = {"finish": "cancel", "reused": 4, "prompt_read": 8}
+        engine._solo_kept(1, prompt, [])
+        self.assertEqual(engine.slot_held[1], prompt[:12])
+        self.assertEqual(engine.pick_slot(prompt + [30]), 1)
+        self.assertFalse(engine._resumes(1, [99] + prompt))
+
+    def test_solo_cancel_does_not_invent_unreported_progress(self):
+        engine = ProcessEngine.__new__(ProcessEngine)
+        engine.slot_held, engine.slot_used = [[]], [0]
+        engine.last = {"finish": "cancel", "reused": 4}
+        engine._solo_kept(0, list(range(20)), [])
+        self.assertEqual(engine.slot_held[0], list(range(4)))
+        engine.last = {"finish": "cancel", "reused": 0, "prompt_read": 0}
+        engine._solo_kept(0, list(range(20)), [])
+        self.assertEqual(engine.slot_held[0], [])
+
+    def test_solo_decode_keeps_every_fed_token_except_the_last(self):
+        engine = ProcessEngine.__new__(ProcessEngine)
+        engine.slot_held, engine.slot_used = [[]], [0]
+        engine.last = {"finish": "cancel", "reused": 4, "prompt_read": 8}
+        engine._solo_kept(0, [1, 2, 3], [4, 5, 6])
+        self.assertEqual(engine.slot_held[0], [1, 2, 3, 4, 5])
+
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
 # GEN (solo) streams T lines; BGEN reads the prompt (one T line, DONE), answers BADM and continues in the slot.
 # A window gives a slot up to MULTI tokens in ONE line, `BT <slot> <id> [<id> ..]`.

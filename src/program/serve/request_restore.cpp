@@ -127,7 +127,10 @@ Flow Request::restore() {
     own_slot = in_slot ? slot_b : runtime_.slot0_solo() ? 0 : -1;
     if (runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached) respell_prompt();
     if (runtime_.o.prompt_cache > 0 && want_cvec == runtime_.cvec_cached) {
-        if (runtime_.live_ok && starts_with(runtime_.live, runtime_.live_imgs)) { resume = (int64_t) runtime_.live.size(); from_live = true; }
+        if (runtime_.live_ok && live_resume_allowed() && starts_with(runtime_.live, runtime_.live_imgs)) {
+            resume = (int64_t) runtime_.live.size();
+            from_live = true;
+        }
         for (const ConvCheckpoint& c : runtime_.checks)
             if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
                 resume = (int64_t) c.ids.size();
