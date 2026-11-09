@@ -135,6 +135,20 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
+def _leading_tool_items(items) -> list[int]:
+    """Initial declarations belong to the template header; later discovery stays in place."""
+    leading = []
+    for i, item in enumerate(items if isinstance(items, list) else []):
+        if not isinstance(item, dict):
+            break
+        kind = item.get("type") or ("message" if "role" in item else None)
+        if kind == "additional_tools":
+            leading.append(i)
+        elif kind != "message" or item.get("role") not in ("system", "developer"):
+            break
+    return leading
+
+
 def input_messages(req: dict) -> list[dict]:
     """`instructions` + `input` -> the chat template's messages."""
     messages = []
@@ -151,6 +165,7 @@ def input_messages(req: dict) -> list[dict]:
         raise ResponsesError("input must be a string or an array of input items", "input")
     thinking = []                                    # reasoning waiting for the assistant turn it belongs to
     open_turn = None                                 # the assistant message the next function_call joins
+    leading_tools = _leading_tool_items(items)
 
     def turn(content=""):
         nonlocal open_turn
@@ -221,7 +236,17 @@ def input_messages(req: dict) -> list[dict]:
             open_turn = None
             thinking.clear()
         elif kind == "additional_tools":
-            continue                                 # declarations are handled by request_tools
+            # Codex prepends these before developer instructions after compaction.
+            # template_kwargs renders them as native tools, without demoting those instructions.
+            if i in leading_tools:
+                continue
+            found = item.get("tools")
+            if isinstance(found, list) and found:
+                messages.append({"role": "user", "content":
+                                 "Additional callable tools (call namespaced tools as namespace.name):\n" +
+                                 json.dumps(found, ensure_ascii=False)})
+                open_turn = None
+                thinking.clear()
         elif kind == "item_reference":
             raise ResponsesError("item references need stored responses, and this server keeps none: send the items "
                                  "themselves", param, "unsupported_parameter")
@@ -392,9 +417,20 @@ def requested_logprobs(req: dict) -> int | None:
 def template_kwargs(req: dict) -> dict:
     effort = (req.get("reasoning") or {}).get("effort")
     try:
-        return effort_kwargs(effort)
+        kwargs = effort_kwargs(effort)
     except ValueError as e:
         raise ResponsesError(str(e), "reasoning.effort") from None
+    if isinstance(req.get("input"), list) and any(isinstance(item, dict) and item.get("type") in
+            ("additional_tools", "tool_search_output") for item in req["input"]):
+        # Keep initial tools in the native schema/DSML header. Only later discovery stays
+        # in the conversation, so loading a plugin does not invalidate the cached prefix.
+        header = list(req.get("tools") or [])
+        for i in _leading_tool_items(req["input"]):
+            found = req["input"][i].get("tools")
+            if isinstance(found, list):
+                header.extend(found)
+        kwargs["_prompt_tools"] = request_tools({"tools": header, "tool_choice": req.get("tool_choice")})[0]
+    return kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output
