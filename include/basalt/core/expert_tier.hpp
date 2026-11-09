@@ -253,6 +253,11 @@ public:
     kernels::cpu::ExpertPool* pool() const { return pool_.get(); }
     const kernels::cpu::NativeFmt& fmt(int layer) const { return fmt_[(size_t) layer]; }
 
+    const kernels::cpu::NativeFmt& fmt(int layer, int expert) const {
+        const auto* r = replacement(layer, expert);
+        return r ? *r->cpu : fmt(layer);
+    }
+
     /// The VRAM slots open now, every layer's.
     int64_t slots() const { return live_base() + (int64_t) n_layers_ * ext_per_layer_; }
     /// The experts the GPUs hold now: the main card's (the caller's device) and each second card's slots and the VRAM their
