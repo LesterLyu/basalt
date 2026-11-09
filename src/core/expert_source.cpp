@@ -2071,7 +2071,9 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     // device aliases of the mapped registration, for the PCIe share of the misses
     dev_slice_.clear();
     slice_bytes_ = a->slice_bytes;
-    if (a->registered_bytes > 0) {
+    if (a->allocation.allocation_pinned()) {
+        dev_slice_.push_back(base_);
+    } else if (a->registered_bytes > 0) {
         std::vector<uint64_t> starts = a->slice_bytes > 0 ? a->slice_starts : std::vector<uint64_t>{0};
         for (uint64_t off : starts) {
             void* d = nullptr;

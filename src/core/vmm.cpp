@@ -109,15 +109,17 @@ uint64_t host_granularity() {
     return host_prop(prop, g) ? g : 0;
 }
 
-uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
+uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped, HostBacking backing) {
     mapped = 0;
     const Fns& v = fns();
     CUmemAllocationProp prop{};
     size_t g = 0;
-    if (!bytes || !host_prop(prop, g) || kHostPieceBytes % g != 0) return nullptr;
+    if (!bytes || !host_prop(prop, g)) return nullptr;
+    if (backing == HostBacking::Bounded && kHostPieceBytes % g != 0) return nullptr;
     const int dev = current_device();
     if (bytes > SIZE_MAX - (g - 1)) return nullptr;
     size_t n = (bytes + g - 1) / g * g;
+    const uint64_t stride = backing == HostBacking::Bounded ? kHostPieceBytes : n;
     CUdeviceptr p = 0;
     const auto refused = [&](const char* op, CUresult error, uint64_t off) {
         basalt::log::warn("basalt memory", "host VMM %s at %.2f of %.2f GiB on CUDA%d failed (driver code %d)",
@@ -127,7 +129,7 @@ uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
     if (error != CUDA_SUCCESS) { refused("reserve", error, 0); return nullptr; }
     uint64_t off = 0;
     for (; off < n;) {
-        const uint64_t piece = std::min<uint64_t>(kHostPieceBytes, n - off);
+        const uint64_t piece = std::min<uint64_t>(stride, n - off);
         CUmemGenericAllocationHandle h;
         const char* op = "create";
         error = v.create(&h, piece, &prop, 0);
@@ -145,8 +147,8 @@ uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
             }
         }
         refused(op, error, off);
-        for (uint64_t at = 0; at < off; at += kHostPieceBytes)
-            v.unmap(p + at, std::min<uint64_t>(kHostPieceBytes, off - at));
+        for (uint64_t at = 0; at < off; at += stride)
+            v.unmap(p + at, std::min<uint64_t>(stride, off - at));
         v.address_free(p, n);
         return nullptr;
     }
@@ -154,11 +156,12 @@ uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped) {
     return reinterpret_cast<uint8_t*>(p);
 }
 
-void free_host(uint8_t* ptr, uint64_t mapped) {
+void free_host(uint8_t* ptr, uint64_t mapped, HostBacking backing) {
     if (!ptr) return;
     auto p = reinterpret_cast<CUdeviceptr>(ptr);
-    for (uint64_t off = 0; off < mapped; off += kHostPieceBytes)
-        fns().unmap(p + off, std::min<uint64_t>(kHostPieceBytes, mapped - off));
+    const uint64_t stride = backing == HostBacking::Bounded ? kHostPieceBytes : mapped;
+    for (uint64_t off = 0; off < mapped; off += stride)
+        fns().unmap(p + off, std::min<uint64_t>(stride, mapped - off));
     fns().address_free(p, mapped);
 }
 

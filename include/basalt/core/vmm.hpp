@@ -17,9 +17,11 @@ uint64_t granularity();
 /// The minimum host allocation granularity on the current device, or 0 without host VMM.
 uint64_t host_granularity();
 /// CUDA-pinned system memory accessible to the CPU and current GPU; other GPUs may copy through host endpoints.
-/// Returns the padded mapping size for free_host; no portable registration is involved.
-uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped);
-void free_host(uint8_t* ptr, uint64_t mapped);
+/// Bounded backing lets a large arena exceed the driver's single-allocation allowance. Layer spans keep one backing.
+/// Returns the padded mapping size; free_host must receive the same backing policy. No portable registration is involved.
+enum class HostBacking { Whole, Bounded };
+uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped, HostBacking backing = HostBacking::Whole);
+void free_host(uint8_t* ptr, uint64_t mapped, HostBacking backing = HostBacking::Whole);
 /// Reserves `bytes` of address space (a multiple of the granularity); null on failure.
 uint8_t* reserve(uint64_t bytes);
 void release_range(uint8_t* va, uint64_t bytes);

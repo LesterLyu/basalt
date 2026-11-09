@@ -445,7 +445,7 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     if (!bytes) return true;
     if (bytes > SIZE_MAX - ((2ull << 20) - 1)) return false;
     if constexpr (platform::kPreferHostVmm) {
-        if (pin) data_ = vmm::alloc_host(bytes, capacity_);
+        if (pin) data_ = vmm::alloc_host(bytes, capacity_, vmm::HostBacking::Bounded);
         allocation_pinned_ = data_ != nullptr;
     }
     if (!data_) {
@@ -458,7 +458,7 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
 }
 
 void RamAllocation::reset() {
-    if (allocation_pinned_) vmm::free_host(data_, capacity_);
+    if (allocation_pinned_) vmm::free_host(data_, capacity_, vmm::HostBacking::Bounded);
     else platform::free_aligned(data_);
     data_ = nullptr;
     bytes_ = capacity_ = 0;

@@ -1,5 +1,6 @@
 // Registration ownership, independent mapped aliases and host endpoints on every visible card.
 #include "basalt/core/ram_load.hpp"
+#include "basalt/core/pinned.hpp"
 #include "basalt/core/vmm.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -149,6 +150,14 @@ int main() {
         const bool host_vmm = vmm::host_granularity() > 0;
         if (!host_vmm) std::printf("host VMM unavailable; ordinary registration tested\n");
         if (host_vmm) {
+            {
+                PinnedArena arena(chunk + 1);
+                require(arena.valid() && arena.allocation.allocation_pinned(), "full resident arena host mapping");
+                require(arena.registered_bytes == arena.capacity && arena.capacity >= chunk + 1,
+                        "full resident arena pin extent");
+                std::memset(arena.data(), 0x39, chunk + 1);
+                roundtrip(arena.data(), chunk + 1, cards);
+            }
             // One expert can straddle the boundary between two physical backing allocations.
             constexpr uint64_t boundary = 2ull << 30;
             RamAllocation spanning;
