@@ -83,7 +83,7 @@ public:
         if (ops_) ops_->memory_usage(usage);
         if (prefill_) prefill_->memory_usage(usage);
         if (vis_) usage.device(m_.device(), "vision", vis_->device_bytes());
-        usage.host["decode_workspace"] += host_allocated_bytes_ + emb4_.capacity() * sizeof(float) + hist_.capacity() * sizeof(int32_t);
+        usage.host["decode_workspace"] += host_allocated_bytes_ + hist_.capacity() * sizeof(int32_t);
         if (drafter_ && usage.claim(drafter_.get()))
             usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
     }
