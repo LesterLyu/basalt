@@ -1,4 +1,5 @@
 // src/models/deepseek41/model.cpp - loads a DeepSeek-V4.1 pack onto the GPU.
+#include "basalt/core/memory_audit.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/expert_tier.hpp"
@@ -176,6 +177,7 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
         return false;
     }
 
+    core::MemoryAuditScope weight_audit("model-weights");
     // dense tensors to the device; the token embedding and the Engram table stay in the file
     uint64_t total = 0;
     const int dense_file = plan.file_fd(embd_fd_);
@@ -197,6 +199,7 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
             err = "out of device memory loading " + name;
             return false;
         }
+        weight_audit.requested(d.bytes);
         core::LoadItem it;
         it.file = dense_file;
         it.off = t.offset;
@@ -208,6 +211,7 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
         total += d.bytes;
         dev_.emplace(name, std::move(d));
     }
+    weight_audit.finish();
     basalt::log::info("basalt deepseek41", "%zu dense tensors, %.2f GiB on the GPU", dev_.size(),
                  (double) total / (1024.0 * 1024.0 * 1024.0));
 

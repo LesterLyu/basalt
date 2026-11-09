@@ -9,6 +9,7 @@
 #include "basalt/models/builtin.hpp"
 #include "basalt/program/gpu_select.hpp"
 #include "basalt/program/options.hpp"
+#include "basalt/core/memory_audit.hpp"
 
 #include <memory>
 #include <optional>
@@ -24,6 +25,7 @@ int run(int argc, char** argv) {
     const basalt::model::ModelAdapter* adapter = nullptr;
     if (const auto code = cli::start(argc, argv, options, adapter)) return *code;
     basalt::program::CommonOptions& common = *options;
+    basalt::core::enable_memory_audit(common.diag_memory);
     std::string placement_error;
     if (!basalt::platform::parse_cpu_list(common.pool_cpus_text, common.pool_cpus, placement_error)) {
         basalt::log::error("basalt", "--pool-cpus: %s", placement_error.c_str());

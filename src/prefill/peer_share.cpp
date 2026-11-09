@@ -17,6 +17,8 @@
 #include "basalt/prefill/peer_share.hpp"
 
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/memory_usage.hpp"
+#include "basalt/core/memory_audit.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
 
@@ -53,6 +55,7 @@ struct PeerShare::Impl {
     int main = -1, peer = -1;
     Dims d;
     std::vector<void*> dev_peer, host;
+    uint64_t peer_allocated = 0, main_allocated = 0;
     // main card
     cudaStream_t s_main = nullptr, s_rows = nullptr;
     cudaEvent_t ev_x = nullptr, ev_xq = nullptr, ev_end = nullptr, ev_rows[kMaxBufs] = {};
@@ -261,9 +264,15 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
     {
         m->peer = peer_device;
         const core::OnDevice od(peer_device);
+        core::MemoryAuditScope audit("peer-prefill");
         layout(d, [&](size_t b) {
             void* p = nullptr;
-            if (ok && cudaMalloc(&p, b) == cudaSuccess) pv.push_back(p), m->dev_peer.push_back(p);
+            if (ok && cudaMalloc(&p, b) == cudaSuccess) {
+                pv.push_back(p);
+                m->dev_peer.push_back(p);
+                m->peer_allocated += b;
+                audit.requested(b);
+            }
             else ok = false;
         }, [](size_t) {});
         ok = ok && cudaStreamCreateWithFlags(&m->s_stage, cudaStreamNonBlocking) == cudaSuccess &&
@@ -294,6 +303,7 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
     {
         m->main = main_device;
         const core::OnDevice od(main_device);
+        core::MemoryAuditScope audit("peer-quantization");
         int lo = 0, hi = 0;
         cudaDeviceGetStreamPriorityRange(&lo, &hi);
         ok = ok && cudaStreamCreateWithFlags(&m->s_main, cudaStreamNonBlocking) == cudaSuccess &&
@@ -303,6 +313,10 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
              cudaEventCreateWithFlags(&m->ev_end, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < kMaxBufs; ++b) ok = cudaEventCreateWithFlags(&m->ev_rows[b], cudaEventDisableTiming) == cudaSuccess;
         ok = ok && cudaMalloc(&m->dxq, mmq::q8_bytes(kQuantRows, d.n_embd)) == cudaSuccess;
+        if (m->dxq) {
+            m->main_allocated = mmq::q8_bytes(kQuantRows, d.n_embd);
+            audit.requested(m->main_allocated);
+        }
         layout(d, [](size_t) {}, [&](size_t b) {
             void* p = nullptr;
             if (ok && cudaHostAlloc(&p, b, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess)
@@ -328,6 +342,13 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
     m->worker = std::thread([w] { w->work(); });
     m_ = std::move(m);
     return true;
+}
+
+void PeerShare::memory_usage(core::MemoryUsage& usage) const {
+    if (!m_ || !usage.claim(this)) return;
+    usage.device(m_->main, "long_prefill", m_->main_allocated);
+    usage.device(m_->peer, "long_prefill", m_->peer_allocated);
+    if (m_->ctx) usage.device(m_->peer, "mmq_buffers", m_->ctx->allocated_bytes());
 }
 
 void PeerShare::prepare(const Layer& L, const std::vector<Expert>& experts) {

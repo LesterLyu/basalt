@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <map>
 #include <vector>
 #include "basalt/log.hpp"
 
@@ -1179,6 +1180,13 @@ bool stream_capturing(void* stream) {
 // smaller than its live one, so a slot holds about 4 MB at most (0.5 MB for the engine's <= 16 rows).  nullptr
 // when the memory cannot be had, and the caller falls back to the one-block kernel; a failed grow is remembered, so
 // later calls of that size do not retry cudaMalloc each time.
+std::mutex sampler_memory_mutex;
+std::map<int, uint64_t> sampler_memory;
+void note_sampler_allocation(int device, uint64_t bytes) {
+    std::lock_guard<std::mutex> lock(sampler_memory_mutex);
+    sampler_memory[device] += bytes;
+}
+
 int2* split_scratch(void* stream, size_t entries, unsigned** done) {
     struct Slot {
         int device;
@@ -1214,6 +1222,7 @@ int2* split_scratch(void* stream, size_t entries, unsigned** done) {
             return nullptr;
         }
         slot->done = d;
+        note_sampler_allocation(device, kSplitMaxRows * sizeof(unsigned));
     }
     *done = slot->done;
     if (slot->entries >= entries) return slot->ptr;
@@ -1231,6 +1240,7 @@ int2* split_scratch(void* stream, size_t entries, unsigned** done) {
             return nullptr;
         }
     }
+    note_sampler_allocation(device, want * sizeof(int2));
     if (slot->ptr != nullptr) retired.push_back(slot->ptr);
     slot->ptr = ptr;
     slot->entries = want;
@@ -1520,6 +1530,7 @@ bool wide_buffers(void* stream, int n_vocab, WideBuffers& out) {
             (void) cudaGetLastError();
             return false;
         }
+        note_sampler_allocation(device, 4 * row + 2 * chunks + state + temp);
         if (slot->base != nullptr) retired.push_back(slot->base);
         slot->base = base;
         slot->n_vocab = n_vocab;
@@ -1607,6 +1618,12 @@ void sample_wide(const float* logits, int n_tokens, int n_vocab, const int* hist
 }
 
 }  // namespace
+
+uint64_t sampler_cache_bytes(int device) {
+    std::lock_guard<std::mutex> lock(sampler_memory_mutex);
+    const auto it = sampler_memory.find(device);
+    return it == sampler_memory.end() ? 0 : it->second;
+}
 
 bool sampler_wide_reserve(int n_vocab, void* stream) {
     WideBuffers w{};

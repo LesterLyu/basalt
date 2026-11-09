@@ -34,8 +34,12 @@ namespace basalt::core {
 void ExpertTier::memory_usage(MemoryUsage& usage) const {
     if (!usage.claim(this)) return;
     usage.device(device_, "experts", cache_.mapped_bytes() + ext_.mapped_bytes());
-    for (const auto& peer : peers_)
+    for (const auto& peer : peers_) {
         usage.device(peer->device(), "expert_helper", peer->cache().mapped_bytes());
+        usage.device(peer->device(), "scratch", peer->device_scratch_bytes());
+    }
+    for (const auto& share : shares_)
+        if (share) share->memory_usage(usage);
     for (const auto& alloc : ram_allocations_)
         usage.host["resident_experts"] += alloc.capacity();
     for (const auto& pin : ram_pins_) {
