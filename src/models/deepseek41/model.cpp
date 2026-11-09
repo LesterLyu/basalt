@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <sstream>
 
 namespace basalt::models::deepseek41 {
@@ -30,8 +31,7 @@ DsModel::~DsModel() {
     shared_tier_.tier.reset();
     tier_profile_.report();
     overlay_.clear();
-    for (auto& [name, t] : dev_)
-        if (t.ptr) cudaFree(t.ptr);
+    dense_.reset();
     if (embd_fd_ >= 0) platform::close_fd(embd_fd_);
     if (experts_fd_ >= 0) platform::close_fd(experts_fd_);
 }
@@ -183,6 +183,28 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
     const int dense_file = plan.file_fd(embd_fd_);
     int dense_device = 0;
     if (cudaGetDevice(&dense_device) != cudaSuccess) dense_device = 0;
+    uint64_t arena_bytes = 0;
+    for (const auto& [name, t] : pack_.tensors) {
+        if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") continue;
+        const bool wide_gate = t.type == 30 && name.find("ffn_gate_inp.weight") != std::string::npos;
+        const uint64_t limit = std::numeric_limits<uint64_t>::max();
+        if (wide_gate && t.bytes > limit / 2) { err = "dense tensor size overflow: " + name; return false; }
+        const uint64_t bytes = wide_gate ? t.bytes * 2 : t.bytes;
+        const uint64_t padding = (256 - arena_bytes % 256) % 256;
+        if (padding > limit - arena_bytes || bytes > limit - arena_bytes - padding) {
+            err = "dense arena size overflow: " + name;
+            return false;
+        }
+        arena_bytes += padding + bytes;
+    }
+    try {
+        // One owner, with aligned views for every tensor; no per-tensor allocation slack.
+        dense_ = std::make_unique<core::DeviceArena>(arena_bytes, device_);
+    } catch (const core::CudaError& e) {
+        err = std::string("cannot allocate dense weights: ") + e.what();
+        return false;
+    }
+    weight_audit.requested(arena_bytes);
     for (const auto& [name, t] : pack_.tensors) {
         if (name == "token_embd.weight" || name == "per_layer_token_embd.weight") continue;
         DevTensor d;
@@ -195,11 +217,12 @@ bool DsModel::load(const std::string& path, core::LoadPlan& plan, std::string& e
             d.type = 0;
             d.bytes = t.bytes * 2;
         }
-        if (cudaMalloc(&d.ptr, d.bytes) != cudaSuccess) {
-            err = "out of device memory loading " + name;
+        try {
+            d.ptr = dense_->alloc(d.bytes);
+        } catch (const core::CudaError& e) {
+            err = "cannot place dense tensor " + name + ": " + e.what();
             return false;
         }
-        weight_audit.requested(d.bytes);
         core::LoadItem it;
         it.file = dense_file;
         it.off = t.offset;
