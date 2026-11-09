@@ -24,8 +24,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -273,9 +275,11 @@ private:
     /// The plan of a share in h_meta_ (and row_of_): its groups and entries, or false when an entry is not resident.
     bool plan(int64_t layer, const int32_t* ids, int64_t n_tok, int64_t k, const int32_t* kind, int& groups, int& rows,
               std::string& err, int plan_index = 0);
+    using LaunchKey = std::tuple<int, int, int, int64_t, int, int, int, float, const float*, float*>;
+    std::map<LaunchKey, cudaGraphExec_t> launch_graphs_;
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err, float* out,
-                       const kernels::NativeExpertLayout* const* layouts = nullptr, int plan = 0);
+                       const kernels::NativeExpertLayout* const* layouts = nullptr, int plan_index = 0, bool mixed = false);
 };
 
 }  // namespace basalt::core

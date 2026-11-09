@@ -65,6 +65,9 @@ void PeerExperts::close() {
         On on(device_);
         if (stream_) cudaStreamSynchronize(stream_);
         if (refill_) cudaStreamSynchronize(refill_);
+        for (const auto& [key, graph] : launch_graphs_)
+            if (graph) cudaGraphExecDestroy(graph);
+        launch_graphs_.clear();
         cache_.close();
         if (d_x_) cudaFree(d_x_);
         if (d_out_) cudaFree(d_out_);
@@ -625,7 +628,7 @@ bool PeerExperts::run_fetched(std::string& err) {
 
 bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
                                 int64_t n_tok, int64_t k, const int32_t* kind, std::string& err, float* out,
-                                const kernels::NativeExpertLayout* const* layouts, int plan_index) {
+                                const kernels::NativeExpertLayout* const* layouts, int plan_index, bool mixed) {
     if (layouts) {
         const int64_t n = n_tok * k;
         if (n < 0 || n > CAP) { err = "peer experts: window too large"; return false; }
@@ -643,14 +646,14 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
             std::fill(mask, mask + n, 0);
             for (int64_t j = i; j < n; ++j) {
                 const auto& q = layouts[j] ? *layouts[j] : L;
-                if (kind[j] == 2 && q.gu_type == f.gu_type && q.d_type == f.d_type &&
+                if (kind[j] == 2 && q.gu_type == f.gu_type && q.up_type == f.up_type && q.d_type == f.d_type &&
                     q.n_embd == f.n_embd && q.n_ff == f.n_ff && q.swiglu_limit == f.swiglu_limit) {
                     mask[j] = 2; done[j] = 1;
                 }
             }
             // Distinct pinned plans stay alive until finish(). Device metadata and scratch
             // are reused in stream order without waiting on the host between formats.
-            if (!launch_layout(layer, f, x, ids, n_tok, k, mask, err, out, nullptr, next_plan++)) return false;
+            if (!launch_layout(layer, f, x, ids, n_tok, k, mask, err, out, nullptr, next_plan++, true)) return false;
         }
         return true;
     }
@@ -671,27 +674,63 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
             if (!ck(cudaHostGetDevicePointer((void**) &x_map_, const_cast<float*>(x), 0), "mapped activations", err)) return false;
             x_host_ = x;
         }
-        basalt::kernels::quantize_q8_1_rows_copy(x_map_, n_tok, n_embd_, d_q8_, (Meta*)meta_map_+plan_index, d_meta_, (int) (sizeof(Meta) / 4), s);
-    } else {
-        // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
-        if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * n_embd_) * sizeof(float));
-        if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-            !ck(cudaMemcpyAsync(d_meta_, &m, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
-            return false;
-        basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
     }
-    Meta* dm = (Meta*)d_meta_;
-    basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
-    basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
-                                           d_scratch_, d_out_, s);
-    basalt::kernels::native_grouped_set_mma_hint(false);
-    if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
-        try {
-            basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, n_embd_, s);
-        } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
-        launched_direct_ = true;
+    const auto enqueue = [&]() -> bool {
+        if (meta_map_) {
+            // Mixed formats share one activation block. Later plans only replace the metadata.
+            basalt::kernels::quantize_q8_1_rows_copy(x_map_, plan_index ? 0 : n_tok, n_embd_, d_q8_,
+                (Meta*)meta_map_+plan_index, d_meta_, (int)(sizeof(Meta)/4), s);
+        } else {
+            // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
+            if (!plan_index && !direct) std::memcpy(h_x_, x, (size_t) (n_tok * n_embd_) * sizeof(float));
+            if ((!plan_index && !ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * n_embd_) * sizeof(float),
+                                              cudaMemcpyHostToDevice, s), "input", err)) ||
+                !ck(cudaMemcpyAsync(d_meta_, &m, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+                return false;
+            if (!plan_index) basalt::kernels::quantize_q8_1_rows(d_x_, n_tok, n_embd_, d_q8_, s);
+        }
+        Meta* dm = (Meta*)d_meta_;
+        basalt::kernels::native_grouped_set_mma_hint(rows >= 2 * groups);   // several entries per expert
+        basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
+                                               d_scratch_, d_out_, s);
+        basalt::kernels::native_grouped_set_mma_hint(false);
+        if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
+            try {
+                basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, n_embd_, s);
+            } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
+        }
         return true;
+    };
+    cudaGraphExec_t graph = nullptr;
+    if (mixed && meta_map_) {
+        const auto key = std::make_tuple(L.gu_type,L.up_type,L.d_type,n_tok,groups,rows,plan_index,L.swiglu_limit,x_map_,out);
+        auto found = launch_graphs_.find(key);
+        // Keep uncommon shapes on the same native path without unbounded driver allocations.
+        if (found == launch_graphs_.end() && launch_graphs_.size() < 256) {
+            found = launch_graphs_.emplace(key,nullptr).first;
+            cudaGraph_t captured = nullptr;
+            if (cudaStreamBeginCapture(s,cudaStreamCaptureModeRelaxed) == cudaSuccess) {
+                bool ok = false;
+                try { ok = enqueue(); }
+                catch (...) {
+                    cudaStreamEndCapture(s,&captured);
+                    if (captured) cudaGraphDestroy(captured);
+                    throw;
+                }
+                const auto status = cudaStreamEndCapture(s,&captured);
+                if (ok && status == cudaSuccess && captured)
+                    (void)cudaGraphInstantiateWithFlags(&found->second,captured,0);
+                if (captured) cudaGraphDestroy(captured);
+                if (!ok) return false;
+            }
+            if (!found->second) (void)cudaGetLastError();
+        }
+        if (found != launch_graphs_.end()) graph = found->second;
     }
+    if (graph) {
+        if (!ck(cudaGraphLaunch(graph,s),"launch graph",err)) return false;
+    } else if (!enqueue()) return false;
+    if (direct) { launched_direct_ = true; return true; }
     return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, s),
               "results", err);
 }

@@ -4,6 +4,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
+#include "basalt/core/device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/models/deepseek41/attn.hpp"
@@ -22,6 +23,7 @@
 #include <atomic>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <vector>
 
 namespace basalt::models::deepseek41 {
@@ -110,6 +112,11 @@ public:
         : m_(m), g_(m.geo()), ctx_((int) m.context()), fmt_(m.cache_format()), lat_b_(ctxp::latent_row_bytes(fmt_)),
           idx_b_(ctxp::index_row_bytes(fmt_)) {}
     ~KernelOps() override {
+        if (!overlay_graphs_.empty()) cudaDeviceSynchronize();
+        for (auto& [key, g] : overlay_graphs_) {
+            if (g.exec) cudaGraphExecDestroy(g.exec);
+            if (g.host) cudaFreeHost(g.host);
+        }
         for (cudaGraphExec_t e : share_g_)
             if (e) cudaGraphExecDestroy(e);
         for (cudaEvent_t e : br_ev_)
@@ -120,6 +127,8 @@ public:
     }
 
     void memory_usage(core::MemoryUsage& usage) const override {
+        for (const auto& [key, g] : overlay_graphs_)
+            if (g.host) usage.host["decode_workspace"] += sizeof(WindowPlan);
         uint64_t kv = state_bytes_;
         for (const auto& b : el_kv_) if (b) kv += b->backed();
         for (const auto& b : el_ik_) if (b) kv += b->backed();
@@ -850,15 +859,16 @@ public:
         int entries = 0;
         const int nhits = make_plan(plan, false, entries);
         if (nhits) gpu_share(plan, ex_plan_, nhits, entries);
+        if (m_.has_overlay()) run_overlay(il, T, K, h_ids_, lk, stream, false);
         if (n_fetched) {
             tier_->submit_fetch();
             const int ng = make_plan(plan, true, entries);
             tier_->await_fetch(st);
             if (ng) gpu_share(plan, ex_plan2_, ng, entries);
+            if (m_.has_overlay()) run_overlay(il, T, K, h_ids_, lk, stream, true);
         }
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !m_.has_overlay() && !peer->run_fetched(err)) return false;
-        if (m_.has_overlay()) run_overlay(il, T, K, h_ids_, lk, stream);
         gpu_profile.stop();
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
@@ -1019,6 +1029,7 @@ public:
         } else if (!shared_out && nhits) {
             gpu_share();
         }
+        if (m_.has_overlay()) run_overlay(il, 1, K, lk.experts, lk, stream, false);
         if (n_fetched) {
             tier_->submit_fetch();
             ExpertPlan plan2;
@@ -1030,10 +1041,10 @@ public:
                 kernels::native_expert_grouped_clamped(L, g_.clamp_exp[(size_t) il], dp->ptr, dp->start, dp->ng, dp->dst, dp->tok,
                                                        ng, ng, ex_xq_, ex_scr_, ex_rows_, stream);
             }
+            if (m_.has_overlay()) run_overlay(il, 1, K, lk.experts, lk, stream, true);
         }
         // the second card's fetched experts run once their copies land, long after these launches
         if (peer && !m_.has_overlay() && !peer->run_fetched(err)) return false;
-        if (m_.has_overlay()) run_overlay(il, 1, K, lk.experts, lk, stream);
         gpu_profile.stop();
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
@@ -1094,16 +1105,16 @@ private:
         *p = v;
         return true;
     }
-    void run_overlay(int layer, int rows, int k, const int32_t* ids, const ExpertTier::Lookup& lk, void* stream) {
+    void run_overlay(int layer, int rows, int k, const int32_t* ids, const ExpertTier::Lookup& lk, void* stream, bool fetched) {
         bool done[ExpertTier::kMaxK]{};
         for (int u = 0; u < lk.k; ++u) {
             const auto* v = m_.replacement(layer, lk.experts[u]);
-            if (!v || !lk.dev[u] || done[u]) continue;
+            if (!v || !lk.dev[u] || lk.fetched[u] != fetched || done[u]) continue;
             WindowPlan p{};
             int groups = 0, entries = 0;
             for (int j = u; j < lk.k; ++j) {
                 const auto* w = m_.replacement(layer, lk.experts[j]);
-                if (!w || !lk.dev[j] || w->layout.gu_type != v->layout.gu_type || w->layout.d_type != v->layout.d_type) continue;
+                if (!w || !lk.dev[j] || lk.fetched[j] != fetched || w->layout.gu_type != v->layout.gu_type || w->layout.d_type != v->layout.d_type) continue;
                 done[j] = true;
                 p.ptr[groups] = (unsigned long long)lk.dev[j];
                 p.start[groups++] = entries;
@@ -1113,12 +1124,57 @@ private:
             }
             p.start[groups] = entries;
             p.ng[0] = groups;
-            // Plan words are passed by value; scratch and device metadata are reused in stream order.
-            put_words(&p, ex_plan2_, (int)(sizeof(p)/4), stream);
-            auto* dp = (WindowPlan*)ex_plan2_;
-            kernels::native_expert_grouped_clamped(v->layout, g_.clamp_exp[layer], dp->ptr, dp->start, dp->ng,
-                                                   dp->dst, dp->tok, groups, entries, ex_xq_, ex_scr_, ex_rows_, stream);
+            overlay_group(p, v->layout, g_.clamp_exp[layer], rows*k, groups, entries, fetched, stream);
         }
+    }
+    void overlay_group(const WindowPlan& plan, const kernels::NativeExpertLayout& layout, float limit,
+                       int capacity, int groups, int entries, bool fetched, void* stream) {
+        const auto key = std::make_tuple(capacity, groups, layout.gu_type, layout.up_type, layout.d_type, limit, fetched);
+        const auto st = (cudaStream_t)stream;
+        auto* dp = (WindowPlan*)ex_plan2_;
+        const auto direct = [&] {
+            put_words(&plan,dp,(int)(sizeof(WindowPlan)/4),stream);
+            kernels::native_expert_grouped_clamped(layout,limit,dp->ptr,dp->start,dp->ng,dp->dst,dp->tok,
+                                                   groups,entries,ex_xq_,ex_scr_,ex_rows_,stream);
+        };
+        // Bound cached launch metadata; rare shapes keep the same native computation.
+        if (!overlay_graphs_.contains(key) && overlay_graphs_.size() >= (1u<<20)/sizeof(WindowPlan)) {
+            direct();
+            return;
+        }
+        auto& graph = overlay_graphs_[key];
+        if (!graph.tried) {
+            graph.tried = true;
+            const unsigned flags = cudaHostAllocPortable | cudaHostAllocMapped;
+            if (cudaHostAlloc((void**)&graph.host,sizeof(WindowPlan),flags) == cudaSuccess &&
+                cudaHostGetDevicePointer((void**)&graph.mapped,graph.host,0) == cudaSuccess) {
+                *graph.host = plan;
+                cudaGraph_t captured = nullptr;
+                if (cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed) == cudaSuccess) {
+                    copy_words((const int32_t*)graph.mapped,(int32_t*)dp,(int)(sizeof(WindowPlan)/4),stream);
+                    // Actual entries come from start[ng]; a fixed scratch capacity reuses the same graph for this width.
+                    kernels::native_expert_grouped_clamped(layout,limit,dp->ptr,dp->start,dp->ng,dp->dst,dp->tok,
+                                                           groups,capacity,ex_xq_,ex_scr_,ex_rows_,stream);
+                    if (cudaStreamEndCapture(st,&captured) == cudaSuccess && captured)
+                        (void)cudaGraphInstantiateWithFlags(&graph.exec,captured,0);
+                    if (captured) cudaGraphDestroy(captured);
+                }
+            }
+            if (!graph.exec) {
+                (void)cudaGetLastError();
+                if (graph.host) cudaFreeHost(graph.host);
+                graph.host = nullptr;
+            }
+        }
+        if (graph.exec) {
+            // Each format and copy phase owns its plan until the next layer's route fence.
+            *graph.host = plan;
+            const auto status = cudaGraphLaunch(graph.exec,st);
+            if (status != cudaSuccess)
+                throw core::CudaError(std::string("launching replacement experts: ")+cudaGetErrorString(status),(int)status);
+            return;
+        }
+        direct();
     }
     static bool oom(std::string& err) {
         err = "out of device memory for the attention state";
@@ -1160,6 +1216,13 @@ private:
     std::shared_ptr<ExpertTier> tier_;
     static constexpr int kMaxK = 8;                 // routed experts of a token
     std::vector<cudaGraphExec_t> share_g_;          // [layer * (kMaxK + 1) + experts on the card]: their launch and the shared expert's
+    struct OverlayGraph {
+        WindowPlan *host = nullptr, *mapped = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        bool tried = false;
+    };
+    using OverlayKey = std::tuple<int,int,int,int,int,float,bool>;
+    std::map<OverlayKey,OverlayGraph> overlay_graphs_;
     float *sh_g_ = nullptr, *sh_u_ = nullptr, *sh_h_ = nullptr;
     void *sh_q1_ = nullptr, *sh_q2_ = nullptr;
     static constexpr int kPosStride = 4 * kMaxT;   // per layer: pos, window start, window rows, visible compressed rows
