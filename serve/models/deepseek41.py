@@ -39,16 +39,19 @@ class DeepseekTemplate:
     source = "deepseek41 encoder (serve/models/deepseek41_encoding.py)"
 
     def render(self, messages, tools=None, add_generation_prompt=True, enable_thinking=True, reasoning_effort=None,
-               drop_thinking=True, **_):
+               drop_thinking=None, **_):
         msgs = [dict(m) for m in messages]
-        if tools:
-            wrapped = [{"type": "function", "function": t} for t in tools]
+        prompt_tools = _.get("_prompt_tools", tools)
+        if prompt_tools:
+            wrapped = [{"type": "function", "function": t} for t in prompt_tools]
             if msgs and msgs[0].get("role") == "system":
                 msgs[0]["tools"] = wrapped
             else:
                 msgs.insert(0, {"role": "system", "content": "", "tools": wrapped})
         mode = "thinking" if enable_thinking is not False else "chat"
         effort = EFFORTS.get(reasoning_effort, reasoning_effort)
+        if drop_thinking is None:
+            drop_thinking = not bool(tools)
         text = enc.encode_messages(msgs, thinking_mode=mode, reasoning_effort=effort, drop_thinking=drop_thinking)
         if not add_generation_prompt and msgs and msgs[-1].get("role") in ("user", "tool", "system"):
             head = enc.ASSISTANT_SP_TOKEN

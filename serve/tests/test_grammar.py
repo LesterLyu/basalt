@@ -142,6 +142,19 @@ class GrammarOff(Fixture, unittest.TestCase):
 
 
 class GrammarOn(Fixture, unittest.TestCase):
+    def test_discovered_responses_tools_stay_in_the_grammar(self):
+        namespace = {"type": "namespace", "name": "mcp__plugin", "tools": [
+            {"type": "function", "name": "get_weather", "parameters": FN["parameters"]}]}
+        g = self.sent("/v1/responses", {"model": "basalt", "tools": [
+            {"type": "tool_search", "execution": "client"}], "input": [
+            {"role": "user", "content": "find weather"},
+            {"type": "tool_search_call", "call_id": "s", "execution": "client", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "s", "execution": "client", "tools": [namespace]}]})
+        self.assertEqual(g["kind"], "tools")
+        functions = [t["function"] for t in g["tools"]]
+        tool = next(t for t in functions if t["name"] == "mcp__plugin.get_weather")
+        self.assertEqual(tool["parameters"], FN["parameters"])
+
     grammar = True
 
     def test_tools(self):

@@ -826,6 +826,10 @@ class Service:
         """The rendered prompt and the character spans in it where special-token text stays plain text: think tags
         and control-token text inside messages are text; only the template's own are special."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
+        if "_prompt_tools" in kwargs:
+            _, header_tools, header_changed = mark_think_literals([], kwargs["_prompt_tools"], self.literals)
+            kwargs = dict(kwargs, _prompt_tools=header_tools)
+            changed = changed or header_changed
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
             return prompt, []
