@@ -2,6 +2,7 @@
 //
 // Per layer: Engram (on its layers), hyper-connection mixes and collapse, attention, expansion, the FFN's mixes and
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
+#include "basalt/core/memory_audit.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
@@ -87,6 +88,7 @@ public:
             usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
     }
     bool init(std::string& err) {
+        core::MemoryAuditScope memory_audit("session-init");
         // the layer's chain runs ahead of the mixes branch, one step below the attention's branches, which hold the chain
         // up on the compressor's layers (graph nodes keep their stream's priority)
         int least = 0, greatest = 0;
@@ -714,6 +716,7 @@ private:
 
     // How the next pick is drawn: the shared sampler when the request samples, biases or penalizes, else the argmax.
     bool prepare_draw(const model::DecodeRequest& r, std::string& err) {
+        core::MemoryAuditScope memory_audit("request-sampler", stream_);
         history_len_ = 0;
         draw_kernel_ = false;
         if (r.sampling == nullptr) return true;
@@ -948,6 +951,7 @@ private:
     // Captures `body` once into a graph and launches it; later calls launch the instance.
     template <class F>
     bool run_graph(cudaGraphExec_t& exec, F&& body) {
+        core::MemoryAuditScope memory_audit(exec ? nullptr : "decode-graph", stream_);
         if (!exec) {
             if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess)
                 return fail("cannot begin a graph capture");

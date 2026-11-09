@@ -1,6 +1,7 @@
 // src/models/deepseek41/ops_kernels.cpp - the layer ops built from the kernel groups' entry points: attention
 // (window ring, compressor, indexer, query path, sparse MQA, grouped output) with per-layer state owned here.
 #include "basalt/kernels/elementwise.hpp"
+#include "basalt/core/memory_audit.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/log.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -1008,6 +1009,7 @@ public:
         if (shared_out && nhits) {
             cudaGraphExec_t& exec = share_g_[(size_t) il * (kMaxK + 1) + (size_t) nhits];
             if (!exec) {
+                core::MemoryAuditScope memory_audit("expert-graph", st);
                 cudaGraph_t g = nullptr;
                 if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
                     err = "deepseek41: cannot capture a layer's experts";
@@ -1144,6 +1146,7 @@ private:
         }
         auto& graph = overlay_graphs_[key];
         if (!graph.tried) {
+            core::MemoryAuditScope memory_audit("overlay-graph", st);
             graph.tried = true;
             const unsigned flags = cudaHostAllocPortable | cudaHostAllocMapped;
             if (cudaHostAlloc((void**)&graph.host,sizeof(WindowPlan),flags) == cudaSuccess &&

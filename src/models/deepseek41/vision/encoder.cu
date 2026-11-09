@@ -2,6 +2,7 @@
 // and aligner output are fp32; the inputs of the products are bf16. Attention runs one head at a time as two products
 // around a row softmax. The graph follows llama.cpp's mtmd deepseek4v encoder (MIT).
 #include "basalt/models/deepseek41/vision.hpp"
+#include "basalt/core/memory_audit.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -167,6 +168,7 @@ struct VisionEncoder::Impl {
     std::string err;
 
     ~Impl() {
+        core::MemoryAuditScope memory_audit("vision-release");
         for (void* p : owned) cudaFree(p);
         for (void* p : work) cudaFree(p);
     }
@@ -279,11 +281,15 @@ VisionBlas::~VisionBlas() = default;
 
 bool VisionBlas::open(std::string& err) {
     if (impl_->blas) return true;
+    core::MemoryAuditScope memory_audit("vision-blas");
+    core::MemoryAuditScope create_audit("vision-blas-create");
     if (cublasCreate(&impl_->blas) != CUBLAS_STATUS_SUCCESS) {
         impl_->blas = nullptr;
         err = "cannot create the product handle";
         return false;
     }
+    create_audit.finish();
+    core::MemoryAuditScope warm_audit("vision-blas-warm");
     // the first product of each kind loads its kernels; the encoder runs an fp32 and a bf16 kind
     constexpr int n = 64;
     void* buf = nullptr;
@@ -310,6 +316,7 @@ bool VisionBlas::open(std::string& err) {
 }
 
 bool VisionEncoder::init(const basalt::vision::Mmproj& mp, int max_patches, VisionBlas& blas, std::string& err) {
+    core::MemoryAuditScope memory_audit("vision-init");
     (void) max_patches;
     if (!blas.open(err)) return false;
     impl_->blas = blas.impl_->blas;
@@ -323,6 +330,7 @@ bool VisionEncoder::init(const basalt::vision::Mmproj& mp, int max_patches, Visi
 static int blocks(size_t n) { return (int) ((n + 255) / 256); }
 
 bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl, std::vector<float>& out, std::string& err) {
+    core::MemoryAuditScope memory_audit("vision-encode");
     Impl& s = *impl_;
     const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();
     if ((size_t) n * kVisionPatchValues != rows.size()) {

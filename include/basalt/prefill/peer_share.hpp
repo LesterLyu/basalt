@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+namespace basalt::core { struct MemoryUsage; }
+
 namespace basalt::prefill {
 
 class PeerShare {
@@ -46,6 +48,7 @@ public:
     PeerShare& operator=(const PeerShare&) = delete;
 
     bool open(int main_device, int peer_device, const Dims& d, std::string& err);
+    void memory_usage(core::MemoryUsage& usage) const;
 
     /// One launch as the caller's steps see it (second card).
     struct Launch {

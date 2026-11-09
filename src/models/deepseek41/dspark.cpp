@@ -3,6 +3,7 @@
 // experts, the latent rotation and the Markov and confidence heads are in dspark_kernels.cu.
 //
 // The stage structure follows llama.cpp's DeepSeek-V4.1 DSpark graph (MIT, Copyright (c) 2023-2026 The ggml authors).
+#include "basalt/core/memory_audit.hpp"
 #include "models/deepseek41/dspark.hpp"
 
 #include "basalt/artifact/gguf_reader.hpp"
@@ -183,6 +184,7 @@ struct DsparkDrafter::Impl {
     }
 
     bool load(const core::FileRange& section, const std::string& ranking, int keep, std::string& err) {
+        core::MemoryAuditScope memory_audit("draft-load");
         size_t free0 = 0, free1 = 0, total_b = 0;
         cudaMemGetInfo(&free0, &total_b);
         const bool ok = read(section, ranking, keep, err);
@@ -552,6 +554,7 @@ struct DsparkDrafter::Impl {
     // Captures `body` into `exec` once, then launches the instance.
     template <class F>
     bool launch(cudaGraphExec_t& exec, F&& body, std::string& err) {
+        core::MemoryAuditScope memory_audit(exec ? nullptr : "draft-graph", st);
         if (!exec) {
             if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
                 err = "dspark: cannot begin a graph capture";

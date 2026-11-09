@@ -127,6 +127,7 @@ public:
     int device() const { return device_; }
     bool direct_access() const { return p2p_; }
     uint64_t available_bytes() const { return available_bytes_; }
+    uint64_t device_scratch_bytes() const { return device_scratch_bytes_; }
 
     /// Whether the peer holds (layer, expert) right now.
     bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
@@ -277,6 +278,12 @@ private:
               std::string& err, int plan_index = 0);
     using LaunchKey = std::tuple<int, int, int, int64_t, int, int, int, float, const float*, float*>;
     std::map<LaunchKey, cudaGraphExec_t> launch_graphs_;
+    uint64_t device_scratch_bytes_ = 0;
+    cudaError_t allocate_device(void** out, size_t bytes) {
+        const cudaError_t status = cudaMalloc(out, bytes);
+        if (status == cudaSuccess) device_scratch_bytes_ += bytes;
+        return status;
+    }
     bool launch_layout(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err, float* out,
                        const kernels::NativeExpertLayout* const* layouts = nullptr, int plan_index = 0, bool mixed = false);

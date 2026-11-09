@@ -67,6 +67,8 @@ void sample_tokens_split(int split, const float* logits, int n_tokens, int n_voc
 // The wide path's buffers on `stream` (about 16 bytes per vocabulary entry plus the sort's), made now: false when the
 // memory cannot be had.  A request that samples a list longer than 64 entries reserves them before its first window.
 bool sampler_wide_reserve(int n_vocab, void* stream);
+// All owned cache buffers, including retired ranges still referenced by captured graphs.
+uint64_t sampler_cache_bytes(int device);
 
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (needs thread-block clusters): the same token as
 // sample_tokens' one-block argmax.  False (nothing launched) where it

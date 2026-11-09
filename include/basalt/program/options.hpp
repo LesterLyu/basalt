@@ -94,6 +94,7 @@ struct CommonOptions {
     int drafter_device = -1;           ///< --diag-drafter-gpu N: the CUDA device it runs on (-1: the main card)
     bool diag_teacher = false;         ///< --diag-teacher: --spec-oracle's tokens go on whatever the picks
     bool diag_tier_timing = false;
+    bool diag_memory = false;
     bool diag_tier_frozen = false;     ///< --diag-tier-frozen: the VRAM tier keeps what it holds
     std::string diag_dump;                 ///< --diag-dump DIR: a model's per-layer tensors, off by default
     int diag_tier_ram = -1, diag_tier_vram = -1;   ///< --diag-tier-ram / --diag-tier-vram: fixed expert-tier sizes

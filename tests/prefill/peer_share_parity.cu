@@ -4,6 +4,7 @@
 // memory. Checks every row, the rows' independence from how the share cuts its launches, and prints the products' rates
 // on each card. Exit 77 without two GPUs.
 #include "basalt/core/device.hpp"
+#include "basalt/core/memory_usage.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/ggml/ggml.h"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -326,6 +327,15 @@ int main() {
             basalt::prefill::PeerShare share;
             std::string err;
             if (!share.open(0, 1, d, err)) throw std::runtime_error(err);
+            basalt::core::MemoryUsage usage;
+            share.memory_usage(usage);
+            if (usage.gpus[1]["long_prefill"] > basalt::prefill::PeerShare::peer_bytes(d) ||
+                usage.gpus[1]["long_prefill"] + 4096 < basalt::prefill::PeerShare::peer_bytes(d) ||
+                usage.gpus[0]["long_prefill"] != basalt::prefill::mmq::q8_bytes(basalt::prefill::PeerShare::kQuantRows, d.n_embd))
+                throw std::runtime_error("peer workspace ownership does not match the allocation plan");
+            const auto before_usage = usage.gpus;
+            share.memory_usage(usage);
+            if (before_usage != usage.gpus) throw std::runtime_error("shared peer workspace was counted twice");
             cudaEvent_t a, b;
             cudaEventCreate(&a);
             cudaEventCreate(&b);

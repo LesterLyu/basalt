@@ -4,6 +4,7 @@
 #include "basalt/platform/compiler.hpp"
 
 #include "basalt/core/device.hpp"
+#include "basalt/core/memory_audit.hpp"
 #include "basalt/core/spin_wait.hpp"
 
 #include "basalt/core/load_progress.hpp"
@@ -39,7 +40,11 @@ void ExpertTier::memory_usage(core::MemoryUsage& usage) const {
     if (!usage.claim(this)) return;
     usage.device(m_.device(), "experts", cache_.mapped_bytes() + ext_.mapped_bytes());
     usage.device(m_.device(), "scratch", fetch_stride_*(uint64_t)fetch_slots_*kFetchRings);
-    if (peer_) usage.device(peer_->device(), "expert_helper", peer_->cache().mapped_bytes());
+    if (peer_) {
+        usage.device(peer_->device(), "expert_helper", peer_->cache().mapped_bytes());
+        usage.device(peer_->device(), "scratch", peer_->device_scratch_bytes());
+    }
+    if (share_) share_->memory_usage(usage);
     for (size_t l = 0; l < ram_.size(); ++l)
         if (ram_[l]) usage.host["resident_experts"] += host_vmm_bytes_.empty()
             ? core::ram_padded(ram_bytes_[l]) : host_vmm_bytes_[l];
@@ -229,6 +234,7 @@ ExpertTier::~ExpertTier() {
 }
 
 bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
+    core::MemoryAuditScope memory_audit("expert-tiers");
     const Geometry& g = m_.geo();
     n_layers_ = g.n_layers;
     n_expert_ = g.n_expert;
@@ -592,6 +598,7 @@ void ExpertTier::probe_env(program::ProbeEnv& env) {
 }
 
 bool ExpertTier::load_ram(std::string& err) {
+    core::MemoryAuditScope memory_audit("expert-ram-map");
     uint64_t max_blob = 0;
     for (const ExpertLayer& e : m_.pack().experts) {   // one expert in every layer
         max_blob = std::max<uint64_t>(max_blob, e.blob_bytes);

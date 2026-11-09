@@ -455,7 +455,7 @@ function memoryMeter(label, used, total, free, parts) {
 const vramLabels = {weights: "Model weights", experts: "Expert cache", expert_helper: "Expert helper",
   kv_state: "KV cache & state", scratch: "Scratch", mmq_buffers: "MMQ buffers", dense_prefill: "Dense prefill",
   long_prefill: "Prefill workspace", dspark: "DSpark", mtp: "MTP", vision: "Vision workspace",
-  system_reserved: "System reserved", other_apps: "Other apps"};
+  sampler: "Sampler cache", system_reserved: "System reserved", other_apps: "Other apps"};
 const hostLabels = {resident_experts: "Resident experts", expert_homes: "Evicted / borrowed experts",
   checkpoints: "Conversation checkpoints", expert_swap_workspace: "Expert swap workspace",
   expert_prefetch: "Expert prefetch ring", expert_staging: "Expert upload staging",

@@ -1,5 +1,6 @@
 // src/program/serve/runtime.cpp - lifecycle of the persistent engine.
 #include "state.hpp"
+#include "basalt/kernels/sampler.hpp"
 
 namespace basalt::program::serve {
 
@@ -56,6 +57,8 @@ void Runtime::report_memory(bool force) {
     memory_at = now;
     basalt::core::MemoryUsage usage;
     memory_usage(usage);
+    for (auto& [device, parts] : usage.gpus)
+        if (const uint64_t bytes = kernels::sampler_cache_bytes(device)) parts["sampler"] += bytes;
     usage.host["checkpoints"] += conversations ? conversations->bytes() : 0;
     for (const auto& c : checks) usage.host["checkpoints"] += c.bytes();
     for (const auto& b : bs)

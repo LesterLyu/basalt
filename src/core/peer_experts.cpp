@@ -1,4 +1,5 @@
 // src/core/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
+#include "basalt/core/memory_audit.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
 
@@ -99,6 +100,7 @@ void PeerExperts::close() {
     fetched_groups_ = fetched_rows_ = 0;
     marks_.clear();
     marks_made_ = 0;
+    device_scratch_bytes_ = 0;
     d_x_ = d_out_ = h_x_ = h_out_ = nullptr;
     d_meta_ = h_meta_ = d_scratch_ = nullptr;
     d_q8_ = nullptr;
@@ -218,11 +220,11 @@ bool PeerExperts::prepare(int device, ExpertSource& src, int64_t n_layers, int64
         ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
         ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
         ck(cudaHostAlloc(&h_meta_, CAP * sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
-        ck(cudaMalloc((void**) &d_x_, (size_t) CAP * n_embd * sizeof(float)), "input", err) &&
-        ck(cudaMalloc((void**) &d_out_, (size_t) CAP * n_embd * sizeof(float)), "result", err) &&
-        ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (n_embd / 32) * 36), "activations", err) &&
-        ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
+        ck(allocate_device((void**) &d_x_, (size_t) CAP * n_embd * sizeof(float)), "input", err) &&
+        ck(allocate_device((void**) &d_out_, (size_t) CAP * n_embd * sizeof(float)), "result", err) &&
+        ck(allocate_device(&d_meta_, sizeof(Meta)), "plan", err) &&
+        ck(allocate_device((void**) &d_q8_, (size_t) CAP * (n_embd / 32) * 36), "activations", err) &&
+        ck(allocate_device(&d_scratch_, scratch), "scratch", err);
     if (!alloc_ok) { close(); return false; }
     size_t free_b = 0, total_b = 0;
     if (!ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo", err)) { close(); return false; }
@@ -264,10 +266,10 @@ bool PeerExperts::open_plain(int device, int64_t n_layers, int64_t n_expert, int
         ck(cudaHostGetDevicePointer(&meta_map_, h_meta_, 0), "mapped plan", err) &&
         ck(cudaHostAlloc((void**) &go_, 64, cudaHostAllocPortable | cudaHostAllocMapped), "plan word", err) &&
         ck(cudaHostGetDevicePointer((void**) &go_map_, go_, 0), "mapped plan word", err) &&
-        ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
-        ck(cudaMalloc((void**) &d_out_, row_bytes * CAP), "rows", err) &&
-        ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
-        ck(cudaMalloc(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) CAP, n_ff)), "scratch", err);
+        ck(allocate_device(&d_meta_, sizeof(Meta)), "plan", err) &&
+        ck(allocate_device((void**) &d_out_, row_bytes * CAP), "rows", err) &&
+        ck(allocate_device((void**) &d_q8_, (size_t) CAP * (size_t) (n_embd / 32) * 36), "q8_1 rows", err) &&
+        ck(allocate_device(&d_scratch_, basalt::kernels::native_expert_scratch_bytes((int) CAP, n_ff)), "scratch", err);
     if (!ok) {
         close();
         return false;
@@ -707,6 +709,7 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
         auto found = launch_graphs_.find(key);
         // Keep uncommon shapes on the same native path without unbounded driver allocations.
         if (found == launch_graphs_.end() && launch_graphs_.size() < 256) {
+            core::MemoryAuditScope memory_audit("peer-expert-graph", s);
             found = launch_graphs_.emplace(key,nullptr).first;
             cudaGraph_t captured = nullptr;
             if (cudaStreamBeginCapture(s,cudaStreamCaptureModeRelaxed) == cudaSuccess) {

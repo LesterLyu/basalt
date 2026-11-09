@@ -299,7 +299,7 @@ target_link_libraries(basalt-plan PRIVATE plan)
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/peer_copy.cpp src/core/host_plan.cpp)
+                             src/core/peer_copy.cpp src/core/host_plan.cpp src/core/memory_audit.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -898,6 +898,11 @@ target_link_libraries(s2_gemv_q8_parity PRIVATE model_qwen4exp_kernels ${_gpu_ru
 basalt_gpu_test(NAME s2_gemv_q8_parity COMMAND s2_gemv_q8_parity --selftest)
 
 add_executable(sampler_parity tests/kernels/sampler_parity.cpp)
+add_executable(sampler_memory_test tests/kernels/sampler_memory_test.cpp)
+target_link_libraries(sampler_memory_test PRIVATE kernels core ${_gpu_runtime_target})
+basalt_embed_manifest(sampler_memory_test)
+basalt_gpu_test(NAME sampler_memory_test COMMAND sampler_memory_test)
+set_tests_properties(sampler_memory_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
