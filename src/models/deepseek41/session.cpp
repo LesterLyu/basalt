@@ -277,6 +277,7 @@ public:
                         close_prompt_path();
                         for (int i = 0; i < r.n_tokens; ++i)
                             if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
+                        if (r.progress) r.progress(r.n_tokens);
                         return {};
                     }
                     return prompt_failed(err);
@@ -295,6 +296,7 @@ public:
             std::string err;
             if (!step(r.tokens + i, 1, r.pos + i, false, nullptr, nullptr, err)) return {model::Status::Error, err};
         }
+        if (r.progress) r.progress(r.n_tokens);
         return {};
     }
 
@@ -305,6 +307,10 @@ public:
     }
 
     size_t running_bytes() const override { return ops_ ? ops_->turn_bytes() : 0; }
+
+    bool can_continue_prefill(int64_t stop) const override {
+        return prefillp::may_continue_to(stop, (int64_t) hist_.size(), whole_from_, kWindow);
+    }
 
     model::Result save_running(uint8_t* host, int64_t pos) override {
         if (!prefillp::may_save(pos, whole_from_)) return {model::Status::Error, kSkippedRows};

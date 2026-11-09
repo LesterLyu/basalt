@@ -21,6 +21,11 @@ pays no indirect call. `Flow::next` returns to command dispatch; `Flow::error` e
 
 A model with its own serving derives from both classes in its own folder; see `src/models/qwen4exp/serve/`.
 
+A cancelled prompt retains only completed chunks in its slot. A model that skips layers constrains forward reuse
+through `can_continue_prefill`: the incoming tokens and images must match, and the planned tail must still follow.
+Such partial state stays in place rather than being parked as a complete conversation. Live progress estimates do
+not advance the completed-token counter.
+
 The protocol text and error paths are shared contracts with the Python server and the benchmark client. A structural
 change preserves those contracts and is checked against a frozen engine with fixed expert placement, including batch
 slots, cancellation and conversation restoration.

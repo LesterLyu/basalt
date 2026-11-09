@@ -1122,6 +1122,12 @@ basalt_embed_manifest(engine_session_test)
 basalt_cpu_test(NAME engine_session_test COMMAND engine_session_test)
 set_tests_properties(engine_session_test PROPERTIES TIMEOUT 60)
 
+add_executable(prefill_cancel_test tests/program/prefill_cancel_test.cpp)
+target_link_libraries(prefill_cancel_test PRIVATE serve_shared warnings)
+basalt_embed_manifest(prefill_cancel_test)
+basalt_cpu_test(NAME prefill_cancel_test COMMAND prefill_cancel_test)
+set_tests_properties(prefill_cancel_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 60)
+
 # the engine log helper: the line each level renders (CPU only)
 add_executable(log_test tests/core/log_test.cpp)
 target_include_directories(log_test PRIVATE include)

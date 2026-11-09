@@ -52,6 +52,13 @@ int main() {
         CHECK(!may_resume(whole - 1, kStop, whole) && !may_resume(cut, kStop, whole) && !may_resume(1, kStop, whole));
         // forward through the part, and a new sequence, need nothing behind them
         CHECK(may_resume(cut, cut, whole) && may_resume(0, kStop, whole));
+        // An interrupted prefix can go forward to the original tail, but cannot finish or be saved inside it.
+        CHECK(may_continue_to(kStop, cut, whole, kWin));
+        CHECK(may_continue_to(kStop + 17, cut, whole, kWin));
+        CHECK(!may_continue_to(kStop - 1, cut, whole, kWin));
+        CHECK(!may_continue_to(cut, cut, whole, kWin));
+        CHECK(may_continue_to(whole, whole, whole, kWin));
+        CHECK(may_continue_to(8, 8, 0, kWin));
     }
     Dims d;
     d.n_embd = 5120; d.n_used = 6; d.n_expert = 256; d.n_ff_exp = 2304; d.engram_cols = 8 * 256;

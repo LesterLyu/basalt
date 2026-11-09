@@ -191,6 +191,7 @@ public:
             }
         const uint64_t floor = std::max<uint64_t>((uint64_t) o.conversation_cache_min_free_mib << 20, disk_floor);
         const auto spill = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
+            if (!session().can_continue_prefill((int64_t) ids.size())) return;
             if (at_exit) disk.flush();   // one image in RAM at a time
             const int64_t positions = (int64_t) ids.size();
             if (!capture_admit(session().running_bytes() + session().cells_bytes(positions), floor)) {
@@ -244,6 +245,7 @@ public:
     // session goes on holding it (`kept`) and only the disk lacks it.
     bool park_current(size_t held, int64_t kept) override {
         if ((!conversations->enabled() && !disk.enabled()) || !live_ok || live.empty()) return true;
+        if (!session().can_continue_prefill((int64_t) live.size())) return true;
         if (o.conversation_cache_min_tokens > 0 && (int64_t) live.size() < o.conversation_cache_min_tokens) return true;
         int64_t deepest = 0;
         for (const ConvCheckpoint& c : checks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
@@ -472,6 +474,15 @@ public:
 
 private:
     Flow prepare_image() override;
+    bool live_resume_allowed() const override { return rt_.session().can_continue_prefill(n - 1); }
+    Flow complete_begin() override {
+        if (cancelled && at > read_from && runtime_.o.prompt_cache > 0) {
+            runtime_.live.assign(ids32.begin(), ids32.begin() + at);
+            runtime_.live_imgs = runtime_.imgs_below(runtime_.req_imgs, at);
+            runtime_.live_ok = true;
+        }
+        return Flow::proceed;
+    }
     Flow decode() override { return decode_loop(*this); }
     bool release_room() override { return true; }
     bool checkpoint_mount(const ConvCheckpoint& c) override {
@@ -534,6 +545,7 @@ private:
     }
 
     void progress_line(const char* tag, int64_t at_pos) {
+        if (std::strcmp(tag, "PP") == 0) runtime_.pp_reached = std::max(runtime_.pp_reached, at_pos);
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
         basalt::protocol::emit("%s %lld %lld %.0f %.1f\n", tag, (long long) at_pos, (long long) n, ms,
                                ms > 0.0 ? 1000.0 * (double) (at_pos - resume) / ms : 0.0);
@@ -713,6 +725,7 @@ Flow SessionRequest::read_to(int64_t to) {
             const Block& b = blocks_[next_block_++];
             r = rt_.session().prefill_embeddings(b.rows.data(), b.n_rows, at);
             at += b.n_rows;
+            if (r.ok()) progress_line("PP", at);
         } else {
             const int64_t end = next_block_ < blocks_.size() ? std::min(to, blocks_[next_block_].at) : to;
             basalt::model::PrefillRequest pr;
@@ -733,7 +746,7 @@ Flow SessionRequest::read_to(int64_t to) {
             };
             pr.stop = [this] { return runtime_.halted(); };
             r = rt_.session().prefill_chunk(pr);
-            at = end;
+            at = runtime_.halted() ? std::clamp(runtime_.pp_reached, base, end) : end;
         }
         if (!r.ok()) {
             basalt::log::error("basalt serve", "%s", r.message.c_str());

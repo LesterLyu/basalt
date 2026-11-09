@@ -47,6 +47,10 @@ inline int64_t far_below(int64_t stop, int n_layers, int skip_layer, int window)
 /// resumed only at a read's stop, and one window back from it at most.
 inline int64_t whole_from(int64_t stop, int window) { return stop > window ? stop - window : 0; }
 inline bool may_save(int64_t pos, int64_t whole) { return pos >= whole; }
+/// An interrupted skipped-layer read continues forward only when its planned tail still follows.
+inline bool may_continue_to(int64_t stop, int64_t held, int64_t whole, int window) {
+    return may_save(held, whole) || stop >= whole + window;
+}
 /// `held`: the positions read. Forward and the start need nothing behind them.
 inline bool may_resume(int64_t pos, int64_t held, int64_t whole) { return pos == 0 || pos >= held || pos >= whole; }
 

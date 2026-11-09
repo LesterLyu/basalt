@@ -126,9 +126,9 @@ struct PrefillRequest {
     /// Positions between these tokens and the read's stop, -1 unknown. State is saved or resumed only at that stop: a model
     /// may leave rows further back short of its last layers.
     int64_t rows_after = -1;
-    std::function<void(int)> progress;   ///< optional: called with the tokens of this request read so far
+    std::function<void(int)> progress;   ///< optional: completed chunks, in tokens relative to this request
     std::function<void(int)> live;       ///< optional: an estimate of the same, from a driver thread, inside a chunk
-    std::function<bool()> stop;          ///< optional: true ends the read at a chunk's end; nothing can continue from there
+    std::function<bool()> stop;          ///< optional: true ends the read at a chunk's end
     int total_tokens = 0;                ///< what the whole prompt still has to read, this part included: sizes the workspaces
     bool more = false;                   ///< another part follows: the workspaces stay until end_prompt()
 };
@@ -143,6 +143,9 @@ public:
     virtual Result prepare() { return {}; }
     /// The prompt is read: workspaces a part kept with `more` go back.
     virtual void end_prompt() {}
+    /// Whether the current prefix can continue to this prompt stop. A skipped-layer read may require its original
+    /// tail before decoding; passing the held prefix length asks whether it can be saved outside this session.
+    virtual bool can_continue_prefill(int64_t stop) const { (void) stop; return true; }
     /// A logit bias (device copy, n_vocab floats) for the next draws; null clears it.
     virtual Result set_logit_bias(const float* bias) { (void) bias; return {Status::NotImplemented, "this model takes no logit bias"}; }
     /// Draws the token of row `row` of the last decoded window again under `bias` (n_vocab floats): the grammar's mask.

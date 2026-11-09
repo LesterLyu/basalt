@@ -1054,7 +1054,7 @@ class ProcessEngine:
             return
         holding, born = True, self.gen                  # born: engine generation holding the control lines
         slot, gen0, reserved = None, None, None
-        solo_slot, run0 = None, 0
+        solo_slot, run0, admit0 = None, 0, 0
         phase = "none"            # solo -> admit -> slot; "none" once the engine is done with it
         stop_sent = False
         yields, solo_again = 0, 0
@@ -1187,6 +1187,7 @@ class ProcessEngine:
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
+                    admit0 = len(out)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # admission overwrites the slot
                     phase = "admit"
@@ -1210,6 +1211,8 @@ class ProcessEngine:
                             yield None
                     self._note_first_reused(first, last0)
                     cont = bool(self._ctl_result and self._ctl_result[1])
+                    if not cont and cancel.is_set():
+                        self._solo_kept(slot, prompt, out[admit0:] + pending)
                     phase = "slot" if cont else "none"
                     while pending:
                         t = pending.pop(0)
@@ -1298,6 +1301,8 @@ class ProcessEngine:
                     if line and line.startswith("BADM ") and line.split()[2:3] in (["1"], ["2"]):
                         phase = "slot"
                 if drained and phase != "slot":
+                    if phase == "admit" and slot is not None:
+                        self._solo_kept(slot, prompt, out[admit0:])
                     self._carry_run(carry, first, last0, True)     # a request that ran in earlier runs too
             except EngineDied:
                 pass
@@ -1332,7 +1337,12 @@ class ProcessEngine:
         """A solo run in `slot` ended: the engine keeps its prompt and every token it fed (all but the last) there."""
         if slot is None:
             return
-        self.slot_held[slot] = list(prompt) + gen[:-1] if gen else []
+        if gen:
+            self.slot_held[slot] = list(prompt) + gen[:-1]
+        else:
+            last = self.last or {}
+            held = min(len(prompt), max(0, last.get("reused", 0) + last.get("prompt_read", 0)))
+            self.slot_held[slot] = list(prompt[:held]) if last.get("finish") == "cancel" else []
         self.slot_used[slot] = time.time()
 
     def _resumes(self, slot: int, prompt: list[int]) -> bool:

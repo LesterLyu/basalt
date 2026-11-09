@@ -22,7 +22,7 @@ public:
     /// Optional: called from a driver thread as each layer of a chunk finishes on the GPU, with an estimate of the
     /// tokens of the current run read so far (the chunk's start plus its length times the share of layers done).
     std::function<void(int)> live;
-    /// Optional: asked after each chunk; true ends the read there, and the state is good for nothing.
+    /// Optional: asked after each chunk; true ends the read there. Skipped rows can only continue toward the planned tail.
     std::function<bool()> stop;
     /// Optional: queued at the start of each layer with its streams [T][4][n_embd], on the chunk's stream.
     std::function<void(int layer, const float* x, int T, void* stream)> layer_tap;

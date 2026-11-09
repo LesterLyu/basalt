@@ -21,8 +21,7 @@ Flow Request::complete() {
     decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
     if (const Flow flow = complete_begin(); flow != Flow::proceed) return flow;
     if (!cancelled) {
-        // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
-        // (the checkpoints taken while reading it are still good)
+        // Completed decode rows replace the prompt. A cancelled read keeps only the model's committed prefix.
         runtime_.live.swap(consumed);
         runtime_.live_imgs = runtime_.imgs_below(runtime_.req_imgs, (int64_t) runtime_.live.size());
         runtime_.live_ok = runtime_.o.prompt_cache > 0;
@@ -128,7 +127,7 @@ Flow Request::complete() {
         std::fflush(stdout);
         runtime_.admit_slot = -1;
     }
-    if (solo_req) {   // the conversation stays in the slot it ran in
+    if (solo_req || (in_slot && cancelled && runtime_.live_ok)) {   // a partial admission stays in its slot too
         slot_state_back(slot_b);
         if (yielded_at < 0) {   // (a read that gave way was parked in the slot already)
             BSlot& sb = runtime_.bs[(size_t) slot_b];

@@ -151,6 +151,7 @@ protected:
     virtual bool turn_checkpoint_at_last_token() const { return false; }
     // ---- restoring a conversation: what it does to the model's sessions.  Per request.
     virtual bool cvec_wanted() const { return true; }
+    virtual bool live_resume_allowed() const { return true; }
     virtual void set_cvec() {}
     virtual void select_view() {}
     virtual bool slot_draft_in(int) { return true; }
