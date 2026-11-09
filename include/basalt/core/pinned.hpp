@@ -10,6 +10,8 @@
 //     engine adapts to the machine it is on" is only true if the engine says what it got.
 #pragma once
 
+#include "basalt/core/ram_load.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -20,6 +22,7 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
 
 struct PinnedArena {
+    RamAllocation allocation;
     void* base = nullptr;
     uint64_t capacity = 0;
     PageBacking backing = PageBacking::NormalPages;

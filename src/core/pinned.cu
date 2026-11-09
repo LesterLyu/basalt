@@ -44,6 +44,19 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          const std::string& shared_file, uint64_t shared_hash) : capacity(bytes) {
     if (bytes == 0) return;
+    if constexpr (platform::kPreferHostVmm) {
+        if (shared_file.empty()) {
+            if (allocation.allocate(bytes) && allocation.allocation_pinned()) {
+                base = allocation.data();
+                capacity = allocation.capacity();
+                registered_bytes = capacity;
+                backing = PageBacking::PinnedByCuda;
+                note = "CUDA-pinned through host VMM";
+                return;
+            }
+            allocation.reset();
+        }
+    }
     basalt::platform::RegionBacking region_backing = basalt::platform::RegionBacking::NormalPages;
     base = basalt::platform::alloc_region(bytes, region_backing, note, shared_file, shared_hash, mapping_base,
                                           mapping_bytes);
@@ -77,6 +90,11 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
 }
 
 PinnedArena::~PinnedArena() {
+    if (allocation.data()) {
+        allocation.reset();
+        base = nullptr;
+        return;
+    }
     if (base) {
         if (locked_bytes) basalt::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
