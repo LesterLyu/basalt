@@ -404,7 +404,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         return false;
     }
     const auto slot_bytes = cache_sizes((int)per_layer_,false);
-    if (homes_.main == 0) cache_.set_segment_bytes(policy::kCacheSegment);
+    cache_.set_segment_bytes(policy::kCacheSegment);
     if (!slot_bytes.empty() && !cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
@@ -1870,15 +1870,28 @@ bool ExpertTier::lend(uint64_t wanted, std::string& err) {
     std::string why;
     if (!core::device_memory(-1, free, total, why)) { err="cannot query free memory before lending experts: " + why; return false; }
     const uint64_t before = free;
+    const auto base_before = cache_.mapped_bytes(), extra_before = ext_.mapped_bytes();
     const auto loan = [&](core::ExpertCache& arena, uint64_t offset) {
-        if (free >= wanted || !arena.valid() || !arena.mapped_bytes()) return true;
-        const uint64_t keep = policy::loan_keep(arena.mapped_bytes(),wanted-free);
-        if (!shrink_cache(arena,offset,keep,err)) return false;
-        return core::device_memory(-1, free, total, err);
+        while (free < wanted && arena.valid() && arena.mapped_bytes()) {
+            const auto mapped = arena.mapped_bytes();
+            const uint64_t keep = policy::loan_keep(mapped,wanted-free);
+            if (!shrink_cache(arena,offset,keep,err)) return false;
+            if (!core::device_memory(-1, free, total, err)) return false;
+            // Released mappings and allocator free bytes can differ; require mapping progress before another loan.
+            if (arena.mapped_bytes() >= mapped) break;
+        }
+        return true;
     };
-    if (!loan(ext_,(uint64_t)n_layers_*per_layer_) || (homes_.main == 0 && !loan(cache_,0))) return false;
+    if (!loan(ext_,(uint64_t)n_layers_*per_layer_) || !loan(cache_,0)) return false;
     if (free > before) basalt::log::info("basalt deepseek41","expert VRAM loan: %.2f GiB released, %.2f GiB free",(free-before)/1073741824.,free/1073741824.);
-    return free >= wanted;
+    if (free >= wanted) return true;
+    err = "expert lending leaves " + std::to_string(free >> 20) + " MiB free, needs " +
+        std::to_string((wanted + (1ull << 20) - 1) >> 20) + " MiB (before " +
+        std::to_string(before >> 20) + ", total " + std::to_string(total >> 20) +
+        "; base " + std::to_string(base_before >> 20) + " -> " + std::to_string(cache_.mapped_bytes() >> 20) +
+        ", extra " + std::to_string(extra_before >> 20) + " -> " + std::to_string(ext_.mapped_bytes() >> 20) +
+        ", base slots " + std::to_string(cache_.slots()) + ", segmented " + std::to_string(cache_.segmented()) + ")";
+    return false;
 }
 
 void ExpertTier::shrink() {
@@ -1899,7 +1912,7 @@ bool ExpertTier::reclaim(std::string& err) {
     std::string why;
     if (!core::device_memory(-1, free, total, why)) { err="cannot query free memory before reclaiming experts: " + why; return false; }
     const uint64_t keep = refill_reserve();
-    if (homes_.main == 0 && cache_.valid() && free > keep) {
+    if (cache_.valid() && free > keep) {
         const auto before = cache_.slots();
         if (!cache_.grow(cache_.mapped_bytes()+(int64_t)(free-keep),err)) return false;
         if (cache_.slots() > before) { seed_copies(n_expert_); finish_swaps(); pack_extra_ram(); }
