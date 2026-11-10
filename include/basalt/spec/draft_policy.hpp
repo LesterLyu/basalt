@@ -71,6 +71,7 @@ private:
     double best_rate() const;              // the highest q any stated chance gets
     bool unmeasured(int t) const;          // a size measured too few times, or too long ago, to trust its cost
     bool recent(int t) const;              // measured within the last rounds
+    bool trusted(int t) const;             // recent, and not dearer than a larger size measured after it
     double base(int t) const;              // a size's cost relative to the scale, measured or inferred
     double base_from(int t, bool lately) const;   // t's base from the other (recent) sizes; < 0 without any
     double mtp_tokens(int t) const;
