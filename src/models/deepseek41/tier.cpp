@@ -247,6 +247,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     for (int l = 0; l < n_layers_; ++l) {
         const auto& e = m_.pack().experts[l];
         one_each_ram += e.blob_bytes;
+        if (!m_.has_overlay()) {
+            fetch_stride_ = std::max<uint64_t>(fetch_stride_, e.blob_bytes);
+            continue;
+        }
         std::vector<uint64_t> sizes;
         for (int expert = 0; expert < n_expert_; ++expert) sizes.push_back(std::max<uint64_t>(e.blob_bytes, expert_bytes(l,expert)));
         std::sort(sizes.begin(), sizes.end());
@@ -270,9 +274,8 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         return slots_fit(room, left_free, n_expert_);
     };
     if (!load_rank(err)) return false;
-    base_count_.resize(n_layers_);
-    for (int l = 0; l < n_layers_; ++l) {
-        base_count_[l] = n_expert_;
+    base_count_.assign(n_layers_, n_expert_);
+    if (m_.has_overlay()) for (int l = 0; l < n_layers_; ++l) {
         for (int e = 0; e < n_expert_; ++e) if (m_.replacement(l, e)) --base_count_[l];
     }
     const int max_base = *std::max_element(base_count_.begin(), base_count_.end());
@@ -636,6 +639,7 @@ bool ExpertTier::load_ram(std::string& err) {
     }
     for (int l = 0; l < n_layers_; ++l) {
         std::vector<int> held;
+        int n_main = 0, n_peer = 0;
         auto empty_slot = [&](bool helper, uint64_t bytes) {
             const int count = helper ? homes_.peer : (int)per_layer_;
             const auto& owners = helper ? peer_owner_ : owner_;
@@ -655,7 +659,7 @@ bool ExpertTier::load_ram(std::string& err) {
             const size_t idx = (size_t) l * n_expert_ + e;
             switch (policy::place_of_rank(placement, (int) copies, r)) {
                 case policy::Place::Main: {
-                    const int32_t slot = empty_slot(false, expert_bytes(l,e));
+                    const int32_t slot = m_.has_overlay() ? empty_slot(false, expert_bytes(l,e)) : l*(int)per_layer_+n_main++;
                     if (slot < 0) { err="deepseek41: primary slot layout cannot hold its ranked experts"; return false; }
                     res_[idx] = slot;
                     owner_[(size_t) slot] = e;
@@ -663,7 +667,7 @@ bool ExpertTier::load_ram(std::string& err) {
                     break;
                 }
                 case policy::Place::Peer: {
-                    const int32_t slot = empty_slot(true, expert_bytes(l,e));
+                    const int32_t slot = m_.has_overlay() ? empty_slot(true, expert_bytes(l,e)) : l*homes_.peer+n_peer++;
                     if (slot < 0) { err="deepseek41: helper slot layout cannot hold its ranked experts"; return false; }
                     peer_->admit(l, e, slot);
                     peer_owner_[(size_t) slot] = e;
@@ -1320,6 +1324,10 @@ std::vector<int64_t> ExpertTier::slot_sizes(int n, int rank_start, bool seed, bo
     std::vector<int64_t> result;
     if (n <= 0) return result;
     result.reserve((size_t)n_layers_*n);
+    if (!m_.has_overlay()) {
+        for (const auto& layer : m_.pack().experts) result.insert(result.end(), n, layer.blob_bytes);
+        return result;
+    }
     for (int l = 0; l < n_layers_; ++l) {
         std::vector<uint64_t> initial;
         if (conservative) {
@@ -1349,6 +1357,11 @@ std::vector<int64_t> ExpertTier::slot_sizes(int n, int rank_start, bool seed, bo
 int ExpertTier::slots_fit(uint64_t free, uint64_t keep, int maximum, int rank_start, bool seed, bool conservative) const {
     if (free <= keep) return 0;
     const uint64_t budget = free-keep;
+    if (!m_.has_overlay()) {
+        uint64_t per_rank = 0;
+        for (const auto& layer : m_.pack().experts) per_rank += (layer.blob_bytes + 255) / 256 * 256;
+        return policy::uniform_slots_fit(budget, per_rank, maximum);
+    }
     int fit = 0;
     for (int n = 1; n <= maximum; ++n) {
         uint64_t bytes = 0;

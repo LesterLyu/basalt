@@ -21,6 +21,28 @@ static int g_fail = 0;
     } while (0)
 
 int main() {
+    // The uniform limit must match enumerated aligned mixed slots, including exact budget boundaries.
+    CHECK(uniform_slots_fit(100,0,10) == 0);
+    CHECK(uniform_slots_fit(100,7,0) == 0);
+    std::mt19937 uniform_rng(39);
+    for (int trial = 0; trial < 100; ++trial) {
+        const int layers = 1 + uniform_rng()%40, maximum = 1 + uniform_rng()%64;
+        std::vector<uint64_t> blobs(layers);
+        uint64_t per_rank = 0;
+        for (auto& b : blobs) { b=1+uniform_rng()%12000000; per_rank += (b+255)/256*256; }
+        const uint64_t budget = (uniform_rng()%(maximum+2))*per_rank + uniform_rng()%per_rank;
+        int expected = 0;
+        for (int n = 1; n <= maximum; ++n) {
+            uint64_t sum = 0;
+            for (auto b : blobs)
+                for (auto v : mixed_slot_sizes(std::vector<uint64_t>(384,b), std::vector<uint64_t>(n,b)))
+                    sum += ((uint64_t)v+255)/256*256;
+            if (sum <= budget) expected = n;
+        }
+        CHECK(uniform_slots_fit(budget,per_rank,maximum) == expected);
+        CHECK(uniform_slots_fit(per_rank,per_rank,maximum) == 1);
+        CHECK(uniform_slots_fit(per_rank-1,per_rank,maximum) == 0);
+    }
     // Final GPU ownership removes mandatory replacement RAM and base RAM alike.
     // The conservative pre-placement budget spills; actual CPU ownership fits.
     {
