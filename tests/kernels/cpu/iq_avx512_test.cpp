@@ -79,6 +79,81 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Limited-SwiGLU rows must keep the single-token ggml rounding, including when a token moves within a window.
+int check_exact_iq2s(int n, int rows, int mode) {
+    constexpr int T = 8;
+    const size_t stride = ggml_row_size(GGML_TYPE_IQ2_S, n), up = stride * rows;
+    std::vector<uint8_t> weights(2 * up);
+    fill(weights, 22, 104 + n + mode, mode);
+    const auto* dot = ggml_get_type_traits_cpu_avx512(GGML_TYPE_IQ2_S);
+    const auto* quant = ggml_get_type_traits_cpu_avx512(GGML_TYPE_Q8_K);
+    const auto* dw = ggml_get_type_traits(GGML_TYPE_IQ2_S);
+    std::vector<std::vector<uint8_t>> packed(T, std::vector<uint8_t>(ggml_row_size(GGML_TYPE_Q8_K, n)));
+    std::vector<std::vector<float>> x(T, std::vector<float>(n));
+    std::vector<std::vector<float>> ref(T, std::vector<float>(rows)), gu(T, std::vector<float>(rows));
+    std::vector<std::vector<float>> got(T, std::vector<float>(rows)), got_gu(T, std::vector<float>(rows));
+    const void* act[T];
+    float *out[T], *out_gu[T];
+    const bool scaled = mode == 1;
+    const float sg = scaled ? .5f : 1.f, su = scaled ? 1.25f : 1.f, limit = 10.f;
+    std::mt19937 rng(29 + n + mode);
+    for (int t = 0; t < T; ++t) {
+        for (float& v : x[t]) v = mode == 2 ? ((rng() & 1) ? 1.f : -1.f) : (float) ((int) (rng() % 2001) - 1000) / 400.f;
+        quant->from_float(x[t].data(), packed[t].data(), n);
+        dequant_q8_K(packed[t].data(), x[t].data(), n);
+        act[t] = packed[t].data(); out[t] = got[t].data(); out_gu[t] = got_gu[t].data();
+        for (int r = 0; r < rows; ++r) {
+            float a = 0, b = 0;
+            dot->vec_dot(n, &a, 0, weights.data() + stride * r, 0, act[t], 0, 1);
+            dot->vec_dot(n, &b, 0, weights.data() + up + stride * r, 0, act[t], 0, 1);
+            ref[t][r] = a;
+            if (scaled) { a *= sg; b *= su; }
+            a = std::fmin(a, limit); b = std::fmax(std::fmin(b, limit), -limit);
+            gu[t][r] = (a / (1.f + std::exp(-a))) * b;
+        }
+    }
+    size_t different = 0;
+    for (int nt = 1; nt <= T; ++nt) for (int offset = 0; offset + nt <= T; ++offset) {
+        cpu::iq_exact_512_rows(22, weights.data(), stride, n, act + offset, nt, out, 0, rows);
+        cpu::iq_exact_512_gu_rows(22, weights.data(), stride, up, n, sg, su, scaled, limit, act + offset, nt, out_gu, 0, rows);
+        for (int t = 0; t < nt; ++t) for (int r = 0; r < rows; ++r)
+            different += std::memcmp(&got[t][r], &ref[t + offset][r], 4) != 0 ||
+                         std::memcmp(&got_gu[t][r], &gu[t + offset][r], 4) != 0;
+    }
+    for (int t = 0; t < T; ++t) {
+        std::fill(got[t].begin(), got[t].end(), -12345.f);
+        std::fill(got_gu[t].begin(), got_gu[t].end(), -12345.f);
+    }
+    cpu::iq_exact_512_rows(22, weights.data(), stride, n, act + 2, 3, out, 1, rows - 1);
+    cpu::iq_exact_512_gu_rows(22, weights.data(), stride, up, n, sg, su, scaled, limit, act + 2, 3, out_gu, 1, rows - 1);
+    for (int t = 0; t < T; ++t) for (int r = 0; r < rows; ++r) {
+        const bool inside = t < 3 && r >= 1 && r < rows - 1;
+        const float a = inside ? ref[t + 2][r] : -12345.f, b = inside ? gu[t + 2][r] : -12345.f;
+        different += std::memcmp(&got[t][r], &a, 4) != 0 || std::memcmp(&got_gu[t][r], &b, 4) != 0;
+    }
+    double max_abs = 0, max_rel = 0, max_gu_abs = 0, max_gu_rel = 0;
+    int bad = 0;
+    std::vector<float> w(n), u(n);
+    for (int r : {0, 1, rows / 2, rows - 1}) {
+        dw->to_float(weights.data() + stride * r, w.data(), n);
+        dw->to_float(weights.data() + up + stride * r, u.data(), n);
+        for (int t = 0; t < T; ++t) {
+            double a = 0, b = 0;
+            for (int i = 0; i < n; ++i) { a += (double) w[i] * x[t][i]; b += (double) u[i] * x[t][i]; }
+            const double err = std::abs(ref[t][r] - a);
+            max_abs = std::max(max_abs, err); max_rel = std::max(max_rel, err / std::max(1e-3, std::abs(a)));
+            bad += !std::isfinite(ref[t][r]) || err > 1e-4 + 1e-3 * std::abs(a);
+            a = std::min(a * sg, (double) limit); b = std::max(std::min(b * su, (double) limit), -(double) limit);
+            const double want = a / (1 + std::exp(-a)) * b, eg = std::abs(gu[t][r] - want);
+            max_gu_abs = std::max(max_gu_abs, eg); max_gu_rel = std::max(max_gu_rel, eg / std::max(1e-3, std::abs(want)));
+            bad += !std::isfinite(gu[t][r]) || eg > 1e-4 + 1e-3 * std::abs(want);
+        }
+    }
+    std::printf("  exact IQ2_S n=%d rows=%d mode=%d: ggml/width/position differences %zu; vs double dot abs %.3g rel %.3g, "
+                "gate/up abs %.3g rel %.3g\n", n, rows, mode, different, max_abs, max_rel, max_gu_abs, max_gu_rel);
+    return bad + (different != 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -169,6 +244,11 @@ int main(int argc, char** argv) {
         bad += tok_diff != 0;
         if (max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for type %d (dot rows)\n", type); ++bad; }
         if (max_gu > 1e-4) { std::printf("REFERENCE ERROR too large for type %d (gate/up rows)\n", type); ++bad; }
+    }
+    for (int mode = 0; mode < MODES; ++mode) {
+        bad += check_exact_iq2s(256, 33, mode);
+        bad += check_exact_iq2s(5120, 2304, mode);
+        bad += check_exact_iq2s(2304, 5120, mode);
     }
     std::printf("iq_avx512_test: %s\n", bad ? "FAIL" : "PASS");
 
