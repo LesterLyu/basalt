@@ -13,7 +13,8 @@
 //   8. middling chances stop the window where another row costs more than it returns;
 //   9. a head that overstates its chances is calibrated down, and the window shrinks with it;
 //  10. rows that cost little take more drafts at the same chances;
-//  11. never more rows than the drafts, nor beyond the cap.
+//  11. small sizes measured dear in a cold start do not hold the window at its largest size;
+//  12. never more rows than the drafts, nor beyond the cap.
 #include "basalt/spec/draft_policy.hpp"
 
 #include <cstdio>
@@ -124,6 +125,29 @@ int main() {
         const int t_dear = run(p, 0.75f, 0.75f, 300, ds_cost);
         const int t_cheap = run(q, 0.75f, 0.75f, 300, [](int t) { return 13.0 + 0.8 * (t - 1); });
         check(t_cheap > t_dear, "drafter: cheap rows take more drafts at the same chances");
+    }
+    {
+        // one card, most experts on the CPU: a row costs about 15 ms more. A request's first windows (DeepSeek, cold,
+        // the window growing a row at a time) had two stalls about 20 times a round, at 1 and 3 rows
+        const auto cpu_cost = [](int t) { return 34.0 + 15.0 * (t - 1); };
+        DraftPolicy p(6);
+        const float lo[5] = {0.4f, 0.4f, 0.4f, 0.4f, 0.4f};
+        const int t0[] = {1, 1, 2, 3, 4, 5};
+        const double stall[] = {1.0, 20.0, 1.0, 20.0, 1.0, 1.0};
+        for (int i = 0; i < 6; ++i) p.observe_window(lo, t0[i], 0, stall[i] * cpu_cost(t0[i]));
+        for (int i = 0; i < 4; ++i) p.observe_window(lo, 6, 0, cpu_cost(6));   // the largest size measured since
+        check(p.cost_ms(1) < p.cost_ms(6), "drafter: fewer rows never cost more than a size measured since");
+        int six = 0;
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        for (int i = 0; i < 40; ++i) {
+            const int t = p.window(lo, 5);
+            six += t == 6;
+            int a = 0;
+            while (a < t - 1 && u(rng) < 0.4f) ++a;
+            p.observe_window(lo, t, a, cpu_cost(t));
+        }
+        check(six <= 4, "drafter: stalls at the small sizes do not hold low chances at the largest window");
     }
     {
         DraftPolicy p(4);

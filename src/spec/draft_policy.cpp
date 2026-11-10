@@ -66,8 +66,18 @@ double DraftPolicy::lookup_rate(int match) const {
 
 bool DraftPolicy::recent(int t) const { return base_n_[t] > 0 && round_ - seen_[t] <= kStale; }
 
+// A window of fewer rows does not cost more than one of more rows: a size whose base exceeds that of a larger size
+// measured since was measured in a slow moment (a cold start's first windows, a graph's first launch). It is not
+// taken again while it looks dearer, so it would keep that cost until it went stale; the other sizes stand in for it.
+bool DraftPolicy::trusted(int t) const {
+    if (!recent(t)) return false;
+    for (int u = t + 1; u <= kMaxT; ++u)
+        if (recent(u) && seen_[u] > seen_[t] && base_[u] < base_[t]) return false;
+    return true;
+}
+
 double DraftPolicy::base(int t) const {
-    if (recent(t)) return base_[t];
+    if (trusted(t)) return base_[t];
     // sizes measured lately (else any measured) stand in for t: interpolated, extrapolated by the cost of a row, or
     // scaled by the prior shape
     for (const bool lately : {true, false}) {
@@ -82,7 +92,7 @@ double DraftPolicy::base_from(int t, bool lately) const {
     // largest (the cost of a row on this machine); below the smallest, or with one, the prior shape scales it
     int lo = 0, hi = 0, below = 0;
     for (int u = 1; u <= kMaxT; ++u) {
-        if (u == t || base_n_[u] <= 0 || (lately && !recent(u))) continue;
+        if (u == t || base_n_[u] <= 0 || (lately && !trusted(u))) continue;
         if (u < t) { below = lo; lo = u; }
         else if (hi == 0) hi = u;
     }
@@ -171,8 +181,8 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     ++round_;
     if (round_ms > 0) {
         if (scale_ <= 0) scale_ = round_ms / kShape[t];          // the first round sets the scale
-        if (!recent(t)) {                                        // new, or measured too long ago: start over from
-            base_[t] = base(t);                                  // what the other sizes imply
+        if (!trusted(t)) {                                       // new, measured too long ago or in a slow moment:
+            base_[t] = base(t);                                  // start over from what the other sizes imply
             base_n_[t] = kBasePrior;
         }
         scale_ += kScaleAlpha * (round_ms / base_[t] - scale_);
