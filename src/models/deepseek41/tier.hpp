@@ -331,6 +331,7 @@ private:
     struct PeerCompute;
     std::unique_ptr<core::PeerExperts> peer_;
     uint64_t peer_workspace_bytes_ = 0;
+    static constexpr size_t kSpareBlocks = 16;   // free RAM places kept pinned for promotions
     uint64_t peer_workspace_pool_limit_ = 0;
     std::vector<std::pair<int32_t, int32_t>> peer_workspace_lent_;
     std::vector<int> peer_workspace_backed_;

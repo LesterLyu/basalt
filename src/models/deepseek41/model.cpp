@@ -26,6 +26,12 @@
 namespace basalt::models::deepseek41 {
 
 DsModel::~DsModel() {
+    {
+        std::lock_guard<std::mutex> lock(pool_mu_);
+        pool_quit_ = true;
+    }
+    pool_cv_.notify_all();
+    if (pool_refill_.joinable()) pool_refill_.join();
     shared_tier_.tier.reset();
     tier_profile_.report();
     overlay_.clear();
@@ -138,25 +144,22 @@ void DsModel::release_replacement_ram(int layer, int expert) const {
 
 std::unique_ptr<ExpertRam> DsModel::acquire_expert_ram(uint64_t bytes) const {
     TierScope scope(tier_profile_,TierProfile::Acquire);
-    size_t best = swap_pool_.size();
-    for (size_t i = 0; i < swap_pool_.size(); ++i)
-        if (swap_pool_[i]->allocated() >= bytes && (best == swap_pool_.size() || swap_pool_[i]->allocated() < swap_pool_[best]->allocated())) best=i;
-    if (best != swap_pool_.size()) {
+    std::unique_lock<std::mutex> lock(pool_mu_);
+    if (auto ram = swap_pool_.take(bytes)) {
         if (tier_profile_.enabled) ++tier_profile_.calls[TierProfile::RamPoolHit];
-        auto ram = std::move(swap_pool_[best]);
-        swap_pool_[best] = std::move(swap_pool_.back()); swap_pool_.pop_back();
-        swap_pool_bytes_ -= ram->allocated();
+        if (swap_pool_.usable(pool_block_) < pool_target_) pool_cv_.notify_one();
         return ram;
     }
     core::detail::HostMemory hm;
     if (!core::detail::host_available_memory(hm)) return nullptr;
     auto room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
     if (bytes > room && !swap_pool_.empty()) {
-        swap_pool_.clear(); swap_pool_bytes_=0;
+        swap_pool_.clear();
         if (!core::detail::host_available_memory(hm)) return nullptr;
         room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
     }
     if (bytes > room) return nullptr;
+    lock.unlock();
     auto ram = std::make_unique<ExpertRam>();
     if (tier_profile_.enabled) ++tier_profile_.calls[TierProfile::RamPoolMiss];
     if (!ram->allocate(bytes) || ram->allocated() > room) return nullptr;
@@ -164,22 +167,63 @@ std::unique_ptr<ExpertRam> DsModel::acquire_expert_ram(uint64_t bytes) const {
 }
 
 void DsModel::trim_expert_ram_pool(uint64_t limit) const {
-    while (swap_pool_bytes_ > limit && !swap_pool_.empty()) {
-        swap_pool_bytes_ -= swap_pool_.back()->allocated();
-        swap_pool_.pop_back();
-    }
+    std::lock_guard<std::mutex> lock(pool_mu_);
+    swap_pool_.trim(limit);
 }
 
 void DsModel::recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const {
     TierScope scope(tier_profile_,TierProfile::Recycle);
-    constexpr uint64_t capacity = 1ull<<30;
-    if (!ram || ram->registered() < ram->bytes || ram->allocated() > capacity-swap_pool_bytes_) {
+    std::unique_lock<std::mutex> lock(pool_mu_);
+    if (!swap_pool_.put(ram)) {
         if (ram && tier_profile_.enabled) ++tier_profile_.calls[TierProfile::RamPoolFree];
+        lock.unlock();
         ram.reset(); return;
     }
-    ram->ready = false;
-    swap_pool_bytes_ += ram->allocated();
-    swap_pool_.push_back(std::move(ram));
+}
+
+void DsModel::keep_expert_ram(size_t blocks, uint64_t bytes, int device) const {
+    if (tiers_.diag_tier_timing)
+        basalt::log::info("basalt deepseek41", "expert RAM refill: %zu blocks of at least %llu bytes", blocks,
+                          (unsigned long long) bytes);
+    {
+        std::lock_guard<std::mutex> lock(pool_mu_);
+        pool_target_ = blocks;
+        pool_block_ = bytes;
+    }
+    if (!pool_refill_.joinable()) pool_refill_ = std::thread([this, device] { refill_expert_ram(device); });
+    pool_cv_.notify_one();
+}
+
+void DsModel::refill_expert_ram(int device) const {
+    cudaSetDevice(device);
+    std::unique_lock<std::mutex> lock(pool_mu_);
+    for (;;) {
+        pool_cv_.wait(lock, [&] { return pool_quit_ || swap_pool_.usable(pool_block_) < pool_target_; });
+        if (pool_quit_) return;
+        const uint64_t bytes = pool_block_;
+        lock.unlock();
+        // the floor a decode-time allocation keeps
+        std::unique_ptr<ExpertRam> ram;
+        core::detail::HostMemory hm;
+        if (core::detail::host_available_memory(hm)) {
+            const uint64_t room = core::ram_tier_room(hm.available,platform::ram_reserve(),true);
+            ram = std::make_unique<ExpertRam>();
+            if (bytes > room || !ram->allocate(bytes) || ram->allocated() > room || ram->registered() < bytes) ram.reset();
+        }
+        lock.lock();
+        if (!ram) {
+            pool_target_ = 0;   // RAM is short: a promotion pins its own place, or finds none, as without the refill
+            continue;
+        }
+        if (pool_quit_) { lock.unlock(); return; }
+        // Foreground recycling may have filled the pool while this block was being pinned.
+        if (swap_pool_.usable(pool_block_) >= pool_target_ || !swap_pool_.put(ram)) {
+            if (swap_pool_.usable(pool_block_) < pool_target_) pool_target_ = 0;
+            lock.unlock();
+            ram.reset();
+            lock.lock();
+        }
+    }
 }
 
 bool DsModel::load(const std::string& path, std::string& err) {

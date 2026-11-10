@@ -475,6 +475,12 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     }
     promoted_ = 0;
     exclusive_cache_ = true;
+    {
+        // a promotion's victim needs a RAM place at once; a burst of them takes these instead of pinning on the token's path
+        uint64_t blob = m_.overlay_max_bytes();
+        for (int l = 0; l < n_layers_; ++l) blob = std::max<uint64_t>(blob, m_.pack().experts[(size_t) l].blob_bytes);
+        m_.keep_expert_ram(kSpareBlocks, blob, m_.device());
+    }
     m_.tier_profile().enabled=m_.tiers().diag_tier_timing;
     basalt::log::info("basalt deepseek41","resident expert RAM %.2f GiB; loaded directly into final tier placement",
                       resident_ram_bytes()/1073741824.);
