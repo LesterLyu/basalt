@@ -8,6 +8,7 @@
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/batch_driver.hpp"
 #include "basalt/core/ram_load.hpp"
+#include "basalt/core/expert_hotspots.hpp"
 #include "basalt/core/device.hpp"
 #include "basalt/kernels/cpu/native_expert.hpp"
 #include "basalt/ngram/ple_reader.hpp"
@@ -102,6 +103,8 @@ public:
     /// The caches' format (--kv); set before resolve_context.
     CacheFormat cache_format() const { return cache_format_; }
     void set_cache_format(CacheFormat f) { cache_format_ = f; }
+    std::string expert_hotspots(const std::string& action) override;
+    core::ExpertHotspots& hotspots() const { return hotspots_; }
 
     void memory_usage(core::MemoryUsage& usage) const override {
         if (!usage.claim(this)) return;
@@ -111,6 +114,7 @@ public:
             usage.host["locked_experts"] += v.ram->pin.locked_bytes;
         }
         usage.host["expert_swap_workspace"] += swap_pool_bytes_;
+        usage.host["expert_hotspots"] += hotspots_.bytes();
         if (engram_) usage.host["engram_reader"] += engram_->allocated_bytes();
         if (dense_) usage.device(device_, "weights", dense_->capacity());
     }
@@ -179,6 +183,7 @@ private:
     bool load(const std::string& path, core::LoadPlan& reads, std::string& err);
 
     core::LoadPlan* planning_ = nullptr;
+    mutable core::ExpertHotspots hotspots_;
     CacheFormat cache_format_ = CacheFormat::Fp8;
     mutable TierProfile tier_profile_;
     std::vector<Replacement> overlay_;

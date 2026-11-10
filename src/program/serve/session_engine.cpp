@@ -133,6 +133,7 @@ public:
         model_.memory_usage(usage);
         for (const auto& s : sessions_) s->memory_usage(usage);
     }
+    std::string expert_hotspots(const std::string& action) override { return model_.expert_hotspots(action); }
     void probe_command(const std::string& line, std::string& e) override {
         basalt::program::ProbeEnv env;
         if (const basalt::model::Result r = session().probe_env(env); !r.ok()) { e = "PROBE: " + r.message; return; }

@@ -313,6 +313,8 @@ public:
     /// weights, checks of what was placed) and makes its sessions if plan() did not; they are then ready to run.
     virtual Result attach(const LoadRequest& req, std::vector<std::unique_ptr<ModelSession>>& sessions) = 0;
     virtual void memory_usage(core::MemoryUsage&) const {}
+    /// Host-only diagnostic control, callable by the input reader during inference.
+    virtual std::string expert_hotspots(const std::string&) { return "{\"supported\":false}"; }
 };
 
 /// A started model and its sessions.
