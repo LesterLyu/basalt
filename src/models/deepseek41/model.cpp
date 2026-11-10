@@ -139,6 +139,13 @@ std::unique_ptr<ExpertRam> DsModel::acquire_expert_ram(uint64_t bytes) const {
     return ram;
 }
 
+void DsModel::trim_expert_ram_pool(uint64_t limit) const {
+    while (swap_pool_bytes_ > limit && !swap_pool_.empty()) {
+        swap_pool_bytes_ -= swap_pool_.back()->allocated();
+        swap_pool_.pop_back();
+    }
+}
+
 void DsModel::recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const {
     TierScope scope(tier_profile_,TierProfile::Recycle);
     constexpr uint64_t capacity = 1ull<<30;
@@ -307,7 +314,7 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     // the image encoder's cuBLAS handle takes host memory when created, so it opens before the RAM tier reads the free
     // memory, with the prompt path's buffers
     s.host.open = [this](std::string& err) {
-        if (tiers_.vision && !vision_blas().open(err)) return false;
+        if (tiers_.vision && vision_device() == device_ && !vision_blas().open(err)) return false;
         return prompt_host_.open(*this, 0, sessions(), tiers_.vision, err);
     };
     s.host.bytes = [this] { return prompt_host_.bytes(); };
@@ -431,6 +438,8 @@ model::Result DsModel::plan(const model::LoadRequest& req, core::LoadPlan& reads
                                               ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
     }
     set_peer_devices(std::move(peers));
+    if (req.vision_device >= 0 && req.vision_device != device() && req.vision_device != peer_device())
+        return {model::Status::Error, "deepseek41: --vision-gpu must name the main card or its first expert helper"};
     // the sessions first (the drafter takes its memory with the first), then the expert tier, sized from what they leave,
     // opened by the first session; what those share queues its reads in the start's plan
     planning_ = &reads;

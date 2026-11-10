@@ -4,6 +4,7 @@
 // collapse, router, routed and shared experts, expansion. Prefill runs the same path token by token.
 #include "basalt/core/memory_audit.hpp"
 #include "basalt/core/device.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/log.hpp"
 #include "models/deepseek41/session.hpp"
 #include "basalt/ggml/ggml.h"
@@ -56,6 +57,7 @@ public:
     ~Session() override {
         for (auto& reads : eread_)   // reads still out land in eraw_ before it goes
             for (ngram::PleReader::Ticket& t : reads) finish_read(t);
+        images_done();
         drop_prefill();
         for (void* p : allocs_) cudaFree(p);
         if (h_next_) cudaFreeHost(h_next_);
@@ -84,7 +86,7 @@ public:
         usage.device(m_.device(), "scratch", allocated_bytes_);
         if (ops_) ops_->memory_usage(usage);
         if (prefill_) prefill_->memory_usage(usage);
-        if (vis_) usage.device(m_.device(), "vision", vis_->device_bytes());
+        if (vis_) usage.device(vis_->device(), "vision", vis_->device_bytes());
         usage.host["decode_workspace"] += host_allocated_bytes_ + hist_.capacity() * sizeof(int32_t);
         if (drafter_ && usage.claim(drafter_.get()))
             usage.device(drafter_->device(), "dspark", drafter_->device_bytes());
@@ -536,42 +538,58 @@ public:
             if (!image_) return {model::Status::Error, err.empty() ? "deepseek41: no image buffers for this slot" : err};
         }
         vision::Image& img = image_->picture;
-        if (!vision::decode_image(data, bytes, img, err)) return {model::Status::Error, err};
-        // The encoder's weights and this picture's work buffers go above the VRAM reserve: in what the tier's extra copies
-        // leave, else in the room of all its copies; images_done gives it back.
+        if (!vision::decode_image(data, bytes, img, err)) { images_done(); return {model::Status::Error, err}; }
+        const int device = m_.vision_device();
+        const bool on_main = device == m_.device();
         std::string te;
         core::ExpertTier* t = ops_->expert_tier(te);
         const auto above_floor = [&] {
             size_t free_b = 0, total_b = 0;
-            return !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
+            return !on_main || !t || cudaMemGetInfo(&free_b, &total_b) != cudaSuccess || free_b >= t->free_floor();
         };
-        const auto lend = [&] {
-            if (!t) return false;
+        const auto lend_main = [&] {
+            if (!on_main || !t) return false;
             cudaStreamSynchronize(stream_);
             t->lend_all();
             return true;
         };
+        if (vis_ && !vis_->fits(plan_image(img.w, img.h, vis_merge_, vis_min_pixels_))) release_vision();
         if (!vis_) {
             release_short_prompt();
             cudaStreamSynchronize(stream_);
             vis_borrowed_ = true;
-            if (t) t->shrink();
+            if (on_main && t) t->shrink();
             vision::Mmproj mp;
             if (!m_.open_mmproj(mp, err)) { images_done(); return {model::Status::Error, err}; }
+            vis_merge_ = mp.hp().merge;
+            vis_min_pixels_ = mp.hp().min_pixels;
             vis_ = std::make_unique<VisionEncoder>();
-            bool loaded = vis_->init(mp, m_.vision_blas(), err);
-            if (!loaded && lend()) {
+            bool loaded = false;
+            if (!on_main && t && t->peer() && t->peer()->device() == device) {
+                const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
+                void* storage = nullptr;
+                uint64_t capacity = 0;
+                if (!t->borrow_peer_workspace(VisionEncoder::required_bytes(mp, pl), storage, capacity, err)) {
+                    images_done();
+                    return {model::Status::Error, err};
+                }
+                vis_peer_borrowed_ = true;
+                const core::OnDevice on(device);
+                loaded = vis_->init_borrowed(mp, m_.vision_blas(), storage, capacity, err);
+            } else {
+                const core::OnDevice on(device);
+                loaded = vis_->init(mp, m_.vision_blas(), err);
+            }
+            if (!loaded && lend_main()) {
                 vis_ = std::make_unique<VisionEncoder>();
                 err.clear();
                 loaded = vis_->init(mp, m_.vision_blas(), err);
             }
             if (!loaded) { images_done(); return {model::Status::Error, err}; }
-            vis_merge_ = mp.hp().merge;
-            vis_min_pixels_ = mp.hp().min_pixels;
         }
         const VisionPlan pl = plan_image(img.w, img.h, vis_merge_, vis_min_pixels_);
         bool room = vis_->reserve(pl, err) && above_floor();
-        if (!room && lend()) {
+        if (!room && lend_main()) {
             err.clear();
             room = vis_->reserve(pl, err) && above_floor();
         }
@@ -588,19 +606,28 @@ public:
     }
 
     void images_done() override {
-        if (image_) {   // the picture's decode and patch rows leave with the request
-            std::vector<uint8_t>().swap(image_->picture.rgb);
-            std::vector<float>().swap(image_->patches);
-        }
+        release_vision();
+        if (image_) image_->release();
+    }
+
+    void release_vision() {
         if (!vis_borrowed_) return;
         vis_borrowed_ = false;
         cudaStreamSynchronize(stream_);
         vis_.reset();
         std::string e;
-        if (core::ExpertTier* t = ops_->expert_tier(e)) {
-            if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
-            t->grow();
+        if (m_.vision_device() != m_.device() && !m_.vision_blas().close(e))
+            basalt::log::warn("basalt deepseek41", "image product handle stays allocated: %s",e.c_str());
+        if (core::ExpertTier* t = ops_ ? ops_->expert_tier(e) : nullptr) {
+            if (vis_peer_borrowed_) {
+                if (!t->return_peer_workspace(e))
+                    basalt::log::warn("basalt deepseek41", "helper image workspace stays borrowed: %s", e.c_str());
+            } else if (m_.vision_device() == m_.device()) {
+                if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());
+                t->grow();
+            }
         }
+        vis_peer_borrowed_ = false;
     }
 
     model::Result prefill_embeddings(const float* rows, int n_rows, int64_t pos, model::ImageGrid) override {
@@ -1512,6 +1539,7 @@ private:
     std::unique_ptr<VisionEncoder> vis_;
     int vis_merge_ = 3, vis_min_pixels_ = 0;
     bool vis_borrowed_ = false;
+    bool vis_peer_borrowed_ = false;
     std::vector<void*> allocs_;
     uint64_t allocated_bytes_ = 0;
     uint64_t host_allocated_bytes_ = 0;

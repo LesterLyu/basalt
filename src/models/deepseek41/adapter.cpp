@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
+#include <charconv>
+#include <cstring>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -88,6 +90,15 @@ public:
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(args.next("--prefill-chunk"));
         else if (a == "--ds-gpu-single-miss") o.gpu_single_miss = true;
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
+        else if (a == "--vision-gpu") {
+            const char* value = args.next("--vision-gpu");
+            const char* end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value,end,o.vision_device);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || o.vision_device < 0) {
+                basalt::log::error("basalt deepseek41", "--vision-gpu: expected a non-negative CUDA device number");
+                code = 2;
+            }
+        }
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-timing") o.diag_tier_timing = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;

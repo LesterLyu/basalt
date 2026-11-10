@@ -16,9 +16,7 @@ class DsModel;
 /// Bytes between experts in a staging buffer: the layer's blob rounded up to whole blocks of its two formats.
 uint64_t staged_stride(const ExpertLayer& e);
 
-/// What the prompt path and the image path take in host RAM at their peak. It is allocated before the RAM tier reads the
-/// free memory, so the tier sizes beside it, and nothing large is allocated per request after it. Prompts are read one at
-/// a time, so the prompt buffers are one set; each slot has its own image buffers.
+/// The prompt path's fixed host buffers and each slot's on-demand image buffers.
 class PromptHost {
 public:
     PromptHost() = default;
@@ -27,7 +25,7 @@ public:
     PromptHost& operator=(const PromptHost&) = delete;
 
     /// `ring_pieces`: experts the pinned ring of file and second-card reads holds (0: none); `slots`: sessions;
-    /// `vision`: each slot gets the buffers of the largest image.
+    /// `vision`: give each slot image buffers that allocate on use.
     bool open(const DsModel& m, int ring_pieces, int slots, bool vision, std::string& err);
     /// The ring at `pieces` experts (its contents are not kept).
     bool set_ring(int pieces, std::string& err);
@@ -53,6 +51,11 @@ public:
     struct Image {
         vision::Image picture;          ///< the decoded image
         std::vector<float> patches;     ///< its patch rows
+        void release() {
+            std::vector<uint8_t>().swap(picture.rgb);
+            std::vector<float>().swap(patches);
+            picture.w = picture.h = 0;
+        }
     };
     /// The next slot's image buffers (each session takes one), nullptr when there are none left.
     Image* take_image();

@@ -47,6 +47,8 @@ public:
     /// Creates the handle on the current device and runs one small product of each kind the encoder uses. Does nothing
     /// when already open.
     bool open(std::string& err);
+    /// Releases handle-owned storage after every encoder borrowing this handle has finished.
+    bool close(std::string& err);
 
     struct Impl;
 
@@ -65,6 +67,11 @@ public:
     /// Uploads the projector `mp` (a deepseek41v file) to the current device. `blas` is opened here when it is not yet, and
     /// must outlive the encoder. False when the card has no room for the weights; no CUDA error is left behind.
     bool init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std::string& err);
+    /// The same encoder in a caller-owned device span, including its per-image work buffers.
+    bool init_borrowed(const basalt::vision::Mmproj& mp, VisionBlas& blas, void* storage, uint64_t bytes, std::string& err);
+    static uint64_t required_bytes(const basalt::vision::Mmproj& mp, const VisionPlan& plan);
+    bool fits(const VisionPlan& plan) const;
+    int device() const;
     /// Sizes the work buffers for `plan` (they only grow); false with `err` when the card has no room for them, and the
     /// caller makes room. No CUDA error is left behind.
     bool reserve(const VisionPlan& plan, std::string& err);

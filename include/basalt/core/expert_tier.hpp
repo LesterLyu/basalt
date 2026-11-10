@@ -159,6 +159,8 @@ public:
     /// allocated); `grow` opens the planned slots beside the base arena again once they are free, with the experts a
     /// shrink or lend took off the card (most recently used first) and then the profile's ranked ones.
     void shrink();
+    bool borrow_peer_workspace(uint64_t bytes, void*& storage, uint64_t& capacity, std::string& err);
+    bool return_peer_workspace(std::string& err);
     void grow();
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
     /// copies go back whole, and reclaim() opens the same number again (an error if the card cannot hold them any
@@ -432,6 +434,7 @@ private:
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
     std::vector<uint64_t> ram_stride_;
+    RamAllocation peer_workspace_backup_;
     std::vector<core::RamAllocation> ram_allocations_;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)

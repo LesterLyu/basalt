@@ -40,6 +40,7 @@ void ExpertTier::memory_usage(MemoryUsage& usage) const {
     }
     for (const auto& share : shares_)
         if (share) share->memory_usage(usage);
+    if (peer_workspace_backup_.capacity()) usage.host["expert_swap_workspace"] += peer_workspace_backup_.capacity();
     for (const auto& alloc : ram_allocations_)
         usage.host["resident_experts"] += alloc.capacity();
     for (const auto& pin : ram_pins_) {
@@ -1322,6 +1323,49 @@ void ExpertTier::restore(bool ranked_too) {
         basalt::log::error(s_.area.c_str(), "tier restore sync: %s", cudaGetErrorString(ce));
     land_all();
     promoted_ = promoted;
+}
+
+bool ExpertTier::borrow_peer_workspace(uint64_t bytes, void*& storage, uint64_t& capacity, std::string& err) {
+    storage = nullptr;
+    capacity = 0;
+    auto* helper = peer();
+    if (!helper || !bytes || bytes > (uint64_t) helper->cache().bytes() || peer_workspace_backup_.data()) {
+        err = s_.name + ": the helper expert arena cannot lend the image workspace";
+        return false;
+    }
+    settle();
+    platform::HostMemory hm;
+    if (!platform::host_available_memory(hm) ||
+        ram_padded(bytes) > ram_tier_room(hm.available, platform::ram_reserve(), true) ||
+        !peer_workspace_backup_.allocate(bytes, /*pin=*/false)) {
+        err = s_.name + ": insufficient RAM to back up the helper's expert weights";
+        return false;
+    }
+    OnDevice on(helper->device());
+    auto* base = helper->slot_ptr(0);
+    if (const auto status = cudaMemcpy(peer_workspace_backup_.data(), base, bytes, cudaMemcpyDeviceToHost);
+        status != cudaSuccess) {
+        peer_workspace_backup_.reset();
+        err = cudaGetErrorString(status);
+        return false;
+    }
+    storage = base;
+    capacity = bytes;
+    return true;
+}
+
+bool ExpertTier::return_peer_workspace(std::string& err) {
+    if (!peer_workspace_backup_.data()) return true;
+    auto* helper = peer();
+    OnDevice on(helper->device());
+    if (const auto status = cudaMemcpy(helper->slot_ptr(0), peer_workspace_backup_.data(),
+                                      peer_workspace_backup_.bytes(), cudaMemcpyHostToDevice);
+        status != cudaSuccess) {
+        err = cudaGetErrorString(status);
+        return false;
+    }
+    peer_workspace_backup_.reset();
+    return true;
 }
 
 void ExpertTier::shrink() {

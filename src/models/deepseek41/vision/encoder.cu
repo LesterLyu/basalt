@@ -3,6 +3,7 @@
 // around a row softmax. The graph follows llama.cpp's mtmd deepseek4v encoder (MIT).
 #include "basalt/models/deepseek41/vision.hpp"
 #include "basalt/core/memory_audit.hpp"
+#include "basalt/core/on_device.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -148,7 +149,24 @@ __global__ void k_assemble(const float* aligned, const float* start, const float
 
 }  // namespace
 
+namespace {
+uint64_t aligned_bytes(uint64_t n) { return (n + 255) / 256 * 256; }
+
+uint64_t workspace_bytes(int n, int ng, int ntok, int proj) {
+    const uint64_t N = n, G = ng, T = ntok, P = proj;
+    uint64_t bytes = 0;
+    for (uint64_t count : {N*kVisionPatchValues, N*E, N*QKV, N*F, N*E, N*E, N*E, N*E, N*N, N*E})
+        bytes += aligned_bytes(count * sizeof(float));
+    bytes += aligned_bytes(N*F*2) + aligned_bytes(G*P*4) + aligned_bytes(G*MERGED*2) +
+             aligned_bytes(G*P*2) + aligned_bytes(T*P*4);
+    return bytes;
+}
+}
+
 struct VisionEncoder::Impl {
+    int device = -1;
+    uint8_t* borrowed = nullptr;
+    uint64_t borrowed_bytes = 0, weight_end = 0, work_end = 0;
     int layers = 0, proj = 0, cap = 0, ng_cap = 0, tok_cap = 0;
     float eps = 1e-6f;
     cublasHandle_t blas = nullptr;   // borrowed from the VisionBlas
@@ -168,6 +186,7 @@ struct VisionEncoder::Impl {
     std::string err;
 
     ~Impl() {
+        const core::OnDevice on(device);
         core::MemoryAuditScope memory_audit("vision-release");
         for (void* p : owned) cudaFree(p);
         for (void* p : work) cudaFree(p);
@@ -177,11 +196,18 @@ struct VisionEncoder::Impl {
     template <class T>
     T* upload(const basalt::vision::TensorRef* t) {
         void* p = nullptr;
-        if (cudaMalloc(&p, t->bytes) != cudaSuccess) {
-            cudaGetLastError();
-            return nullptr;
+        if (borrowed) {
+            const uint64_t bytes = aligned_bytes(t->bytes);
+            if (weight_end > borrowed_bytes || bytes > borrowed_bytes - weight_end) return nullptr;
+            p = borrowed + weight_end;
+            weight_end += bytes;
+        } else {
+            if (cudaMalloc(&p, t->bytes) != cudaSuccess) {
+                cudaGetLastError();
+                return nullptr;
+            }
+            owned.push_back(p);
         }
-        owned.push_back(p);
         weight_bytes += t->bytes;
         if (cudaMemcpy(p, t->data, t->bytes, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
         return (T*) p;
@@ -189,11 +215,18 @@ struct VisionEncoder::Impl {
     template <class T>
     T* alloc(T*& slot, size_t count) {
         void* p = nullptr;
-        if (cudaMalloc(&p, count * sizeof(T)) != cudaSuccess) {
-            cudaGetLastError();
-            return nullptr;
+        if (borrowed) {
+            const uint64_t bytes = aligned_bytes(count * sizeof(T));
+            if (work_end > borrowed_bytes || bytes > borrowed_bytes - work_end) return nullptr;
+            p = borrowed + work_end;
+            work_end += bytes;
+        } else {
+            if (cudaMalloc(&p, count * sizeof(T)) != cudaSuccess) {
+                cudaGetLastError();
+                return nullptr;
+            }
+            work.push_back(p);
         }
-        work.push_back(p);
         tracked_work_bytes += count * sizeof(T);
         return slot = (T*) p;
     }
@@ -259,6 +292,7 @@ struct VisionEncoder::Impl {
         for (void* p : work) cudaFree(p);
         work.clear();
         tracked_work_bytes = 0;
+        work_end = weight_end;
         d_rows = x = g = g2 = q = k = v = ao = S = y = aout = dout = nullptr;
         act = mrg = h1 = nullptr;
         cap = ng_cap = tok_cap = 0;
@@ -268,7 +302,8 @@ struct VisionEncoder::Impl {
     // after the caller made room allocates them all again.
     bool ensure(int n, int ng, int ntok) {
         if (n <= cap && ng <= ng_cap && ntok <= tok_cap) return true;
-        const int want = std::max(n, cap), want_ng = std::max(ng, ng_cap), want_tok = std::max(ntok, tok_cap);
+        const int want = borrowed ? n : std::max(n, cap), want_ng = borrowed ? ng : std::max(ng, ng_cap),
+                  want_tok = borrowed ? ntok : std::max(ntok, tok_cap);
         drop_work();
         const size_t N = want;
         const bool ok = alloc(d_rows, N * kVisionPatchValues) && alloc(x, N * E) && alloc(g, N * QKV) && alloc(g2, N * F) &&
@@ -298,11 +333,25 @@ struct VisionEncoder::Impl {
 VisionEncoder::VisionEncoder() : impl_(new Impl) {}
 VisionEncoder::~VisionEncoder() = default;
 int VisionEncoder::width() const { return impl_->proj; }
-uint64_t VisionEncoder::device_bytes() const { return impl_->weight_bytes + impl_->tracked_work_bytes; }
+uint64_t VisionEncoder::device_bytes() const {
+    return impl_->borrowed ? impl_->borrowed_bytes : impl_->weight_bytes + impl_->tracked_work_bytes;
+}
+int VisionEncoder::device() const { return impl_->device; }
+uint64_t VisionEncoder::required_bytes(const basalt::vision::Mmproj& mp, const VisionPlan& plan) {
+    uint64_t bytes = workspace_bytes(plan.n_patches(), plan.lw*plan.lh, plan.n_tokens(), mp.hp().proj);
+    for (const auto& entry : mp.tensors()) bytes += aligned_bytes(entry.second.bytes);
+    return bytes;
+}
+bool VisionEncoder::fits(const VisionPlan& plan) const {
+    return !impl_->borrowed || workspace_bytes(plan.n_patches(), plan.lw*plan.lh, plan.n_tokens(), impl_->proj) <=
+                              impl_->borrowed_bytes - impl_->weight_end;
+}
 
 struct VisionBlas::Impl {
+    int device = -1;
     cublasHandle_t blas = nullptr;
     ~Impl() {
+        const core::OnDevice on(device);
         if (blas) cublasDestroy(blas);
     }
 };
@@ -310,8 +359,26 @@ struct VisionBlas::Impl {
 VisionBlas::VisionBlas() : impl_(new Impl) {}
 VisionBlas::~VisionBlas() = default;
 
+bool VisionBlas::close(std::string& err) {
+    if (!impl_->blas) return true;
+    const core::OnDevice on(impl_->device);
+    core::MemoryAuditScope memory_audit("vision-blas-release");
+    const auto handle = impl_->blas;
+    impl_->blas = nullptr;
+    if (cublasDestroy(handle) == CUBLAS_STATUS_SUCCESS) return true;
+    err = "cannot release the image product handle";
+    return false;
+}
+
 bool VisionBlas::open(std::string& err) {
-    if (impl_->blas) return true;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) { err = "cannot query the image encoder device"; return false; }
+    if (impl_->blas) {
+        if (impl_->device == device) return true;
+        err = "the image product handle belongs to a different device";
+        return false;
+    }
+    impl_->device = device;
     core::MemoryAuditScope memory_audit("vision-blas");
     core::MemoryAuditScope create_audit("vision-blas-create");
     if (cublasCreate(&impl_->blas) != CUBLAS_STATUS_SUCCESS) {
@@ -348,6 +415,7 @@ bool VisionBlas::open(std::string& err) {
 
 bool VisionEncoder::init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std::string& err) {
     core::MemoryAuditScope memory_audit("vision-init");
+    if (cudaGetDevice(&impl_->device) != cudaSuccess) { err = "cannot query the image encoder device"; return false; }
     if (!blas.open(err)) return false;
     impl_->blas = blas.impl_->blas;
     if (!impl_->load(mp, err)) {
@@ -358,6 +426,7 @@ bool VisionEncoder::init(const basalt::vision::Mmproj& mp, VisionBlas& blas, std
 }
 
 bool VisionEncoder::reserve(const VisionPlan& pl, std::string& err) {
+    const core::OnDevice on(impl_->device);
     Impl& s = *impl_;
     const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();
     if (s.ensure(n, ng, ntok)) return true;
@@ -367,7 +436,16 @@ bool VisionEncoder::reserve(const VisionPlan& pl, std::string& err) {
 
 static int blocks(size_t n) { return (int) ((n + 255) / 256); }
 
+bool VisionEncoder::init_borrowed(const basalt::vision::Mmproj& mp, VisionBlas& blas, void* storage, uint64_t bytes,
+                                 std::string& err) {
+    if (!storage || !bytes) { err = "no borrowed image encoder storage"; return false; }
+    impl_->borrowed = static_cast<uint8_t*>(storage);
+    impl_->borrowed_bytes = bytes;
+    return init(mp, blas, err);
+}
+
 bool VisionEncoder::encode(const std::vector<float>& rows, const VisionPlan& pl, std::vector<float>& out, std::string& err) {
+    const core::OnDevice on(impl_->device);
     core::MemoryAuditScope memory_audit("vision-encode");
     Impl& s = *impl_;
     const int n = pl.n_patches(), ng = pl.lw * pl.lh, ntok = pl.n_tokens();

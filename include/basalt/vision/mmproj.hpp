@@ -48,6 +48,7 @@ public:
     const Hparams& hp() const { return hp_; }
     /// The `projector` the file was opened as (the name its model asked for).
     const std::string& projector() const { return projector_; }
+    const std::map<std::string, TensorRef>& tensors() const { return tensors_; }
     /// A tensor by name; null when absent.
     const TensorRef* find(const std::string& name) const;
     /// A required tensor of the given type and element count (ne product); null with `err` set otherwise.
