@@ -34,6 +34,32 @@ DsModel::~DsModel() {
     if (experts_fd_ >= 0) platform::close_fd(experts_fd_);
 }
 
+std::string DsModel::expert_hotspots(const std::string& action) {
+    std::string result = hotspots_.command(action, geo().n_layers, geo().n_expert);
+    if (result.find("\"error\"") != std::string::npos) return result;
+    result.pop_back();
+    std::ostringstream out;
+    out << result << ",\"top_k\":" << geo().n_used << ",\"formats\":[";
+    for (size_t l = 0; l < pack_.experts.size(); ++l) {
+        const auto& e = pack_.experts[l];
+        if (l) out << ',';
+        out << "[\"" << ggml_type_name((ggml_type) e.gu_type) << "\",\""
+            << ggml_type_name((ggml_type) e.d_type) << "\"," << e.blob_bytes << ']';
+    }
+    out << "],\"overrides\":[";
+    bool comma = false;
+    if (has_overlay()) for (int l = 0; l < geo().n_layers; ++l) for (int e = 0; e < geo().n_expert; ++e) {
+        const auto* r = replacement(l, e);
+        if (!r) continue;
+        if (comma) out << ',';
+        comma = true;
+        out << '[' << l << ',' << e << ",\"" << ggml_type_name((ggml_type) r->layout.gu_type)
+            << "\",\"" << ggml_type_name((ggml_type) r->layout.d_type) << "\"," << r->layout.bytes << ']';
+    }
+    out << "]}";
+    return out.str();
+}
+
 bool DsModel::load_overlay(const std::string& path, std::string& err) {
     core::ModelFile file;
     if (!file.open(path, err)) return false;

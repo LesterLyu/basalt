@@ -18,6 +18,7 @@ class LayerOps {
 public:
     virtual ~LayerOps() = default;
     virtual void memory_usage(core::MemoryUsage&) const {}
+    virtual void route_prefill(bool) {}
     /// Attention of `layer` for the token at `pos`. `x` is the normed sublayer input [n_embd] (device); the result
     /// goes to `out` [n_embd] (device), after the output projection.
     virtual bool attention(int layer, int64_t pos, int32_t token, const float* x, float* out, void* stream,

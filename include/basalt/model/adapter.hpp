@@ -216,6 +216,8 @@ public:
     virtual int64_t context() const { return 0; }
     virtual Result make_session(std::unique_ptr<ModelSession>& out) = 0;
     virtual void memory_usage(core::MemoryUsage&) const {}
+    /// Host-only diagnostic control, callable by the input reader during inference.
+    virtual std::string expert_hotspots(const std::string&) { return "{\"supported\":false}"; }
 };
 
 /// The texts of the model's own tokens in the pack's vocabulary: the defaults of --eos-ids, --turn-token, --image-pad-id,

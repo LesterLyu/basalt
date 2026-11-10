@@ -98,6 +98,7 @@ public:
     virtual void after_input_start() {}
     virtual void print_info() = 0;   // the INFO line
     virtual void memory_usage(basalt::core::MemoryUsage&) const {}
+    virtual std::string expert_hotspots(const std::string&) { return "{\"supported\":false}"; }
     void report_memory(bool force = false);
     virtual bool memory_report_ready() const { return true; }
     Clock::time_point memory_at{};

@@ -340,6 +340,10 @@ def make_handler(target: Service | Router):
                         self._json(404, {"error": {"message": "model not found"}})
                     else:
                         self._json(200, router.metrics(shown))
+            elif path == "/api/expert-hotspots":
+                if self._authorized():
+                    name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+                    self._expert_hotspots("status", name)
             elif path == "/api/logs":
                 if self._authorized():
                     self._logs()
@@ -427,6 +431,10 @@ def make_handler(target: Service | Router):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path == "/api/expert-hotspots":
+                    if self._own_page("expert recording can be controlled"):
+                        self._expert_hotspots(req.get("action"), req.get("model"))
+                    return
                 if path.startswith("/v1/responses/"):        # nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -543,6 +551,23 @@ def make_handler(target: Service | Router):
                 self.watch_done.set()
             if self.live is not None:
                 router.live.close(self.live)
+
+        def _expert_hotspots(self, action, name):
+            if action not in ("status", "start", "pause", "reset"):
+                self._json(400, {"error": {"message": "use status, start, pause or reset"}})
+                return
+            target = router.shown() if name is None else router.service_for(name)
+            if target is None:
+                self._json(404, {"error": {"message": "model not found"}})
+                return
+            try:
+                out = target.engine.expert_hotspots(action)
+                out.update(model=target.model, captured_at=time.time(),
+                           scope="All slots; evaluated target-model routes, including rejected draft rows and re-read prompts. "
+                                 "Cached prompt rows and drafter routes are not counted.")
+                self._json(200, out)
+            except (EngineDied, ValueError) as e:
+                self._json(503, {"error": {"message": str(e)}})
 
         def _props(self):
             name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]

@@ -8,6 +8,7 @@
 <link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="web/app.css">
+<script defer src="web/hotspots.js"></script>
 <script defer src="web/app.js"></script>
 </head>
 <body>
@@ -102,18 +103,42 @@
         <div class="device-inference-speed">
           <div>
             <div class="device-speed-label"><b>Decode</b><span id="device-decode-source"></span></div>
-            <div class="num device-speed-rate" id="device-decode-rate">—</div>
+            <div class="num device-speed-rate" id="device-decode-rate"><span>—</span><small class="device-draft-accept"></small></div>
             <div id="device-decode-chart"></div>
           </div>
           <div>
             <div class="device-speed-label"><b>Prefill</b><span id="device-prefill-source"></span></div>
-            <div class="num device-speed-rate" id="device-prefill-rate">—</div>
+            <div class="num device-speed-rate" id="device-prefill-rate"><span>—</span><small class="device-speed-detail" aria-hidden="true">&nbsp;</small></div>
             <div id="device-prefill-chart"></div>
+          </div>
+          <div title="Primary expert cache hits divided by primary-cache plus CPU lookups, as reported by the engine's hit statistic. Helper and offloaded routes are excluded from this denominator.">
+            <div class="device-speed-label"><b>VRAM hit</b><span id="device-hit-source">Last request</span></div>
+            <div class="num device-speed-rate" id="device-hit-rate"><span>—</span><small class="device-speed-detail">Expert cache</small></div>
+            <div class="device-hit-meter" id="device-hit-meter"></div>
           </div>
         </div>
         <div class="device-engine-status"><span>Engine</span><b id="device-engine-action" role="status">Connecting</b></div>
       </section>
     </div>
+    <details class="card expert-hotspots" id="expert-hotspots">
+      <summary><b>Expert hotspots</b><span id="hotspot-state">Off by default</span></summary>
+      <div class="hotspot-content">
+        <div class="hotspot-controls">
+          <button type="button" id="hotspot-toggle" disabled>Start recording</button>
+          <button type="button" id="hotspot-reset" disabled>Clear</button>
+          <label>View <select id="hotspot-phase"><option value="decode">Decode / verify</option><option value="prefill">Prefill</option><option value="combined">Combined</option></select></label>
+          <label>Show <select id="hotspot-limit"><option value="25">Top 25</option><option value="100" selected>Top 100</option><option value="500">Top 500</option><option value="1000">Top 1000</option><option value="all">All active</option><option value="custom">Custom</option></select></label>
+          <input type="number" id="hotspot-custom-limit" aria-label="Custom expert limit" value="250" min="1" step="1" hidden>
+          <label>Label <input id="hotspot-label" maxlength="80" placeholder="e.g. geth-go-thinking"></label>
+          <button type="button" id="hotspot-copy" aria-live="polite" disabled>Copy Markdown</button>
+          <button type="button" id="hotspot-csv" disabled>Export CSV</button>
+          <button type="button" id="hotspot-md" disabled>Export Markdown</button>
+        </div>
+        <p class="hint" id="hotspot-note" role="status">Open this panel to connect. Recording stays off until started.</p>
+        <div class="hotspot-table" id="hotspot-table"></div>
+        <p class="hint">All slots are combined. Counts include target-model draft verification, including rejected rows; cached prompt rows and drafter experts are excluded. Layer-relative heat is frequency versus that layer's mean, not evidence of domain specialization or a quality gain. Clear before a new workload. Counts are lost when the engine restarts.</p>
+      </div>
+    </details>
     <div class="device-grid" id="device-grid"><div class="card empty">Waiting for hardware readings…</div></div>
   </div>
 </main>

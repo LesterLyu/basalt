@@ -323,13 +323,17 @@ tr.live td { color: var(--accent); }
 .devices-heading h1 { margin: 0; font-size: 24px; letter-spacing: -.025em; line-height: 1.1; }
 .devices-heading p { margin: 4px 0 6px; color: var(--fg-2); }
 .badge { display: inline-block; padding: 4px 9px; border: 1px solid var(--line); border-radius: 6px; color: var(--fg-2); font: 12px/1.4 var(--font-mono); }
-.device-inference { flex: 0 1 380px; min-width: 0; }
-.device-inference-speed { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+.device-inference { flex: 0 1 510px; min-width: 0; }
+.device-inference-speed { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) minmax(0, 1fr); }
 .device-inference-speed > div { min-width: 0; padding: 5px 9px; }
 .device-inference-speed > div + div { border-left: 1px solid var(--line); }
 .device-speed-label, .device-speed-rate { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
 .device-speed-label span, .device-speed-rate small, .device-engine-status > span { color: var(--fg-2); font-size: 11px; }
 .device-speed-rate { flex-wrap: wrap; gap: 0 6px; font-size: 18px; font-weight: 500; }
+.device-speed-rate .device-draft-accept, .device-speed-rate .device-speed-detail { flex-basis: 100%; min-height: 1.4em; line-height: 1.4; white-space: nowrap; }
+.device-hit-meter { display: flex; align-items: center; height: 16px; margin-top: 3px; }
+.device-hit-meter > div { width: 100%; height: 4px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.device-hit-meter i { display: block; height: 100%; background: var(--fg-2); }
 .devices-page .device-inference-speed .sb-ch { height: 16px; }
 .device-engine-status { display: flex; align-items: baseline; gap: 8px; padding: 4px 9px; border-top: 1px solid var(--line); }
 .device-engine-status b { min-width: 0; overflow-wrap: anywhere; font-size: 12px; font-weight: 500; }
@@ -380,3 +384,19 @@ tr.live td { color: var(--accent); }
 .device-chart .metric-row b small { margin-left: 3px; }
 .devices-page .sb-ch { position: relative; height: 23px; margin-top: 3px; overflow: hidden; }
 .devices-page .sb-ch svg { display: block; width: 100%; height: 100%; }
+.expert-hotspots { margin-bottom: 14px; }
+.expert-hotspots summary { display: flex; justify-content: space-between; gap: 12px; cursor: pointer; padding: 14px 16px; }
+.expert-hotspots summary span { color: var(--fg-2); font: 12px/1.5 var(--font-mono); }
+.hotspot-content { padding: 0 16px 14px; }
+.hotspot-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.hotspot-controls label { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--fg-2); }
+.hotspot-controls button, .hotspot-controls select, .hotspot-controls input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--fg); font: inherit; font-size: 12px; }
+.hotspot-controls button { cursor: pointer; }
+.hotspot-controls button:disabled { opacity: .45; cursor: default; }
+.hotspot-controls input { width: 170px; max-width: 100%; }
+.hotspot-controls #hotspot-custom-limit { width: 72px; }
+.hotspot-controls #hotspot-copy { min-width: 128px; }
+.hotspot-table { max-height: 330px; overflow: auto; margin-top: 10px; }
+.hotspot-table table { width: 100%; border-collapse: collapse; font: 12px/1.5 var(--font-mono); white-space: nowrap; }
+.hotspot-table th, .hotspot-table td { padding: 5px 9px; text-align: right; border-bottom: 1px solid var(--line); }
+.hotspot-table th { position: sticky; top: 0; background: var(--panel); color: var(--fg-2); }

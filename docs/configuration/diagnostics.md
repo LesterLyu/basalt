@@ -17,6 +17,13 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 
 ## Timing and profiles
 
+The WebUI's **Devices → Expert hotspots** panel records target-model expert routing for DeepSeek. Recording is off
+until started, can be paused/resumed, and clears on engine restart. Clear before a new workload. Prefill and decode/verify
+have separate counts across all slots; reused prompt rows and drafter routes are excluded, rejected verify rows included.
+It uses existing host router IDs, with no extra device transfers. CSV exports every expert and its current format/overlay;
+Markdown export and clipboard copy follow the panel's configurable row limit (including custom counts or all active
+experts); CSV always includes every expert. Layer-relative frequency is not proof of domain specialization or improved quality.
+
 | Flag | Binary | What it does |
 |---|---|---|
 | `--stats` | CLI | Per-token wall time, host phases and the pool's breakdown. |

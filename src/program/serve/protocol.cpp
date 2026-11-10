@@ -236,6 +236,20 @@ int Runtime::init_protocol() {
         while (getline_fd(l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l == "STOP") { stop_req.store(true); continue; }
+            if (l.rfind("HOTSPOTS ", 0) == 0) {
+                // Host counters only: no queued GPU work is drained or paused for this diagnostic.
+                std::istringstream args(l.substr(9));
+                uint64_t seq = 0;
+                std::string action, extra;
+                std::string result = "{\"error\":\"invalid hotspot command\"}";
+                if ((args >> seq >> action) && !(args >> extra)) {
+                    try { result = expert_hotspots(action); }
+                    catch (const std::exception&) { result = "{\"error\":\"cannot snapshot expert counters\"}"; }
+                }
+                std::printf("HOTSPOTS %llu %s\n", (unsigned long long) seq, result.c_str());
+                std::fflush(stdout);
+                continue;
+            }
             if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0) {
                 std::string rewritten;
                 const bool framed = take_text(l, rewritten);
@@ -281,7 +295,7 @@ int Runtime::init_protocol() {
 
 int Runtime::announce() {
     print_info();
-    std::printf("INFO memory=1\n");
+    std::printf("INFO memory=1 expert_hotspots_protocol=1\n");
     {
         std::string ends;
         for (const int64_t id : o.eos_ids) ends += (ends.empty() ? "" : ",") + std::to_string((long long) id);

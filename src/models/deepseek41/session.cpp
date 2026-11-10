@@ -239,6 +239,7 @@ public:
     }
 
     model::Result decode_window(const model::DecodeRequest& r) override {
+        ops_->route_prefill(false);
         if (r.row_tokens) {
             if (r.n_tokens > kMaxWindow) return {model::Status::Error, "deepseek41: the decode window is too long"};
             std::string err;
@@ -259,6 +260,7 @@ public:
     }
 
     model::Result prefill_chunk(const model::PrefillRequest& r) override {
+        ops_->route_prefill(true);
         if (!prefillp::may_resume(r.pos, (int64_t) hist_.size(), whole_from_)) return {model::Status::Error, kSkippedRows};
         sync_rewind(r.pos);
         settle_tier();

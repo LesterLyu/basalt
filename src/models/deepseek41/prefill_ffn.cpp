@@ -182,6 +182,7 @@ public:
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
         cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        m_.hotspots().record(il, hid.data(), T * K, true);
         std::vector<std::vector<int32_t>> by((size_t) g_.n_expert);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= g_.n_expert) {
@@ -863,6 +864,7 @@ private:
         std::vector<int32_t> hid((size_t) T * K);
         cudaStreamSynchronize(st);
         cudaMemcpy(hid.data(), ids, hid.size() * 4, cudaMemcpyDeviceToHost);
+        m_.hotspots().record(il, hid.data(), T * K, true);
         std::vector<std::vector<int32_t>> by((size_t) NE);   // pair = t * K + slot
         for (int e = 0; e < T * K; ++e) {
             if (hid[(size_t) e] < 0 || hid[(size_t) e] >= NE) {

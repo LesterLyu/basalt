@@ -457,7 +457,7 @@ const vramLabels = {weights: "Model weights", experts: "Expert cache", expert_he
   long_prefill: "Prefill workspace", dspark: "DSpark", mtp: "MTP", vision: "Vision workspace",
   sampler: "Sampler cache", system_reserved: "System reserved", other_apps: "Other apps"};
 const hostLabels = {resident_experts: "Resident experts", expert_homes: "Evicted / borrowed experts",
-  checkpoints: "Conversation checkpoints", expert_swap_workspace: "Expert swap workspace",
+  checkpoints: "Conversation checkpoints", expert_swap_workspace: "Expert swap workspace", expert_hotspots: "Expert hotspot counters",
   expert_prefetch: "Expert prefetch ring", expert_staging: "Expert upload staging",
   prefill_activations: "Prefill activations", embedding_workspace: "Token embedding staging",
   engram_workspace: "Engram buffers", engram_reader: "Engram row cache & I/O",
@@ -541,7 +541,7 @@ function drawDeviceInference(live, eng, hist, reqs) {
   const samples = tail(hist.tok_s), scale = nice(Math.max(40, ...samples.filter(num)));
   text($("#device-decode-source"), active ? "Live" : last ? "Last request" : "Idle");
   html($("#device-decode-rate"), '<span>' + (num(rate) ? fmt(rate, 1) + ' <small>tok/s</small>' : dash) + '</span>' +
-    (acceptance ? '<small>' + acceptance + '</small>' : ''));
+    '<small class="device-draft-accept">' + acceptance + '</small>');
   html($("#device-decode-chart"), sbChart(samples, 0, scale, true));
 
   const phases = live.phases || [];
@@ -551,8 +551,17 @@ function drawDeviceInference(live, eng, hist, reqs) {
   const prefill = reading ? live.prefill_tok_s_mean : lastPrompt ? readOf(lastPrompt) * 1000 / lastPrompt.prompt_ms : null;
   const prefillSamples = tail(hist.prefill_tok_s_mean);
   text($("#device-prefill-source"), reading ? "Live" : lastPrompt ? "Last request" : "Idle");
-  html($("#device-prefill-rate"), prefill > 0 ? fmt(prefill) + ' <small>tok/s</small>' : dash);
+  html($("#device-prefill-rate"), '<span>' + (prefill > 0 ? fmt(prefill) + ' <small>tok/s</small>' : dash) +
+    '</span><small class="device-speed-detail" aria-hidden="true">&nbsp;</small>');
   html($("#device-prefill-chart"), sbChart(prefillSamples, 0, nice(Math.max(1000, ...prefillSamples.filter(num))), false));
+
+  const lastHit = reqs.find(r => num(r.hit_rate));
+  const resident = !eng.spill && num(eng.expert_slots) && num(eng.expert_total) && eng.expert_total > 0 && eng.expert_slots >= eng.expert_total;
+  const hit = resident ? 1 : lastHit?.hit_rate;
+  text($("#device-hit-source"), resident ? "Resident" : lastHit ? "Last request" : "Idle");
+  html($("#device-hit-rate"), '<span>' + (num(hit) ? fmt(clamp(hit, 0, 1) * 100, 1) + '<small>%</small>' : dash) +
+    '</span><small class="device-speed-detail">Expert cache</small>');
+  html($("#device-hit-meter"), '<div>' + (num(hit) ? `<i style="width:${clamp(hit, 0, 1) * 100}%"></i>` : '') + '</div>');
 
   const actions = {
     reading: "Reading the prompt", generating: "Generating", unloaded: "Model unloaded", asleep: "Asleep", idle: "Idle",
@@ -562,6 +571,119 @@ function drawDeviceInference(live, eng, hist, reqs) {
   text($("#device-engine-action"), action);
 }
 const onDevices = () => location.hash === "#devices";
+
+/* ---- opt-in route counters, independent of inference and the log feed ---- */
+let hotspot = null, hotspotBusy = false;
+const hotspotButtons = ["toggle", "reset", "copy", "csv", "md"];
+function hotspotLimit() {
+  const value = $("#hotspot-limit").value;
+  if (value === "all") return null;
+  const n = Number(value === "custom" ? $("#hotspot-custom-limit").value : value);
+  return clamp(Number.isFinite(n) ? Math.floor(n) : 100, 1, hotspot?.layers * hotspot?.experts || 100000);
+}
+try {
+  const saved = JSON.parse(localStorage.getItem("basalt.hotspot-view") || "null");
+  if (saved && ["25", "100", "500", "1000", "all", "custom"].includes(saved.limit)) {
+    $("#hotspot-limit").value = saved.limit;
+    if (Number.isInteger(saved.custom) && saved.custom > 0) $("#hotspot-custom-limit").value = saved.custom;
+  }
+} catch (_) { /* browser storage may be unavailable */ }
+$("#hotspot-custom-limit").hidden = $("#hotspot-limit").value !== "custom";
+function drawHotspots() {
+  const supported = !!hotspot?.supported;
+  text($("#hotspot-state"), supported ? hotspot.recording ? "Recording" : hotspot.decode.length ? "Paused" : "Off" : "Unavailable");
+  text($("#hotspot-toggle"), hotspot?.recording ? "Pause recording" : hotspot?.decode?.length ? "Resume recording" : "Start recording");
+  for (const id of hotspotButtons) $("#hotspot-" + id).disabled = !supported || hotspotBusy;
+  if (!supported) {
+    text($("#hotspot-note"), hotspot?.reason || "Load a supported engine to record hotspots.");
+    html($("#hotspot-table"), "");
+    return;
+  }
+  const rows = ExpertHotspotReport.rows(hotspot, $("#hotspot-phase").value);
+  const total = rows.reduce((a, r) => a + r.count, 0), active = rows.filter(r => r.count), shown = ExpertHotspotReport.selected(rows, hotspotLimit());
+  text($("#hotspot-note"), `${hotspot.model} · ${fmt(total)} evaluated routes · ${fmt(active.length)} active experts · showing ${fmt(shown.length)} of ${fmt(active.length)} · zero-based IDs`);
+  html($("#hotspot-table"), shown.length ? '<table><thead><tr><th>Rank</th><th>Layer</th><th>Expert</th><th>Count</th><th>Layer-relative</th><th>Gate/up · Down</th><th>Overlay</th></tr></thead><tbody>' +
+    shown.map(r => `<tr><td>${r.rank}</td><td>${r.layer}</td><td>${r.expert}</td><td>${fmt(r.count)}</td><td>${r.relative.toFixed(2)}×</td><td>${esc(r.gate_up)} · ${esc(r.down)}</td><td>${r.overlay ? "Yes" : ""}</td></tr>`).join("") + '</tbody></table>' : "");
+}
+async function hotspotRequest(action = "status") {
+  if (hotspotBusy) return null;
+  hotspotBusy = true;
+  for (const id of hotspotButtons) $("#hotspot-" + id).disabled = true;
+  try {
+    const model = M?.engine?.model;
+    let result;
+    if (action === "status") result = await get("api/expert-hotspots" + (model ? `?model=${encodeURIComponent(model)}` : ""));
+    else {
+      const r = await fetch("api/expert-hotspots", {method: "POST", headers: {"Content-Type": "application/json",
+        ...(apiKey ? {Authorization: `Bearer ${apiKey}`} : {})}, body: JSON.stringify({action, model})});
+      result = await r.json();
+      if (!r.ok) throw new Error(result.error?.message || `HTTP ${r.status}`);
+    }
+    hotspot = result;
+    return result;
+  } catch (e) {
+    hotspot = {supported: false, reason: e.message};
+    return null;
+  } finally { hotspotBusy = false; drawHotspots(); }
+}
+$("#expert-hotspots").addEventListener("toggle", () => { if ($("#expert-hotspots").open) hotspotRequest(); });
+$("#hotspot-toggle").onclick = () => hotspotRequest(hotspot?.recording ? "pause" : "start");
+$("#hotspot-reset").onclick = () => hotspotRequest("reset");
+$("#hotspot-phase").onchange = drawHotspots;
+function saveHotspotLimit() {
+  try { localStorage.setItem("basalt.hotspot-view", JSON.stringify({limit: $("#hotspot-limit").value,
+    custom: Number($("#hotspot-custom-limit").value)})); } catch (_) { /* keep the in-page choice */ }
+}
+function changeHotspotLimit() {
+  const custom = $("#hotspot-limit").value === "custom";
+  $("#hotspot-custom-limit").hidden = !custom;
+  if (custom) $("#hotspot-custom-limit").value = hotspotLimit();
+  saveHotspotLimit();
+  drawHotspots();
+}
+$("#hotspot-limit").onchange = changeHotspotLimit;
+$("#hotspot-custom-limit").onchange = changeHotspotLimit;
+$("#hotspot-custom-limit").oninput = () => {
+  if ($("#hotspot-custom-limit").value && $("#hotspot-custom-limit").validity.valid) {
+    saveHotspotLimit(); drawHotspots();
+  }
+};
+async function copyHotspots() {
+  if (!hotspot?.supported) return;
+  // Copy the visible snapshot without an intervening fetch, keeping the click's clipboard permission.
+  const s = hotspot, phase = $("#hotspot-phase").value, limit = hotspotLimit();
+  const body = ExpertHotspotReport.markdown(s, phase, $("#hotspot-label").value.trim(), limit);
+  const button = $("#hotspot-copy");
+  let copied = false;
+  try { await navigator.clipboard.writeText(body); copied = true; } catch (_) { /* plain HTTP or clipboard blocked */ }
+  if (!copied) {
+    const focus = document.activeElement, area = document.createElement("textarea");
+    area.value = body; area.readOnly = true; area.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.append(area); area.select();
+    try { copied = document.execCommand("copy"); } catch (_) { /* export remains available */ }
+    area.remove(); focus?.focus({preventScroll: true});
+  }
+  text(button, copied ? "Copied" : "Copy failed");
+  button.title = copied ? "Copied the selected view and row count as Markdown." : "Clipboard unavailable. Use Export Markdown.";
+  setTimeout(() => text(button, "Copy Markdown"), 2000);
+}
+$("#hotspot-copy").onclick = copyHotspots;
+async function exportHotspots(markdown) {
+  const s = await hotspotRequest();
+  if (!s?.supported) return;
+  const phase = $("#hotspot-phase").value, label = $("#hotspot-label").value.trim();
+  const body = markdown ? ExpertHotspotReport.markdown(s, phase, label, hotspotLimit()) : ExpertHotspotReport.csv(s, phase, label);
+  const url = URL.createObjectURL(new Blob([body], {type: markdown ? "text/markdown;charset=utf-8" : "text/csv;charset=utf-8"}));
+  const a = document.createElement("a"); a.href = url;
+  a.download = `expert-hotspots-${phase}-${new Date(s.captured_at * 1000).toISOString().replace(/[:.]/g, "-")}.${markdown ? "md" : "csv"}`;
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+$("#hotspot-csv").onclick = () => exportHotspots(false);
+$("#hotspot-md").onclick = () => exportHotspots(true);
+async function pollHotspots() {
+  if (onDevices() && $("#expert-hotspots").open) await hotspotRequest();
+  setTimeout(pollHotspots, 2000);
+}
 function showPage() {
   const devices = onDevices();
   $("#overview").hidden = devices;
@@ -670,4 +792,4 @@ $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
 window.addEventListener("hashchange", showPage);
 showPage();
-pollMetrics(); pollLog();
+pollMetrics(); pollLog(); pollHotspots();

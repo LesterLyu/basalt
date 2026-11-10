@@ -743,6 +743,7 @@ public:
                                std::string& err) override {
         return routed_run(il, w, out, nullptr, stream, err);
     }
+    void route_prefill(bool on) override { route_prefill_ = on; }
 
     bool routed_and_shared_staged(int il, const float*, const int32_t*, const float* w, float* out, float* shared_out,
                                   void* stream, std::string& err) override {
@@ -774,6 +775,7 @@ public:
         }
         tier_->pump(il, 2 + T);   // what this layer's head leaves the bus of the promotions queued before it
         await_ids(st, T * K);
+        m_.hotspots().record(il, h_ids_, T * K, route_prefill_);
         int32_t uniq[ExpertTier::kMaxK];
         int nu = 0;
         int uidx[ExpertTier::kMaxK];   // [t * K + k] -> index in uniq
@@ -945,6 +947,7 @@ public:
         tier_->pump(il, 3);
         if (shared_out) await_ids(st, K);
         else cudaStreamSynchronize(st);
+        m_.hotspots().record(il, h_ids_, K, route_prefill_);
         ExpertTier::Lookup lk;
         if (!tier_->lookup(il, h_ids_, K, lk, err)) return false;
         const int n_fetched = tier_->fetch(il, lk);
@@ -1094,6 +1097,7 @@ public:
     }
 
 private:
+    bool route_prefill_ = false;
     /// What `to` queues from now on runs after what `from` has queued so far (a branch's fork or join).
     static bool after(cudaStream_t from, cudaStream_t to, cudaEvent_t ev) {
         return cudaEventRecord(ev, from) == cudaSuccess && cudaStreamWaitEvent(to, ev, 0) == cudaSuccess;

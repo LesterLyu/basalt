@@ -130,6 +130,7 @@ public:
         model_.memory_usage(usage);
         for (const auto& s : sessions_) s->memory_usage(usage);
     }
+    std::string expert_hotspots(const std::string& action) override { return model_.expert_hotspots(action); }
     bool windows_in_flight() override { return false; }
     bool next_batch_window() override;
     bool drain_windows() override { return true; }

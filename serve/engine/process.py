@@ -113,8 +113,9 @@ def relay_auto_flags(line: str) -> bool:
 
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
-PROTOCOL_LINES = (AUTO_FLAGS, "MEMORY ", "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
+PROTOCOL_LINES = (AUTO_FLAGS, "MEMORY ", "HOTSPOTS ", "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ",
+                  "RESUME ", "REUSED ", "DONE", "ERR", "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ",
+                  "ENC ", "VIDEO ")
 
 
 def log_unparsed(line: str, log) -> None:
@@ -251,6 +252,10 @@ class ProcessEngine:
         self.info = {}                   # INFO key=value facts
         self.video = None                # the in-engine encoder's VIDEO line: "on ..." or "off <reason>"
         self.conversation = {}           # the cache's figures from the engine's CONV lines; this process's only
+        self.hotspot_q = queue.Queue()
+        self.hotspot_lock = threading.Lock()
+        self.hotspot_seq = 0
+        self.wlock = threading.Lock()                   # also used by control-only/lazy engines
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens, from PP lines
         self.silent_note = None
@@ -373,7 +378,6 @@ class ProcessEngine:
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is
         self._yielded = None                            # (slot, tokens read) of a read that gave way
         self._ctl_erred = False                         # the control lines ended on an ERR
-        self.wlock = threading.Lock()                   # serializes stdin writes
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
@@ -401,10 +405,14 @@ class ProcessEngine:
     def _pump(self):
         proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
         slot_q = self.slot_q
+        hotspot_q = self.hotspot_q
         line = None
         for line in proc.stdout:
             line = engine_line(line)
             log_unparsed(line, log)
+            if line.startswith("HOTSPOTS "):
+                hotspot_q.put(line)
+                continue
             if line.startswith("MEMORY "):
                 if self.proc is proc:
                     self._note_memory(line)
@@ -440,6 +448,7 @@ class ProcessEngine:
             if line and line.startswith("ERR"):         # why it exited, when no request read it
                 self.last_err = line[4:].strip()
         lines.put(None)
+        hotspot_q.put(None)
         for q in slot_q:
             q.put(None)
 
@@ -463,6 +472,39 @@ class ProcessEngine:
 
     def ram_usage(self) -> dict:
         return dict(getattr(self, "_memory_snapshot", ({}, {}))[1])
+
+    def expert_hotspots(self, action="status", timeout=10.0) -> dict:
+        """Host-only counters use their own reply channel, including during a live single-slot request."""
+        if action not in ("status", "start", "pause", "reset"):
+            raise ValueError("unknown hotspot action")
+        if not self.alive():
+            return {"supported": False, "reason": "Load the model to record expert hotspots."}
+        if not self.info.get("expert_hotspots_protocol"):
+            return {"supported": False, "reason": "This engine build does not support live expert recording."}
+        with self.hotspot_lock:
+            proc, replies = self.proc, self.hotspot_q
+            self.hotspot_seq += 1
+            seq = self.hotspot_seq
+            self._send(f"HOTSPOTS {seq} {action}")
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    line = replies.get(timeout=max(0.001, deadline - time.monotonic()))
+                except queue.Empty:
+                    raise ValueError("the engine did not answer the hotspot command") from None
+                if line is None or self.proc is not proc:
+                    raise EngineDied("the engine ended during the hotspot command")
+                _, reply_seq, payload = line.split(" ", 2)
+                if int(reply_seq) == seq:
+                    out = json.loads(payload)
+                    if "error" in out:
+                        raise ValueError(out["error"])
+                    if not out.get("supported"):
+                        out["reason"] = "Live expert recording is not available for this model."
+                    out["engine_session"] = f"{proc.pid}:{self.gen}"
+                    return out
+                if time.monotonic() >= deadline:
+                    raise ValueError("the engine did not answer the hotspot command")
 
     def death_note(self) -> str:
         """What is known of why the engine ended: its exit code or signal and its last error line, never a guess."""
@@ -629,8 +671,7 @@ class ProcessEngine:
         """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write(command + "\n")
-        self.proc.stdin.flush()
+        self._send(command)
         what = command.split()[0]
         deadline = time.time() + timeout
         while True:
@@ -1409,16 +1450,17 @@ class ProcessEngine:
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
-            if text is not None:
-                body = text.text
-                spans = text.byte_spans()
-                plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
-                clip = " clip=1" if text.clip else ""
-                self.proc.stdin.write(f"GENT {int(max_new)}{self.sampling_keys(sampling or {})}{clip} "
-                                      f"{len(body.encode('utf-8'))}{plain}\n{body}")
-            else:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-            self.proc.stdin.flush()
+            with self.wlock:
+                if text is not None:
+                    body = text.text
+                    spans = text.byte_spans()
+                    plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
+                    clip = " clip=1" if text.clip else ""
+                    self.proc.stdin.write(f"GENT {int(max_new)}{self.sampling_keys(sampling or {})}{clip} "
+                                          f"{len(body.encode('utf-8'))}{plain}\n{body}")
+                else:
+                    self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+                self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
@@ -1512,8 +1554,7 @@ class ProcessEngine:
             if not done:                                  # consumer left early: STOP and drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        self._send("STOP")
                     except OSError:
                         pass
                 # never wait untimed: this holds the request FIFO. With STOP the whole drain gets the current
@@ -1559,9 +1600,10 @@ class ProcessEngine:
         try:
             if self.proc.poll() is None:
                 try:
-                    self.proc.stdin.write("QUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # the engine must see EOF before shutdown
+                    with self.wlock:
+                        self.proc.stdin.write("QUIT\n")
+                        self.proc.stdin.flush()
+                        self.proc.stdin.close()  # the engine must see EOF before shutdown
                     self.proc.wait(timeout=self.quit_s)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
