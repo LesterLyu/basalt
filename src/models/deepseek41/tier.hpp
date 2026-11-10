@@ -88,6 +88,9 @@ public:
     /// reclaimable segments go back whole, and reclaim() maps them again at the same addresses. Homes stay.
     void lend_all();
     bool reclaim(std::string& err);
+    /// Temporarily use the helper's existing slot storage; GPU-only weights return to RAM first.
+    bool borrow_peer_workspace(uint64_t bytes, void*& storage, uint64_t& capacity, std::string& err);
+    bool return_peer_workspace(std::string& err);
     /// Main card bytes the tier, the caches and the prompt path leave free: --vram-reserve-mib, or `mib` once set
     /// (`mib` < 0: back to the start's). The arena is not resized here.
     void set_free_floor(int64_t mib);
@@ -221,7 +224,8 @@ private:
     void return_place(int layer, int place);
     void pack_extra_ram();
     uint64_t resident_ram_bytes() const;
-    bool restore_primary(int64_t first, std::string& err);
+    bool restore_experts(bool helper, int64_t first, std::string& err, std::vector<int>* backed = nullptr);
+    void release_peer_backing();
     bool shrink_cache(core::ExpertCache& cache, uint64_t offset, uint64_t keep, std::string& err);
     uint64_t refill_reserve() const;
     int main_slot(int layer, int rank) const;
@@ -326,6 +330,10 @@ private:
     struct PeerSubmitter;
     struct PeerCompute;
     std::unique_ptr<core::PeerExperts> peer_;
+    uint64_t peer_workspace_bytes_ = 0;
+    uint64_t peer_workspace_pool_limit_ = 0;
+    std::vector<std::pair<int32_t, int32_t>> peer_workspace_lent_;
+    std::vector<int> peer_workspace_backed_;
     std::unique_ptr<prefill::PeerShare> share_;
     std::vector<prefill::ShareRates> rates_;    ///< [layer]
     std::unique_ptr<PeerSubmitter> peer_submitter_;

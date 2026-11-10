@@ -17,6 +17,8 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <charconv>
+#include <cstring>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -50,6 +52,8 @@ public:
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
         m->set_tiers(req);
         if (!req.peer_devices.empty()) m->set_peer_device(req.peer_devices.front());
+        if (req.vision_device >= 0 && req.vision_device != m->device() && req.vision_device != m->peer_device())
+            return {model::Status::Error, "deepseek41: --vision-gpu must name the main card or its expert helper"};
         if (req.peer_devices.size() > 1) basalt::log::warn("basalt deepseek41", "one second card holds experts; later cards idle");
         out = std::move(m);
         return {};
@@ -98,6 +102,15 @@ public:
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(args.next("--prefill-chunk"));
         else if (a == "--ds-gpu-single-miss") o.gpu_single_miss = true;
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
+        else if (a == "--vision-gpu") {
+            const char* value = args.next("--vision-gpu");
+            const char* end = value + std::strlen(value);
+            const auto parsed = std::from_chars(value,end,o.vision_device);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || o.vision_device < 0) {
+                basalt::log::error("basalt deepseek41", "--vision-gpu: expected a non-negative CUDA device number");
+                code = 2;
+            }
+        }
         else if (a == "--diag-teacher") o.diag_teacher = true;
         else if (a == "--diag-tier-timing") o.diag_tier_timing = true;
         else if (a == "--diag-tier-frozen") o.diag_tier_frozen = true;

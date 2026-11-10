@@ -137,6 +137,13 @@ std::unique_ptr<ExpertRam> DsModel::acquire_expert_ram(uint64_t bytes) const {
     return ram;
 }
 
+void DsModel::trim_expert_ram_pool(uint64_t limit) const {
+    while (swap_pool_bytes_ > limit && !swap_pool_.empty()) {
+        swap_pool_bytes_ -= swap_pool_.back()->allocated();
+        swap_pool_.pop_back();
+    }
+}
+
 void DsModel::recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const {
     TierScope scope(tier_profile_,TierProfile::Recycle);
     constexpr uint64_t capacity = 1ull<<30;

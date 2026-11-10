@@ -110,12 +110,17 @@ def model_config(spec: ModelSpec, engine_bin: str, vision_max_tokens: int | None
            "arch": (meta.get("gguf_kv") or {}).get("general.architecture"), "log": str(cdir / "engine.log"),
            "tokenizer": tokenizer_files(mf)}
     if vision and dialect_for(cfg["arch"]).in_engine_vision:
-        if vision != "dynamic":
-            raise ValueError(f"this model's images are encoded in the engine: --vision dynamic, not {vision}")
+        card = int(vision) if str(vision).isascii() and str(vision).isdigit() else None
+        if vision != "dynamic" and card is None:
+            raise ValueError(f"this model's images are encoded in the engine: use dynamic or a GPU number, not {vision}")
+        if vision_max_tokens is not None:
+            raise ValueError("this model's in-engine image encoder uses its own token limit")
         if "vision/mmproj" not in mf.sections:
             raise ValueError("this model file has no vision projector (vision/mmproj); drop --vision")
         args.append("--vision")
         cfg["vision"] = {"mode": "dynamic", "gpu": True}
+        if card is not None:
+            cfg["vision"]["card"] = card
         return cfg
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:

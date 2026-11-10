@@ -78,11 +78,9 @@ bool PromptHost::open(const DsModel& m, int pieces, int slots, bool vision, std:
     }
     if (vision) {
         images_.resize((size_t) slots);
-        for (Image& im : images_) {
-            take(im.picture.rgb, (size_t) vision::kMaxImagePixels * 3);
-            const size_t merge = (size_t) VisionPlan{}.merge;
-            take(im.patches, (size_t) kVisionMaxTokens * merge * merge * kVisionPatchValues);
-        }
+        const uint64_t merge = (uint64_t) VisionPlan{}.merge;
+        image_budget_ = (uint64_t)slots * ((uint64_t)vision::kMaxImagePixels * 3 +
+            (uint64_t)kVisionMaxTokens * merge * merge * kVisionPatchValues * sizeof(float));
     }
     return true;
 }

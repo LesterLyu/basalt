@@ -46,6 +46,7 @@ public:
     void release();
 
     const Hparams& hp() const { return hp_; }
+    const std::map<std::string, TensorRef>& tensors() const { return tensors_; }
     /// A tensor by name; null when absent.
     const TensorRef* find(const std::string& name) const;
     /// A required tensor of the given type and element count (ne product); null with `err` set otherwise.

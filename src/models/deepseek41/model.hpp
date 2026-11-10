@@ -63,6 +63,8 @@ public:
     void release_replacement_ram(int layer, int expert) const;
     std::unique_ptr<ExpertRam> acquire_expert_ram(uint64_t bytes) const;
     void recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const;
+    uint64_t expert_ram_pool_bytes() const { return swap_pool_bytes_; }
+    void trim_expert_ram_pool(uint64_t limit) const;
     uint64_t overlay_max_bytes(int layer = -1) const {
         uint64_t bytes = 0;
         if (has_overlay())
@@ -137,6 +139,7 @@ public:
     void set_peer_device(int d) { peer_device_ = d; }
     /// The CUDA device the dense tensors live on.
     int device() const { return device_; }
+    int vision_device() const { return tiers_.vision_device >= 0 ? tiers_.vision_device : device_; }
     /// The sizes the prompt path's workspaces depend on.
     prefillp::Dims prompt_dims() const;
     /// Device bytes of the compressed caches of a full context.

@@ -82,6 +82,7 @@ struct LoadRequest {
     int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
     bool vision = false;              ///< --vision: requests may carry images (each slot keeps buffers for one)
+    int vision_device = -1;           ///< image encoder's CUDA device (-1: the main card)
     std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
     int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)
     uint64_t resident_budget = 0;     ///< bytes the RAM tier may take (0: from the free memory)

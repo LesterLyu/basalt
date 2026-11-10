@@ -176,6 +176,11 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
                 cli_engine += part
             cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
             cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
+            image_card = (cfg.get("vision") or {}).get("card")
+            if image_card is not None and cfg["vision"].get("mode") == "dynamic":
+                if image_card not in cfg["gpu_smi"]:
+                    fail(f"vision: GPU {image_card} must be included in this model's --gpu selection")
+                cfg["args"] += ["--vision-gpu", str(cfg["gpu_smi"].index(image_card))]
     for flag in a.skipped:
         lines.append(tagged("engine", f"{flag[2:]} from the top level: this model has no such flag, skipped"))
     cfg["items"] = start_items(file_engine, cli_engine,

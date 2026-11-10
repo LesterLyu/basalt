@@ -134,6 +134,42 @@ class Peer(Tmp):
 
 
 class Vision(Tmp):
+    def test_in_engine_vision_uses_the_selected_cards_cuda_order(self):
+        from serve.config import build_parser, model_settings
+        from serve.server import check_model
+        from serve.engine.vision import vision_item
+        path = self.build(vision=True, meta={**META, "gguf_kv": {"general.architecture": "deepseek41"}})
+        cli = ["--engine-bin", str(self.engine_bin), "--model", path, "--gpu", "1,0", "--vision", "1"]
+        a, used, file_words, cli_words = model_settings(build_parser(), cli)[0]
+        plan = {"devices": [1, 0], "cards": [{"smi": 1}, {"smi": 0}], "spec": 3}
+        with mock.patch("serve.server.model_plan", return_value=plan), mock.patch("serve.server.gpu_card_name", return_value="card"):
+            cfg = check_model(a, file_words, cli_words, used, None)
+        i = cfg["args"].index("--vision-gpu")
+        self.assertEqual(cfg["args"][i + 1], "0")
+        self.assertEqual(vision_item(cfg["vision"], cfg), "vision=gpu1")
+
+    def test_in_engine_vision_rejects_an_unselected_card(self):
+        from serve.config import build_parser, model_settings
+        from serve.server import check_model
+        path = self.build(vision=True, meta={**META, "gguf_kv": {"general.architecture": "deepseek41"}})
+        cli = ["--engine-bin", str(self.engine_bin), "--model", path, "--gpu", "0", "--vision", "1"]
+        a, used, file_words, cli_words = model_settings(build_parser(), cli)[0]
+        plan = {"devices": [0], "cards": [{"smi": 0}], "spec": 3}
+        with mock.patch("serve.server.model_plan", return_value=plan), mock.patch("serve.server.gpu_card_name", return_value="card"), \
+                redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            check_model(a, file_words, cli_words, used, None)
+
+    def test_deepseek_numbered_vision_stays_in_the_engine(self):
+        meta = {**META, "gguf_kv": {"general.architecture": "deepseek41"}}
+        path = self.build(vision=True, meta=meta)
+        cfg = modelfile.model_config(modelfile.ModelSpec(path, vision="1"), str(self.engine_bin))
+        self.assertEqual(cfg["vision"], {"mode": "dynamic", "gpu": True, "card": 1})
+        self.assertIn("--vision", cfg["args"])
+        self.assertNotIn("--vision-external", cfg["args"])
+        self.assertNotIn("vision_bin", cfg["vision"])
+        with self.assertRaisesRegex(ValueError, "own token limit"):
+            modelfile.model_config(modelfile.ModelSpec(path, vision="1"), str(self.engine_bin), vision_max_tokens=8192)
+
     def test_image_token_limit_stays_out_of_the_text_engine(self):
         path = self.build(vision=True)
         (self.engine_bin.parent / "basalt-vision").write_text("")

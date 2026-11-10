@@ -116,6 +116,7 @@ struct CommonOptions {
     /// model file's `vision/mmproj` section in place; its weights stay in pinned host memory; each ENC command borrows
     /// expert-cache slots, encodes in them and refills them.
     bool vision_in_engine = false;
+    int vision_device = -1;           ///< in-engine image encoder's CUDA device (-1: the main card)
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole prompt
     /// again).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and the PLE history (~118 MB of host
     /// RAM); the KV cache itself is positional and stays where it is.

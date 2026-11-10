@@ -337,6 +337,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.max_context = o.max_context;
         lreq.sessions = std::max(o.batch, 1);
         lreq.vision = o.vision;
+        lreq.vision_device = o.vision_device;
         lreq.expert_profile = o.expert_profile;
         const std::string key = profile_key(model_file.meta());
         {   // what the engine ships for this pack must be there; --expert-profile stands in for the main one
