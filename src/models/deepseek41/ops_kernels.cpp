@@ -885,12 +885,13 @@ public:
             join.tier = tier_.get();
             join.now();
         }
-        if (cpu || reading) tier_->promote(il, lk);
         if (peer) {
             TierScope finish_profile(m_.tier_profile(), TierProfile::PeerFinish);
             if (!peer->finish(nullptr, err)) return false;
         }
+        // Let the sum run before a promotion makes a driver call that may wait on it.
         jw.raise();
+        if (cpu || reading || n_fetched) tier_->promote(il, lk);
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = kIdPending;
         ids_read_ = false;
@@ -1071,12 +1072,13 @@ public:
             join.tier = tier_.get();
             join.now();
         }
-        if (cpu || reading) tier_->promote(il, lk);
         if (peer) {
             TierScope finish_profile(m_.tier_profile(), TierProfile::PeerFinish);
             if (!peer->finish(nullptr, err)) return false;
         }
+        // Let the sum run before a promotion makes a driver call that may wait on it.
         jw.raise();
+        if (cpu || reading || n_fetched) tier_->promote(il, lk);
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = kIdPending;
         ids_read_ = false;
