@@ -887,12 +887,13 @@ public:
         weighted_sum_window(rp, w, T, K, n, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in their rows
         if (cpu) join.now();
-        if (cpu || n_fetched) tier_->promote(il, lk);
         if (peer) {
             TierScope finish_profile(m_.tier_profile(),TierProfile::PeerFinish);
             if (m_.has_overlay() ? !tier_->finish_peer(err) : !peer->finish(nullptr, err)) return false;
         }
+        // Let the sum run before a promotion makes a driver call that may wait on it.
         jw.raise();
+        if (cpu || n_fetched) tier_->promote(il, lk);
         tier_->mark_gap(st);   // the promotions' copies start behind the sum
         for (int r = 0; r < T * K; ++r) h_ids_[r] = -1;
         ids_read_ = false;
@@ -1065,12 +1066,13 @@ public:
         weighted_sum_row_ptrs(rp, w, K, g_.n_embd, out, stream, shared_out);
         // the CPU's share ran while the GPU works; its rows land in the router index's row
         if (cpu) join.now();
-        if (cpu || n_fetched) tier_->promote(il, lk);
         if (peer) {
             TierScope finish_profile(m_.tier_profile(),TierProfile::PeerFinish);
             if (m_.has_overlay() ? !tier_->finish_peer(err) : !peer->finish(nullptr, err)) return false;
         }
+        // Let the sum run before a promotion makes a driver call that may wait on it.
         jw.raise();
+        if (cpu || n_fetched) tier_->promote(il, lk);
         tier_->mark_gap(st);
         for (int k = 0; k < K; ++k) h_ids_[k] = -1;
         ids_read_ = false;
