@@ -74,6 +74,7 @@ struct ExpertTierSpec {
     /// CPU uses that earn a slot (policy::count_use) for every placement; 0: the repeat-miss rule with RAM holding all
     /// experts and kPromoteUses with the file's, the way the first model ran them.
     int admit_uses = 0;
+    int main_promote_misses = 0;
     bool gpu_single_miss = false;
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
@@ -121,6 +122,7 @@ public:
         const uint8_t* host[kMaxK] = {};   ///< host blob of the others (and of those the second card fetched)
         int experts[kMaxK] = {};
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
+        bool main_admit[kMaxK] = {};
         bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
         bool reading[kMaxK] = {};          ///<  is a RAM place a file read is filling (await_reads)
         bool dropped[kMaxK] = {};          ///< id -1: --route-tail-skip dropped the entry; nothing computes it
@@ -447,6 +449,7 @@ private:
     int cover_ = 0;                         ///< experts per layer in the RAM tier
     std::vector<int32_t> ram_idx_;          ///< [layer * n_expert + e] pinned slot or -1
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a home leaving the main card, or -1
+    std::vector<uint64_t> prev_miss_;
     std::vector<uint64_t> last_miss_;       ///< [layer * n_expert + e] token + 1 of the last miss
     uint64_t token_ = 0;
     platform::MappedFile file_;             ///< the experts section

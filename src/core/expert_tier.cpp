@@ -454,6 +454,7 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
     ram_idx_.assign((size_t) n_layers_ * n_expert_, -1);
     spare_.assign((size_t) n_layers_, -1);
     last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
+    if (s_.main_promote_misses > 0) prev_miss_.assign(last_miss_.size(), 0);
     std::vector<int32_t> device_home;   // [layer * n_expert + e] the slot of a home on either card, or -1
     if (homes_.main > 0 || homes_.peer > 0) device_home.assign((size_t) n_layers_ * n_expert_, -1);
     if (!peers_.empty()) {   // peer_owner_ keeps the global slot l * homes_.peer + n; each card numbers its own from 0
@@ -839,6 +840,7 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
         const int e = ids[i];
         lk.experts[i] = e;
         lk.again[i] = false;
+        lk.main_admit[i] = false;
         lk.fetched[i] = false;
         lk.dropped[i] = e == -1 && route_tail_skip_ > 0;
         if (lk.dropped[i]) {
@@ -873,6 +875,11 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
             lk.again[i] = s_.admit_uses > 0 ? core::policy::count_use(uses_[idx], s_.admit_uses)
                                             : core::policy::repeat_miss(last_miss_[idx], token_, core::policy::kPromoteWindow);
             ++(pinned(layer, e) && !lk.reading[i] ? ram_hits_ : file_hits_);
+            if (!prev_miss_.empty()) {
+                lk.main_admit[i] = lk.again[i] && (s_.main_promote_misses == 2 ||
+                    core::policy::repeat_miss(prev_miss_[idx], token_, 64));
+                prev_miss_[idx] = last_miss_[idx];
+            }
             last_miss_[idx] = token_ + 1;
             ++cpu_;
         }
@@ -1259,7 +1266,8 @@ void ExpertTier::promote(int layer, const Lookup& lk) {
         if (lk.dev[i] || lk.fetched[i] || lk.dropped[i] || !pinned(layer, lk.experts[i])) continue;   // pinned sources only
         // with the RAM tier caching the file, the experts the CPU keeps computing; else a repeat miss
         if (reads_.is_open() && s_.admit_uses == 0 ? !core::policy::count_use(uses_[(size_t) layer * n_expert_ + lk.experts[i]]) : !lk.again[i]) continue;
-        if (!move_to_peer(layer, lk.experts[i], lk.host[i]))
+        if (!move_to_peer(layer, lk.experts[i], lk.host[i]) &&
+            (prev_miss_.empty() || lk.main_admit[i]))
             claim(layer, lk.experts[i], lk.host[i], copy_stream_, /*homes_too=*/true, /*whole=*/false, /*later=*/true);
     }
 }

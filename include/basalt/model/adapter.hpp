@@ -116,6 +116,7 @@ struct LoadRequest {
     int diag_rows = 0;                ///< diagnostic: rows of one forward call of a prompt (0: the model's own chunk)
     int diag_split_at = 0;            ///< diagnostic: a model's layers split at this one across two cards (0: off)
     bool gpu_single_miss = false;     ///< fetch a lone RAM expert for the main GPU
+    int main_promote_misses = 3;      ///< recent misses needed for a DeepSeek main-GPU expert slot
 };
 
 struct DecodeRequest {

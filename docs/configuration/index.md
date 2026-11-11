@@ -146,6 +146,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `spec` | engine | integer | 8 (MTP), 6 (DSpark), 16 (Qwen3.8-27B), 8 (Inkling 2 Mini's DSpark), else 0 | Verify windows of at most N tokens (Qwen3.8-27B: up to 16). `0` or `1` turns it off. |
 | `draft-experts` | engine | 32, 64, 96, 128, or 0 | 32 | DeepSeek only. Experts each drafter stage keeps (`0` = all 128). |
 | `ds-gpu-single-miss` | engine | boolean | false | DeepSeek only. When exactly one routed expert misses both GPUs and is in pinned RAM, try to fetch it for the main GPU. |
+| `ds-main-promote-misses` | engine | 2 or 3 | 3 | DeepSeek only. Recent misses within 64 tokens required to cache an expert on the main GPU. The second GPU still uses two. |
 | `suffix-draft` | engine | tokens | 3 (`0` = the drafter only) | Flash-Next and Qwen3.8-27B. Prompt lookup: fill a window from an earlier repeat of at least N tokens. Its index takes host RAM by `max-context`: 64 MiB per slot at 262,144 tokens. |
 | `mtp-max-t` | engine | integer | 0 (= `spec`) | Flash-Next only. Caps the MTP's own windows. |
 | `mtp-window` | engine | cells | 32768 (`0` = all) | Flash-Next only. The drafter attends to the last N cells. |
