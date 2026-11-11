@@ -169,6 +169,10 @@ public:
     void lend_all();
     bool reclaim(std::string& err, bool restore = false);
     /// Whether lend() can give up part of the base arena (ExpertTierSpec::lend_segment, copies, a segmented arena).
+    uint64_t loanable_bytes() const {
+        return ext_.mapped_bytes() + (homes_.main == 0 ? cache_.mapped_bytes() : 0);
+    }
+    bool malloc_slab_backed() const { return cache_.malloc_slab_backed(); }
     bool partial_lend() const { return !live_.empty(); }
     /// Leaves `bytes` device bytes free above the floor by giving up the fewest slots: the ones beside the base arena,
     /// then each layer's last base slots in proportion to its share (the arena's tail holds every layer's last ones).

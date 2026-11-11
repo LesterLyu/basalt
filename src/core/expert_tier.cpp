@@ -1430,7 +1430,9 @@ bool ExpertTier::open_base(int64_t per_layer, std::string& err) {
     for (int64_t i = 0; i < nb; ++i) order[(size_t) i] = (int32_t) i;
     phys_.clear();
     live_.clear();
-    const bool seg = s_.lend_segment > 0 && homes_.main == 0 && nb > 0 && core::vmm::supported();
+    const bool slabs = core::vmm::tcc_mode() && !core::vmm::supported() && homes_.main == 0 && nb > 0;
+    const bool seg = (s_.lend_segment > 0 && homes_.main == 0 && nb > 0 && core::vmm::supported()) || slabs;
+    cache_.set_malloc_slabs(slabs);
     if (seg) {
         std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
             const int la = layer_of[(size_t) a], lb = layer_of[(size_t) b];
@@ -1442,7 +1444,7 @@ bool ExpertTier::open_base(int64_t per_layer, std::string& err) {
     }
     std::vector<int64_t> slot_bytes;
     for (int32_t s : order) slot_bytes.push_back((int64_t) ram_stride(layer_of[(size_t) s]));
-    cache_.set_segment_bytes(seg ? (int64_t) s_.lend_segment : 0);
+    cache_.set_segment_bytes(seg ? (int64_t) (s_.lend_segment ? s_.lend_segment : (256ull << 20)) : 0);
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) {
         phys_.clear();
         return false;

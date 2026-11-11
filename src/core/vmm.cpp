@@ -77,6 +77,12 @@ bool supported() {
            supported != 0;
 }
 
+bool tcc_mode() {
+    int dev = 0, tcc = 0;
+    return cudaGetDevice(&dev) == cudaSuccess &&
+           cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, dev) == cudaSuccess && tcc != 0;
+}
+
 uint64_t granularity() {
     const Fns& v = fns();
     if (!v.ok) return 0;

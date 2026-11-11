@@ -2,6 +2,7 @@
 // keeps every slot left exactly as it was (same address, same bytes); a grow maps them again at the same addresses.
 // Uniform and sized slots.  Needs a CUDA device with virtual memory management (exits 77 without one).
 #include "basalt/core/expert_cache.hpp"
+#include "basalt/core/vmm.hpp"
 
 #include <cuda_runtime.h>
 
@@ -42,6 +43,45 @@ bool check(const basalt::core::ExpertCache& c, int64_t to, int64_t blob) {
     }
     return true;
 }
+int test_malloc_slabs() {
+    constexpr int64_t M = 1ll << 20;
+    const std::vector<int64_t> sizes{3*M,3*M,3*M,5*M,2*M,7*M,2*M,4*M};
+    basalt::core::ExpertCache c;
+    c.set_segment_bytes(8*M);
+    c.set_malloc_slabs(true);
+    std::string err;
+    if (!c.open_sized(sizes,2,8,err) || !c.malloc_slab_backed() || c.slots() != 8)
+        return fail("malloc slab open",err);
+    const auto put = [&](int from) {
+        for (int i=from; i<8; ++i) {
+            std::vector<uint8_t> data((size_t)sizes[i],(uint8_t)(i+19));
+            if (!c.fill_slot_blocking(i,data.data(),err,sizes[i])) return false;
+        }
+        return true;
+    };
+    const auto verify = [&](int until) {
+        for (int i=0; i<until; ++i) {
+            std::vector<uint8_t> data((size_t)sizes[i],(uint8_t)(i+19));
+            if (!c.verify_slot(i,data.data(),err,sizes[i])) return false;
+        }
+        return true;
+    };
+    auto* first = c.device_slot(0);
+    if (!put(0) || c.malloc_slab_boundary(10*M) != 6*M || c.malloc_slab_boundary(14*M) != 14*M)
+        return fail("malloc slab boundaries",err);
+    const auto before = free_vram();
+    if (!c.shrink(14*M,err) || c.slots() != 4 || c.mapped_bytes() != 14*M ||
+        c.device_slot(4) != nullptr || c.device_slot(0) != first || !verify(4))
+        return fail("malloc slab shrink",err);
+    if (free_vram() < before + 15*M) return fail("malloc slab did not release VRAM");
+    if (!c.grow(23*M,err) || c.slots() != 6 || !c.grow(c.full_bytes(),err) || c.slots() != 8 ||
+        c.device_slot(0) != first || !verify(4) || !put(4) || !verify(8))
+        return fail("malloc slab grow and refill",err);
+    c.close();
+    if (c.valid() || c.segmented()) return fail("malloc slab close");
+    std::puts("expert cache malloc slabs: mixed slot boundaries, release and byte-for-byte refill");
+    return 0;
+}
 }  // namespace
 
 int main() {
@@ -50,6 +90,7 @@ int main() {
         std::puts("no CUDA device: skipped");
         return 77;
     }
+    if (basalt::core::vmm::tcc_mode()) return test_malloc_slabs();
     constexpr int64_t kBlob = 1 << 20, kSlots = 96, kSeg = 8ll << 20;
     for (int sized = 0; sized < 2; ++sized) {
         basalt::core::ExpertCache c;

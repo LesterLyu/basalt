@@ -12,6 +12,8 @@ namespace basalt::core::vmm {
 
 /// Whether the current device supports virtual memory management (and the driver entry points were found).
 bool supported();
+/// Whether the current CUDA device runs in TCC driver mode.
+bool tcc_mode();
 /// The allocation granularity of the current device (every size and offset below is a multiple of it); 0 on failure.
 uint64_t granularity();
 /// The minimum host allocation granularity on the current device, or 0 without host VMM.

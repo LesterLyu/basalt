@@ -194,8 +194,11 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 
 void ExpertCache::release_segmented() {
     if (base_ != nullptr) cudaDeviceSynchronize();
-    for (size_t i = 0; i < segs_.size(); ++i)
-        if (segs_[i] != 0) vmm::unmap(base_ + seg_off_[i], (uint64_t) seg_size_[i], segs_[i]);
+    for (size_t i = 0; i < segs_.size(); ++i) {
+        if (segs_[i]) vmm::unmap(base_ + seg_off_[i], (uint64_t) seg_size_[i], segs_[i]);
+    }
+    for (auto* slab : slabs_) if (slab) cudaFree(slab);
+    slabs_.clear();
     if (base_ != nullptr && reserved_ > 0) vmm::release_range(base_, reserved_);
     segs_.clear();
     seg_off_.clear();
@@ -206,8 +209,16 @@ void ExpertCache::release_segmented() {
 }
 
 int64_t ExpertCache::mapped_bytes() const {
-    if (segs_.empty()) return base_ != nullptr ? full_bytes() : 0;
+    if (!segmented()) return base_ != nullptr ? full_bytes() : 0;
     return mapped_segs_ > 0 ? seg_off_[(size_t) mapped_segs_ - 1] + seg_size_[(size_t) mapped_segs_ - 1] : 0;
+}
+
+uint64_t ExpertCache::malloc_slab_boundary(uint64_t keep_bytes) const {
+    if (!malloc_slab_backed() || mapped_segs_ == 0) return 0;
+    if (keep_bytes >= (uint64_t) mapped_bytes()) return (uint64_t) mapped_bytes();
+    const auto end = seg_off_.begin() + mapped_segs_;
+    const auto next = std::upper_bound(seg_off_.begin(), end, (int64_t) keep_bytes);
+    return next == seg_off_.begin() ? 0 : (uint64_t) *(next - 1);
 }
 
 int64_t ExpertCache::slots_within(int64_t bytes) const {
@@ -220,31 +231,37 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
 
 int64_t ExpertCache::slots_after_shrink(int64_t keep_bytes) const {
     int64_t keep = 0;
-    while (keep < (int64_t) segs_.size() && seg_off_[(size_t) keep] < keep_bytes) ++keep;
-    if (segs_.empty() || keep >= mapped_segs_) return slots();
+    while (keep < mapped_segs_ && seg_off_[(size_t) keep] < keep_bytes) ++keep;
+    if (malloc_slab_backed()) keep = std::max<int64_t>(1, keep);
+    if (keep >= mapped_segs_) return slots();
     const int64_t kept = keep > 0 ? seg_off_[(size_t) keep - 1] + seg_size_[(size_t) keep - 1] : 0;
     return slots_within(kept);
 }
 
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
-    if (segs_.empty()) {
+    if (!segmented()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
     int64_t keep = 0;   // the segments [0, keep) hold the first keep_bytes
-    while (keep < (int64_t) segs_.size() && seg_off_[(size_t) keep] < keep_bytes) ++keep;
+    while (keep < mapped_segs_ && seg_off_[(size_t) keep] < keep_bytes) ++keep;
+    if (malloc_slab_backed()) keep = std::max<int64_t>(1, keep);
     if (keep >= mapped_segs_) return true;
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
     for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
-        if (!vmm::unmap(base_ + seg_off_[(size_t) i], (uint64_t) seg_size_[(size_t) i], segs_[(size_t) i])) {
+        const size_t at = (size_t) i;
+        const bool ok = malloc_slab_backed() ? cudaFree(slabs_[at]) == cudaSuccess
+                                           : vmm::unmap(base_ + seg_off_[at], (uint64_t) seg_size_[at], segs_[at]);
+        if (!ok) {
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
         }
-        segs_[(size_t) i] = 0;
+        if (malloc_slab_backed()) slabs_[at] = nullptr;
+        else segs_[at] = 0;
         mapped_segs_ = i;
     }
     live_slots_ = slots_within(mapped_bytes());
@@ -252,15 +269,23 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
 }
 
 bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
-    if (segs_.empty()) {
+    if (!segmented()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
-    while (mapped_segs_ < (int64_t) segs_.size() &&
+    while (mapped_segs_ < (int64_t) seg_off_.size() &&
            seg_off_[(size_t) mapped_segs_] + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
         const size_t i = (size_t) mapped_segs_;
-        segs_[i] = vmm::map(base_ + seg_off_[i], (uint64_t) seg_size_[i]);
-        if (segs_[i] == 0) {
+        bool ok;
+        if (malloc_slab_backed()) {
+            void* p = nullptr;
+            ok = cudaMalloc(&p, (size_t) seg_size_[i]) == cudaSuccess;
+            if (ok) slabs_[i] = static_cast<uint8_t*>(p);
+        } else {
+            segs_[i] = vmm::map(base_ + seg_off_[i], (uint64_t) seg_size_[i]);
+            ok = segs_[i] != 0;
+        }
+        if (!ok) {
             (void) cudaGetLastError();
             err = "the driver has no VRAM for another expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
@@ -362,8 +387,41 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
-    // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    // A fixed head and loanable tail on a driver without physical VMM. Split only between complete slots.
+    if (malloc_slabs_requested_ && seg_req_ > 0 && !tail_req_ && initial_req_ < 0) {
+        close();
+        size_t free_b = 0, total_b = 0;
+        if (n_layers <= 0 || n_expert <= 0 ||
+            (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < off.back())) {
+            err = "ExpertCache: not enough free VRAM for malloc slabs";
+            return false;
+        }
+        n_layers_ = n_layers;
+        n_expert_ = n_expert;
+        residency_.assign((size_t) (n_layers * n_expert), kNotResident);
+        seg_ = seg_req_;
+        for (size_t first = 0; first < slot_bytes.size();) {
+            const auto end = std::upper_bound(off.begin() + first + 1, off.end(), off[first] + (uint64_t) seg_);
+            const size_t next = std::max(first + 1, (size_t) (end - off.begin() - 1));
+            const size_t bytes = (size_t) (off[next] - off[first]);
+            void* p = nullptr;
+            if (cudaMalloc(&p, bytes) != cudaSuccess || cudaMemset(p, 0, bytes) != cudaSuccess) {
+                if (p) cudaFree(p);
+                err = "ExpertCache: cudaMalloc failed for a cache slab";
+                close();
+                return false;
+            }
+            if (!base_) base_ = static_cast<uint8_t*>(p);
+            seg_off_.push_back((int64_t) off[first]);
+            seg_size_.push_back((int64_t) bytes);
+            slabs_.push_back(static_cast<uint8_t*>(p));
+            ++mapped_segs_;
+            first = next;
+        }
+    } else {
+        // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
+        if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    }
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
@@ -381,7 +439,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 
 void ExpertCache::close() {
     off_.clear();
-    if (!segs_.empty()) {
+    if (segmented()) {
         release_segmented();
     } else if (base_ != nullptr) {
         cudaFree(base_);
@@ -436,13 +494,17 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
-    if (slot < 0 || slot >= slots_) return nullptr;
-    if (!off_.empty()) return base_ + off_[(size_t) slot];
-    return base_ + (size_t) slot * (size_t) blob_;
+    return const_cast<uint8_t*>(static_cast<const ExpertCache&>(*this).device_slot(slot));
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     if (slot < 0 || slot >= slots_) return nullptr;
+    if (malloc_slab_backed()) {
+        if (slot >= live_slots_) return nullptr;
+        const auto offset = (int64_t) off_[(size_t) slot];
+        const size_t i = (size_t) (std::upper_bound(seg_off_.begin(), seg_off_.end(), offset) - seg_off_.begin() - 1);
+        return slabs_[i] + (offset - seg_off_[i]);
+    }
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
