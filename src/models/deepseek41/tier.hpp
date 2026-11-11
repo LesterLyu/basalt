@@ -82,7 +82,10 @@ public:
     void grow();
     /// Make this many bytes free by returning only the needed cache segments to RAM.
     bool lend(uint64_t free_bytes, std::string& err);
-    uint64_t loanable_bytes() const { return ext_.mapped_bytes() + (homes_.main == 0 ? cache_.mapped_bytes() : 0); }
+    bool malloc_slab_backed() const { return cache_.malloc_slab_backed(); }
+    uint64_t loanable_bytes() const {
+        return (ext_.segmented() ? ext_.mapped_bytes() : 0) + (homes_.main == 0 ? cache_.mapped_bytes() : 0);
+    }
     void prompt_workspace(const void* owner, uint64_t bytes, uint64_t margin);
     /// A long prompt streams every expert to the main card and needs the card for its chunks: the slots that are
     /// reclaimable segments go back whole, and reclaim() maps them again at the same addresses. Homes stay.

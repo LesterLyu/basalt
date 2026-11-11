@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -96,7 +97,7 @@ public:
             ok = ok && alloc(&f.dev, z.fixed) && cudaMallocHost((void**) &f.host, z.fixed) == cudaSuccess;
         }
         if (ok) {
-            mmq::iota(ident_, (int64_t) S, nullptr);
+            basalt::prefill::mmq::iota(ident_, std::min(cap_, kSub), nullptr);
             cudaDeviceSynchronize();
         }
         if (!ok) err = "out of device memory for the batched attention";

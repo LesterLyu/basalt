@@ -104,7 +104,12 @@ public:
     void set_elastic_tail(int64_t tail_bytes) { tail_req_ = tail_bytes > 0 ? tail_bytes : 0; }
     /// The bytes of the granule-sized tail (0 when there is none).
     int64_t elastic_bytes() const;
-    bool segmented() const { return !segs_.empty(); }
+    bool segmented() const { return !segs_.empty() || malloc_slab_backed(); }
+    /// Use independent, slot-aligned CUDA allocations for a fully backed sized arena.
+    void set_malloc_slabs(bool on) { malloc_slabs_requested_ = on; }
+    bool malloc_slab_backed() const { return !slabs_.empty(); }
+    /// The largest malloc slab boundary at or below keep_bytes.
+    uint64_t malloc_slab_boundary(uint64_t keep_bytes) const;
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
     int64_t mapped_bytes() const;
@@ -191,6 +196,8 @@ private:
     bool open_segmented(uint64_t want, std::string& err);
     void release_segmented();
     uint8_t* base_ = nullptr;
+    bool malloc_slabs_requested_ = false;
+    std::vector<uint8_t*> slabs_;  // independently allocated, backed prefix; first slab remains while open
     int64_t live_slots_ = 0;   // slots() - all of them unless shrunk
     int64_t seg_req_ = 0;   // the segment size asked for (0: one cudaMalloc)
     int64_t initial_req_ = -1;   // initially mapped bytes of a segmented arena (-1: all)

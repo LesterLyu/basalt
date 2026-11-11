@@ -603,34 +603,41 @@ private:
         ExpertTier* tier = ops_->expert_tier(te);
         const bool beside = short_prompt_;
         const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
-        if (beside) tokens = prefillp::kShortChunk;   // these workspaces stay for the next short read, whatever its size
+        const bool slabs = tier && tier->malloc_slab_backed();
+        if (beside && !slabs) tokens = prefillp::kShortChunk;  // a retained workspace must fit the next short read
         const prefillp::Fit fit = prefillp::plan_chunk(d, free_b + (tier ? tier->loanable_bytes() : 0), margin, tokens, m_.tiers().prefill_chunk);
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
             return false;
         }
         for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap /= 2) {
-            std::string e;
-            const uint64_t wanted = prefillp::chunk_bytes(d,cap,tokens)+margin;
-            if (tier && !tier->lend(wanted,e)) { if (!e.empty()) err=e; continue; }
-            prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
-            const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
-            if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
-                cudaGetLastError();   // a larger size that did not fit left its error behind
-                core::MemoryUsage usage;
-                prefill_->memory_usage(usage);
-                if (tier) {
-                    tier->prompt_workspace(this,usage.gpus[m_.device()]["long_prefill"],after);
-                    tier->grow();
-                    if (!beside && cudaMemGetInfo(&free_b,&total_b) == cudaSuccess)
-                        basalt::log::info("basalt deepseek41","prompt workspace: %d tokens, %.2f GiB buffers, %.2f GiB reclaimable experts, %.2f GiB free",cap,
-                                          usage.gpus[m_.device()]["long_prefill"]/1073741824.,
-                                          (tier->loanable_bytes())/1073741824.,free_b/1073741824.);
+            const uint64_t wanted = prefillp::chunk_bytes(d, cap, tokens) + margin;
+            for (uint64_t extra = 0;; extra += 64ull << 20) {
+                std::string e;
+                if (tier && !tier->lend(wanted+extra,e)) { if (!e.empty()) err=e; break; }
+                prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
+                const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
+                if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
+                    cudaGetLastError();
+                    core::MemoryUsage usage;
+                    prefill_->memory_usage(usage);
+                    if (tier) {
+                        tier->prompt_workspace(this,usage.gpus[m_.device()]["long_prefill"],after);
+                        if (!slabs) tier->grow();
+                        if (!beside && cudaMemGetInfo(&free_b,&total_b) == cudaSuccess)
+                            basalt::log::info("basalt deepseek41","prompt workspace: %d tokens, %.2f GiB buffers, %.2f GiB reclaimable experts, %.2f GiB free",cap,
+                                              usage.gpus[m_.device()]["long_prefill"]/1073741824.,
+                                              (tier->loanable_bytes())/1073741824.,free_b/1073741824.);
+                        if (slabs) basalt::log::info("basalt deepseek41", "slab prompt workspace: %d tokens, %llu MiB estimated, %llu MiB extra",
+                            cap, (unsigned long long) (wanted >> 20), (unsigned long long) (extra >> 20));
+                    }
+                    return true;
                 }
-                return true;
+                drop_prefill();
+                cudaGetLastError();
+                if (!e.empty()) err=e;
+                if (!slabs || extra >= (512ull << 20)) break;
             }
-            drop_prefill();
-            if (!e.empty()) err = e;
         }
         if (err.empty()) err = "deepseek41: not enough free device memory for the prompt workspaces";
         return false;
@@ -688,7 +695,8 @@ private:
         std::string e;
         ExpertTier* t = ops_->expert_tier(e);
         if (!t) return;
-        if (short_prompt_) return;
+        if (short_prompt_ && !t->malloc_slab_backed()) return;
+        short_prompt_ = false;
         cudaStreamSynchronize(stream_);
         drop_prefill();
         if (!t->reclaim(e)) basalt::log::warn("basalt deepseek41", "VRAM expert tier stays closed: %s", e.c_str());

@@ -248,13 +248,28 @@ bool host_pin_budget(uint64_t& limit, std::string& why) {
             return true;
         }
     }
+    // In the mixed driver configuration only the WDDM context is a DXGI mapping consumer.
+    // Keep the existing conservative policy for multiple WDDM contexts or unknown driver modes.
+    int tcc_count = 0;
+    bool driver_modes_known = true;
+    for (int d = 0; d < count; ++d) {
+        int tcc = 0;
+        if (cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, d) != cudaSuccess) {
+            (void)cudaGetLastError();
+            driver_modes_known = false;
+            break;
+        }
+        if (tcc) ++tcc_count;
+    }
+    const bool one_wddm_with_tcc = driver_modes_known && tcc_count > 0 && count-tcc_count == 1;
+    const bool shared_mapping = count > 1 && !one_wddm_with_tcc;
     bool known = false;
     for (int d = 0; d < count; ++d) {
         if (!valid[(size_t) d]) continue;
         const auto& prop = props[(size_t) d];
         uint64_t allowance = 0;
         std::string note;
-        if (!platform::pin_budget(allowance, note, prop.luid, prop.luidDeviceNodeMask, count > 1)) continue;
+        if (!platform::pin_budget(allowance, note, prop.luid, prop.luidDeviceNodeMask, shared_mapping)) continue;
         if (!known || allowance < limit) {
             limit = allowance;
             why = "CUDA" + std::to_string(d) + " " + note;

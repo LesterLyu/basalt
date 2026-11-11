@@ -420,7 +420,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     }
     const auto slot_bytes = cache_sizes((int)per_layer_,false);
     cache_.set_segment_bytes(policy::kCacheSegment);
+    cache_.set_malloc_slabs(core::vmm::tcc_mode());
     if (!slot_bytes.empty() && !cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
+    if (malloc_slab_backed())
+        basalt::log::info("basalt deepseek41", "TCC: using reclaimable cudaMalloc slabs");
     res_.assign((size_t) n_layers_ * n_expert_, -1);
     stamp_.assign((size_t) n_layers_ * n_expert_, 0);
     owner_.assign(slot_bytes.size(), -1);
@@ -729,7 +732,8 @@ bool ExpertTier::load_ram(std::string& err) {
     }
     const int limit = (int)(cap_per_layer_ >= 0 ? std::min<int64_t>(n_expert_,cap_per_layer_) : n_expert_);
     const int n = slots_fit(free_b,reserve_+modules_+free_floor_,std::max(0,limit-(int)per_layer_),0,true);
-    const int capacity = std::max(0,limit-(int)per_layer_);
+    const bool elastic_extra = !malloc_slab_backed();
+    const int capacity = elastic_extra ? std::max(0,limit-(int)per_layer_) : n;
     if (capacity > 0) {
         auto sizes = cache_sizes(capacity,true);
         const auto first = slot_sizes(n,0,true);
@@ -738,7 +742,7 @@ bool ExpertTier::load_ram(std::string& err) {
             sizes[(size_t)r*n_layers_+l] = first[(size_t)l*n+r];
             initial_bytes += ((uint64_t)first[(size_t)l*n+r]+255)/256*256;
         }
-        ext_.set_segment_bytes(policy::kCacheSegment);
+        if (elastic_extra) ext_.set_segment_bytes(policy::kCacheSegment);
         ext_.set_initial_bytes((int64_t)initial_bytes);
         if (!ext_.open_sized(sizes,n_layers_,n_expert_,err)) return false;
         ext_per_layer_ = capacity;
@@ -1957,7 +1961,9 @@ void ExpertTier::prompt_workspace(const void* owner, uint64_t bytes, uint64_t ma
 uint64_t ExpertTier::refill_reserve() const {
     uint64_t held = 0, margin = prefillp::kShortMargin;
     for (const auto& entry : prompt_workspaces_) { held += entry.second.first; margin = std::max(margin,entry.second.second); }
-    return policy::refill_reserve(reserve_,held,margin,free_floor_,token_ ? 0 : modules_);
+    // This arena releases its workspace at the end of every prompt. Re-lend on the next read.
+    const bool loan_on_next_prompt = prompt_workspaces_.empty() && malloc_slab_backed();
+    return policy::refill_reserve(loan_on_next_prompt ? 0 : reserve_,held,margin,free_floor_,token_ ? 0 : modules_);
 }
 
 bool ExpertTier::shrink_cache(core::ExpertCache& arena, uint64_t offset, uint64_t keep, std::string& err) {
@@ -1983,13 +1989,16 @@ bool ExpertTier::lend(uint64_t wanted, std::string& err) {
     const uint64_t before = free;
     const auto base_before = cache_.mapped_bytes(), extra_before = ext_.mapped_bytes();
     const auto loan = [&](core::ExpertCache& arena, uint64_t offset) {
-        while (free < wanted && arena.valid() && arena.mapped_bytes()) {
-            const auto mapped = arena.mapped_bytes();
-            const uint64_t keep = policy::loan_keep(mapped,wanted-free);
+        while (free < wanted && arena.segmented() && arena.mapped_bytes()) {
+            const auto mapped = (uint64_t) arena.mapped_bytes();
+            const uint64_t missing = wanted-free;
+            const uint64_t keep = arena.malloc_slab_backed()
+                ? arena.malloc_slab_boundary(missing < mapped ? mapped-missing : 0)
+                : policy::loan_keep(mapped,missing);
             if (!shrink_cache(arena,offset,keep,err)) return false;
             if (!core::device_memory(-1, free, total, err)) return false;
             // Released mappings and allocator free bytes can differ; require mapping progress before another loan.
-            if (arena.mapped_bytes() >= mapped) break;
+            if ((uint64_t) arena.mapped_bytes() >= mapped) break;
         }
         return true;
     };
@@ -2007,7 +2016,7 @@ bool ExpertTier::lend(uint64_t wanted, std::string& err) {
 
 void ExpertTier::shrink() {
     std::string err;
-    if (ext_.valid() && !shrink_cache(ext_,(uint64_t)n_layers_*per_layer_,0,err))
+    if (ext_.segmented() && !shrink_cache(ext_,(uint64_t)n_layers_*per_layer_,0,err))
         basalt::log::warn("basalt deepseek41","expert VRAM stays resident: %s",err.c_str());
 }
 
@@ -2026,7 +2035,14 @@ bool ExpertTier::reclaim(std::string& err) {
     if (cache_.valid() && free > keep) {
         const auto before = cache_.slots();
         if (!cache_.grow(cache_.mapped_bytes()+(int64_t)(free-keep),err)) return false;
-        if (cache_.slots() > before) { seed_copies(n_expert_); finish_swaps(); pack_extra_ram(); }
+        if (cache_.slots() > before) {
+            seed_copies(n_expert_); finish_swaps(); pack_extra_ram();
+            if (malloc_slab_backed()) {
+                const auto filled = std::count_if(owner_.begin(), owner_.begin() + cache_.slots(), [](int e) { return e >= 0; });
+                basalt::log::info("basalt deepseek41", "expert malloc slabs: %lld -> %lld of %lld slots; %lld filled",
+                    (long long) before, (long long) cache_.slots(), (long long) cache_.full_slots(), (long long) filled);
+            }
+        }
     }
     return true;
 }
@@ -2043,7 +2059,7 @@ void ExpertTier::grow() {
         return;
     }
     const uint64_t keep = refill_reserve();
-    if (ext_.valid() && free > keep) {
+    if (ext_.segmented() && free > keep) {
         const auto before = ext_.slots();
         if (!ext_.grow(ext_.mapped_bytes()+(int64_t)(free-keep),err))
             basalt::log::warn("basalt deepseek41","expert cache refill: %s",err.c_str());
