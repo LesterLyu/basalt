@@ -1601,6 +1601,14 @@ if(BUILD_TESTING)
   add_executable(avx_bench tests/kernels/cpu/avx_bench.cpp)
   target_link_libraries(avx_bench PRIVATE kernels_cpu)
 
+  # Manual transfer microbench: no model, kernels or AVX-512 requirement.
+  add_executable(transfer_bench tests/core/transfer_bench.cpp)
+  target_link_libraries(transfer_bench PRIVATE core CUDA::cuda_driver Threads::Threads)
+  target_compile_definitions(transfer_bench PRIVATE
+    TRANSFER_BENCH_SYSTEM="${CMAKE_SYSTEM_NAME}"
+    TRANSFER_BENCH_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+  basalt_embed_manifest(transfer_bench)
+
   # needs the AVX-512 VNNI and VBMI instruction sets, which not every host has
 
   add_executable(nvfp4_cpu_rows_test tests/kernels/cpu/nvfp4_cpu_rows_test.cpp)

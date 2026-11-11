@@ -24,3 +24,6 @@ Configure with `-DBUILD_TESTING=ON`, build, and run `ctest --test-dir build`.
 - Tokenizer parity: register `tokenizer_parity` with `-DBASALT_TOKENIZER_DIR=<a pack's tokenizer/ directory>`.
 
 `basalt-bench` reads its prompts from `data/bench` (run from the repository root, or pass `--fixtures DIR`).
+
+Manual microbenches: `avx_bench` compares CPU expert kernels; [transfer_bench](transfer-bench.md) checks RAM/GPU and
+multi-GPU transfers without loading a model.
