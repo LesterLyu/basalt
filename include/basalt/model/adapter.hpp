@@ -103,6 +103,7 @@ struct LoadRequest {
     bool diag_tier_frozen = false;    ///< diagnostic: the VRAM tier keeps what it holds, no bus copy and no promotion
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     bool gpu_single_miss = false;     ///< fetch a lone RAM expert for the main GPU
+    int main_promote_misses = 3;      ///< recent misses needed for a DeepSeek main-GPU expert slot
 };
 
 struct DecodeRequest {

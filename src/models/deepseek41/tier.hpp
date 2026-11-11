@@ -50,8 +50,8 @@ public:
         const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds or fetched, else null
         const uint8_t* host[kMaxK] = {};   ///< host blob of the others (and of those the second card fetched)
         int experts[kMaxK] = {};
-        bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
-        bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
+        uint8_t recent_misses[kMaxK] = {}; ///< misses within the promotion window, including this one
+        bool fetched[kMaxK] = {};          ///< dev or peer is being copied in by fetch
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -129,8 +129,8 @@ public:
     /// Submit the planned misses after the CPU, helper and resident GPU experts have started.
     void submit_fetch();
     void await_fetch(cudaStream_t main);
-    /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
-    /// VRAM tier (side stream, off the token path, in pieces).
+    /// Queues recurring pinned misses for the VRAM tier on a side stream. The helper can admit a second miss;
+    /// the main card uses its configured miss count.
     void promote(int layer, const Lookup& lk);
 
     /// The copies under way land: every expert is in its place. A prompt reads the places, so it comes first.
@@ -315,7 +315,7 @@ private:
     std::vector<int32_t> spare_;            ///< [layer] pinned slot free for a swap, or -1
     std::vector<uint8_t> swapping_;         ///< [layer] a file expert is being read into its spare
     std::vector<uint64_t> spare_since_;     ///< [layer] token at which the spare became free
-    std::vector<uint64_t> last_miss_;       ///< [layer * n_expert + e] token + 1 of the last miss
+    std::vector<policy::MissHistory> misses_; ///< [layer * n_expert + e] last two misses
     std::vector<std::pair<int, int>> want_; ///< file-backed experts that missed twice, in lookup order
     std::vector<Swap> flight_;              ///< swaps started at the previous begin_token
     std::thread worker_;

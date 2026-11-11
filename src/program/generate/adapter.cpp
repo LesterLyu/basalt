@@ -369,6 +369,7 @@ int run_session_model(basalt::program::CommonOptions& o, const basalt::model::Mo
         lreq.expert_overlay = o.expert_overlay;
         lreq.prefill_chunk = o.prefill_chunk;
         lreq.gpu_single_miss = o.gpu_single_miss;
+        lreq.main_promote_misses = o.main_promote_misses;
         lreq.diag_tier_frozen = o.diag_tier_frozen;
         lreq.kv = o.kv;
         lreq.diag_tier_timing = o.diag_tier_timing;

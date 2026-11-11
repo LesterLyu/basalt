@@ -30,6 +30,19 @@ inline bool repeat_miss(uint64_t last, uint64_t token, int window) {
     return last != 0 && token + 1 - last <= (uint64_t) window;
 }
 
+struct MissHistory {
+    uint64_t last = 0, previous = 0;
+
+    /// Recent misses in the VRAM admission window, including the new one, capped at three.
+    uint8_t record(uint64_t token) {
+        const bool repeated = repeat_miss(last, token, kPromoteWindow);
+        const bool third = repeated && repeat_miss(previous, token, kPromoteWindow);
+        previous = last;
+        last = token + 1;
+        return third ? 3 : repeated ? 2 : 1;
+    }
+};
+
 /// How many experts of every layer each place holds.
 struct Homes {
     int main = 0;   ///< on the main card and nowhere else; 0 when its slots are only copies of the RAM tier

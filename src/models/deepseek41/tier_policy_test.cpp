@@ -125,6 +125,19 @@ int main() {
     CHECK(repeat_miss(5 + 1, 5 + kAdmitWindow, kAdmitWindow));
     CHECK(!repeat_miss(5 + 1, 5 + kAdmitWindow + 1, kAdmitWindow));
 
+    // At the third miss, both previous misses must still be inside the same window.
+    MissHistory recent;
+    CHECK(recent.record(0) == 1);
+    CHECK(recent.record(40) == 2);
+    CHECK(recent.record(64) == 3);
+    CHECK(recent.record(129) == 1);
+    CHECK(recent.record(140) == 2);
+    CHECK(recent.record(192) == 3);
+    MissHistory spaced;
+    CHECK(spaced.record(1) == 1);
+    CHECK(spaced.record(33) == 2);
+    CHECK(spaced.record(66) == 2);
+
     // ghost reset: a stream where one expert misses every 40 tokens is admitted on its second miss, one every 100 never
     for (int period : {40, 100}) {
         uint64_t last = 0;

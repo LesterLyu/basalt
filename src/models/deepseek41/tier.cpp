@@ -629,7 +629,7 @@ bool ExpertTier::load_ram(std::string& err) {
     free_places_.resize(n_layers_);
     swapping_.assign((size_t) n_layers_, 0);
     spare_since_.assign((size_t) n_layers_, 0);
-    last_miss_.assign((size_t) n_layers_ * n_expert_, 0);
+    misses_.assign((size_t) n_layers_ * n_expert_, {});
     preread_experts_.resize(n_layers_);
     const int64_t copies = homes_.main > 0 ? 0 : per_layer_;
     std::vector<int32_t> device_home;   // [layer * n_expert + e] the slot of a home on either card, or -1
@@ -1567,7 +1567,7 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
             return false;
         }
         lk.experts[i] = e;
-        lk.again[i] = false;
+        lk.recent_misses[i] = 0;
         lk.fetched[i] = false;
         lk.peer[i] = nullptr;
         const size_t idx = (size_t) layer * n_expert_ + e;
@@ -1591,14 +1591,14 @@ bool ExpertTier::lookup(int layer, const int32_t* ids, int k, Lookup& lk, std::s
                       " in layer " + std::to_string(layer);
                 return false;
             }
-            lk.again[i] = policy::repeat_miss(last_miss_[idx], token_, policy::kPromoteWindow);
+            auto& history = misses_[idx];
             if (pinned(layer, e)) {
                 ++ram_hits_;
             } else {
                 ++file_hits_;
-                if (policy::repeat_miss(last_miss_[idx], token_, policy::kAdmitWindow) && want_.size() < 64) want_.emplace_back(layer, e);
+                if (policy::repeat_miss(history.last, token_, policy::kAdmitWindow) && want_.size() < 64) want_.emplace_back(layer, e);
             }
-            last_miss_[idx] = token_ + 1;
+            lk.recent_misses[i] = history.record(token_);
             ++cpu_;
         }
     }
@@ -1944,11 +1944,15 @@ void ExpertTier::await_fetch(cudaStream_t main) { cudaStreamWaitEvent(main, fetc
 
 void ExpertTier::promote(int layer, const Lookup& lk) {
     if (m_.tiers().diag_tier_frozen) return;
+    const int main_misses = m_.tiers().main_promote_misses;
     for (int i = 0; i < lk.k; ++i) {
-        if ((lk.dev[i] && !lk.fetched[i]) || (lk.peer[i] && !lk.fetched[i]) || !lk.again[i] || !pinned(layer,lk.experts[i])) continue;
+        if ((lk.dev[i] && !lk.fetched[i]) || (lk.peer[i] && !lk.fetched[i]) ||
+            lk.recent_misses[i] < 2 || !pinned(layer,lk.experts[i])) continue;
+        if (!lk.fetched[i] && move_to_peer(layer,lk.experts[i],lk.host[i])) continue;
+        if (lk.recent_misses[i] < main_misses) continue;
         if (lk.fetched[i] && lk.dev[i])
             claim(layer,lk.experts[i],lk.dev[i],/*homes_too=*/false,/*device_source=*/true);
-        else if (lk.fetched[i] || !move_to_peer(layer,lk.experts[i],lk.host[i]))
+        else  // A temporary peer fetch retains its host source.
             claim(layer,lk.experts[i],lk.host[i],/*homes_too=*/true);
     }
 }

@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <charconv>
 #include <cstring>
+#include <string_view>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -101,6 +102,14 @@ public:
         else if (a == "--expert-overlay") o.expert_overlay = args.next("--expert-overlay");
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(args.next("--prefill-chunk"));
         else if (a == "--ds-gpu-single-miss") o.gpu_single_miss = true;
+        else if (a == "--ds-main-promote-misses") {
+            const std::string_view value = args.next("--ds-main-promote-misses");
+            if (value == "2" || value == "3") o.main_promote_misses = value.front() - '0';
+            else {
+                basalt::log::error("basalt deepseek41", "--ds-main-promote-misses: expected 2 or 3");
+                code = 2;
+            }
+        }
         else if (a == "--diag-drafter-gpu") o.drafter_device = std::atoi(args.next("--diag-drafter-gpu"));
         else if (a == "--vision-gpu") {
             const char* value = args.next("--vision-gpu");
