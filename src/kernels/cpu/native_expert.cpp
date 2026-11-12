@@ -135,6 +135,11 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     return true;
 }
 
+// IQ3_XXS benefits from sharing the decoded grids; its single-token ggml dot is faster.
+static bool use_exact_rows(int type, int nt) {
+    return (type != GGML_TYPE_IQ3_XXS || nt > 1) && iq_exact_512_supported(type);
+}
+
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
     static const bool avx512 = cpu_avx512_ok();
     if (f.gu_act == GGML_TYPE_Q8_K) {   // ggml's reference quantizer is scalar
@@ -198,7 +203,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq1s_512_gu_rows(blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
-    if (avx512 && f.swiglu_limit > 0.f && iq_exact_512_supported(f.gu_type) && iq1s_512_fits(n)) {
+    if (avx512 && f.swiglu_limit > 0.f && use_exact_rows(f.gu_type, nt) && iq1s_512_fits(n)) {
         iq_exact_512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, n, sg, su, f.tail != 0, f.swiglu_limit, act, nt, ff, r0, r1);
         return;
     }
@@ -242,7 +247,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq1s_512_rows(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }
-    if (avx512 && f.swiglu_limit > 0.f && !f.tail && iq_exact_512_supported(f.d_type) && iq1s_512_fits(n)) {
+    if (avx512 && f.swiglu_limit > 0.f && !f.tail && use_exact_rows(f.d_type, nt) && iq1s_512_fits(n)) {
         iq_exact_512_rows(f.d_type, blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1);
         return;
     }
