@@ -144,6 +144,22 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// MXFP4: one E8M0 scale; each byte holds values j and j + 16 in its low and high nibbles.
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e;
+    uint8_t qs[QK_MXFP4 / 2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == 17, "wrong mxfp4 block size/padding");
+
+// FP32 bits of half the E8M0 scale, paired with the doubled E2M1 lookup table.
+#if defined(GGML_COMMON_DECL_CUDA)
+__host__ __device__
+#endif
+static inline uint32_t ggml_e8m0_half_bits(uint32_t e) {
+    return e < 2 ? (0x00200000u << e) : ((e - 1) << 23);
+}
+
 // NVFP4: 64 values in four 16-value sub-blocks, each with a UE4M3 scale. Sub-block s keeps its E2M1 codes in
 // qs[8 s .. 8 s + 7]: byte j holds value j (low nibble) and value j + 8 (high nibble). The FP32 scale per
 // expert matrix is not part of the block; it multiplies the projection's output.
