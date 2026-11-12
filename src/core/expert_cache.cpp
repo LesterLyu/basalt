@@ -193,7 +193,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 }
 
 void ExpertCache::release_segmented() {
-    if (base_ != nullptr) cudaDeviceSynchronize();
+    if (mapped_segs_ > 0) cudaDeviceSynchronize();
     for (size_t i = 0; i < segs_.size(); ++i) {
         if (segs_[i]) vmm::unmap(base_ + seg_off_[i], (uint64_t) seg_size_[i], segs_[i]);
     }
@@ -232,7 +232,7 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
 int64_t ExpertCache::slots_after_shrink(int64_t keep_bytes) const {
     int64_t keep = 0;
     while (keep < mapped_segs_ && seg_off_[(size_t) keep] < keep_bytes) ++keep;
-    if (malloc_slab_backed()) keep = std::max<int64_t>(1, keep);
+    if (malloc_slab_backed() && initial_req_ < 0) keep = std::max<int64_t>(1, keep);
     if (keep >= mapped_segs_) return slots();
     const int64_t kept = keep > 0 ? seg_off_[(size_t) keep - 1] + seg_size_[(size_t) keep - 1] : 0;
     return slots_within(kept);
@@ -245,7 +245,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     }
     int64_t keep = 0;   // the segments [0, keep) hold the first keep_bytes
     while (keep < mapped_segs_ && seg_off_[(size_t) keep] < keep_bytes) ++keep;
-    if (malloc_slab_backed()) keep = std::max<int64_t>(1, keep);
+    if (malloc_slab_backed() && initial_req_ < 0) keep = std::max<int64_t>(1, keep);
     if (keep >= mapped_segs_) return true;
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
@@ -387,12 +387,14 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         off[i + 1] = off[i] + ((uint64_t) slot_bytes[i] + 255) / 256 * 256;
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
-    // A fixed head and loanable tail on a driver without physical VMM. Split only between complete slots.
-    if (malloc_slabs_requested_ && seg_req_ > 0 && !tail_req_ && initial_req_ < 0) {
+    // Split only between complete slots and at the initial prefix.
+    if (malloc_slabs_requested_ && seg_req_ > 0 && !tail_req_) {
         close();
+        const uint64_t initial = initial_req_ < 0 ? off.back() : std::min(off.back(), (uint64_t)initial_req_);
+        const uint64_t backed = *std::lower_bound(off.begin(), off.end(), initial);
         size_t free_b = 0, total_b = 0;
         if (n_layers <= 0 || n_expert <= 0 ||
-            (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < off.back())) {
+            (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < backed)) {
             err = "ExpertCache: not enough free VRAM for malloc slabs";
             return false;
         }
@@ -401,21 +403,24 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         residency_.assign((size_t) (n_layers * n_expert), kNotResident);
         seg_ = seg_req_;
         for (size_t first = 0; first < slot_bytes.size();) {
-            const auto end = std::upper_bound(off.begin() + first + 1, off.end(), off[first] + (uint64_t) seg_);
+            uint64_t limit = off[first] + (uint64_t)seg_;
+            if (off[first] < backed) limit = std::min(limit, backed);
+            const auto end = std::upper_bound(off.begin() + first + 1, off.end(), limit);
             const size_t next = std::max(first + 1, (size_t) (end - off.begin() - 1));
             const size_t bytes = (size_t) (off[next] - off[first]);
             void* p = nullptr;
-            if (cudaMalloc(&p, bytes) != cudaSuccess || cudaMemset(p, 0, bytes) != cudaSuccess) {
-                if (p) cudaFree(p);
-                err = "ExpertCache: cudaMalloc failed for a cache slab";
-                close();
-                return false;
+            if (off[first] < backed) {
+                if (cudaMalloc(&p, bytes) != cudaSuccess || cudaMemset(p, 0, bytes) != cudaSuccess) {
+                    if (p) cudaFree(p);
+                    err = "ExpertCache: cudaMalloc failed for a cache slab";
+                    close();
+                    return false;
+                }
+                ++mapped_segs_;
             }
-            if (!base_) base_ = static_cast<uint8_t*>(p);
             seg_off_.push_back((int64_t) off[first]);
             seg_size_.push_back((int64_t) bytes);
             slabs_.push_back(static_cast<uint8_t*>(p));
-            ++mapped_segs_;
             first = next;
         }
     } else {

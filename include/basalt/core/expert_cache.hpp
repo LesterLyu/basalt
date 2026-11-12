@@ -75,7 +75,7 @@ public:
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
     void close();
 
-    bool valid() const { return base_ != nullptr; }
+    bool valid() const { return base_ != nullptr || malloc_slab_backed(); }
     /// The slots usable now: all of them, unless `shrink` gave the tail's VRAM back - then the ones wholly inside the
     /// VRAM still backed, always a prefix.  The prompt path's loan (the last slots) and every report follow this;
     /// `full_slots()` is what `open` allocated.
@@ -105,7 +105,7 @@ public:
     /// The bytes of the granule-sized tail (0 when there is none).
     int64_t elastic_bytes() const;
     bool segmented() const { return !segs_.empty() || malloc_slab_backed(); }
-    /// Use independent, slot-aligned CUDA allocations for a fully backed sized arena.
+    /// Use independent, slot-aligned CUDA allocations for a sized arena, optionally starting with a backed prefix.
     void set_malloc_slabs(bool on) { malloc_slabs_requested_ = on; }
     bool malloc_slab_backed() const { return !slabs_.empty(); }
     /// The largest malloc slab boundary at or below keep_bytes.
@@ -197,7 +197,7 @@ private:
     void release_segmented();
     uint8_t* base_ = nullptr;
     bool malloc_slabs_requested_ = false;
-    std::vector<uint8_t*> slabs_;  // independently allocated, backed prefix; first slab remains while open
+    std::vector<uint8_t*> slabs_;  // independently allocated; entries past the backed prefix are null
     int64_t live_slots_ = 0;   // slots() - all of them unless shrunk
     int64_t seg_req_ = 0;   // the segment size asked for (0: one cudaMalloc)
     int64_t initial_req_ = -1;   // initially mapped bytes of a segmented arena (-1: all)

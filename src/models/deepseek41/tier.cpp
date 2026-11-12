@@ -732,7 +732,9 @@ bool ExpertTier::load_ram(std::string& err) {
     }
     const int limit = (int)(cap_per_layer_ >= 0 ? std::min<int64_t>(n_expert_,cap_per_layer_) : n_expert_);
     const int n = slots_fit(free_b,reserve_+modules_+free_floor_,std::max(0,limit-(int)per_layer_),0,true);
-    const bool elastic_extra = !malloc_slab_backed();
+    // Mixed-size permanent homes can have a loanable cache beside them.
+    const bool slab_extra = malloc_slab_backed() && m_.has_overlay();
+    const bool elastic_extra = !malloc_slab_backed() || slab_extra;
     const int capacity = elastic_extra ? std::max(0,limit-(int)per_layer_) : n;
     if (capacity > 0) {
         auto sizes = cache_sizes(capacity,true);
@@ -743,6 +745,7 @@ bool ExpertTier::load_ram(std::string& err) {
             initial_bytes += ((uint64_t)first[(size_t)l*n+r]+255)/256*256;
         }
         if (elastic_extra) ext_.set_segment_bytes(policy::kCacheSegment);
+        if (slab_extra) ext_.set_malloc_slabs(true);
         ext_.set_initial_bytes((int64_t)initial_bytes);
         if (!ext_.open_sized(sizes,n_layers_,n_expert_,err)) return false;
         ext_per_layer_ = capacity;
@@ -2067,7 +2070,13 @@ void ExpertTier::grow() {
         const auto before = ext_.slots();
         if (!ext_.grow(ext_.mapped_bytes()+(int64_t)(free-keep),err))
             basalt::log::warn("basalt deepseek41","expert cache refill: %s",err.c_str());
-        if (ext_.slots() > before) { seed_copies(n_expert_); finish_swaps(); pack_extra_ram(); }
+        if (ext_.slots() > before) {
+            seed_copies(n_expert_); finish_swaps(); pack_extra_ram();
+            if (ext_.malloc_slab_backed())
+                basalt::log::info("basalt deepseek41", "extra expert slabs: %lld -> %lld of %lld slots (%.2f GiB backed)",
+                    (long long)before, (long long)ext_.slots(), (long long)ext_.full_slots(),
+                    (double)ext_.mapped_bytes()/1073741824.0);
+        }
     }
 }
 
