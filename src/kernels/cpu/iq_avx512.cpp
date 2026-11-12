@@ -6,13 +6,12 @@
 // `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
-// IQ1_S (19) has an exact kernel, every token bit for bit ggml's single-token dot; so have IQ2_XXS, IQ2_XS, IQ2_S and IQ1_M
-// (29), for limited-SwiGLU layers, whose output stays ggml's.  They too decode a block once for up to four tokens.
+// The exact kernels keep ggml's single-token dot bits, including in limited-SwiGLU layers. They decode a block once
+// for up to four tokens.
 // Multi-token formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).
 //
 // The sign masks of IQ2_XXS, IQ2_XS and IQ3_XXS are built from their 7-bit indices with BMI2 (pdep, and pext for
-// IQ2_XS) and a byte parity rather than eight table loads.  IQ3_S and IQ2_S, whose grid index takes extra high bits,
-// look the grid up with one gather; the grids indexed by a plain byte keep scalar loads, which are faster there.
+// IQ2_XS) and a byte parity rather than eight table loads.
 #include "basalt/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -57,6 +56,11 @@ inline __m512i scales4(int s0, int s1, int s2, int s3) {
     const uint64_t packed = (uint64_t) (uint16_t) s0 | ((uint64_t) (uint16_t) s1 << 16) |
                             ((uint64_t) (uint16_t) s2 << 32) | ((uint64_t) (uint16_t) s3 << 48);
     return _mm512_permutexvar_epi16(idx, _mm512_set1_epi64((long long) packed));
+}
+
+// IQ3 uses one scale for each half of the vector.
+inline __m512i scales2(int lo, int hi) {
+    return _mm512_mask_blend_epi16(0xffff0000u, _mm512_set1_epi16((short) lo), _mm512_set1_epi16((short) hi));
 }
 
 // ---- per format: 64 values (chunk j of a 256-value block) -> grid magnitudes, sign mask, scales
@@ -128,7 +132,7 @@ template <> struct Fmt<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-
         const uint64_t s = ksigns8((uint64_t) (a & 0x0FFFFFFFu) | ((uint64_t) (c & 0x0FFFFFFFu) << 28));
         m = _cvtu64_mask64(s);
         const int sa = 2 * (int) (a >> 28) + 1, sb = 2 * (int) (c >> 28) + 1;
-        sc = scales4(sa, sa, sb, sb);
+        sc = scales2(sa, sb);
     }
 };
 
@@ -138,16 +142,13 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const uint8_t* q = b + 2 + 16 * j;
         // grid index l: q[l] | (high bit l of qh) << 8, sixteen lookups in one gather
-        const int h = (int) b[66 + 2 * j] | ((int) b[66 + 2 * j + 1] << 8);
-        const __m512i hb = _mm512_and_si512(_mm512_srlv_epi32(_mm512_set1_epi32(h),
-                                                              _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)),
-                                            _mm512_set1_epi32(1));
-        const __m512i idx = _mm512_or_si512(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q)), _mm512_slli_epi32(hb, 8));
+        const __m512i low = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q));
+        const __m512i idx = _mm512_mask_add_epi32(low, u16(b + 66 + 2 * j), low, _mm512_set1_epi32(256));
         g = _mm512_i32gather_epi32(idx, (const void*) iq3s_grid, 4);
         m = _cvtu64_mask64(u64(b + 74 + 8 * j));
         const uint8_t s = b[106 + j];
         const int sa = 2 * (s & 15) + 1, sb = 2 * (s >> 4) + 1;
-        sc = scales4(sa, sa, sb, sb);
+        sc = scales2(sa, sb);
     }
 };
 
@@ -235,8 +236,8 @@ inline void iq1s_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accum[t]) + IQ1S_DELTA * accum1[t];
 }
 
-// ---- IQ2_XXS, IQ2_XS, IQ2_S, NT tokens: integer sums folded to ggml's eight int32 lanes, its float accumulation order per
-// token, so every token's result is bit for bit ggml's single-token dot.
+// IQ2 and IQ3 exact dots: fold integer sums to ggml's eight lanes before each float accumulation. Keep the format
+// multiplier after the horizontal sum, as in ggml's single-token dot.
 template <int TY, int NT>
 inline void row_dot_exact(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
     __m256 accum[NT];
@@ -315,7 +316,7 @@ inline void iq1m_row_dot(const uint8_t* row, int nb, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) res[t] = hsum8(accum1[t]) + IQ1M_DELTA * hsum8(accum2[t]);
 }
 
-// the exact dots of one row for NT tokens: IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_M
+// The exact dots of one row for NT tokens.
 template <int TY, int NT>
 inline void exact_dot(const uint8_t* row, int nb, const block_q8_K* const* y, float* res) {
     if constexpr (TY == 19) iq1s_row_dot<NT>(row, nb, y, res);
@@ -390,6 +391,8 @@ void exact_gu_rows_nt(int type, const uint8_t* blob, size_t gu_row, size_t up_of
         case 19: exact_gu_rows_k<19>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 16: exact_gu_rows_k<16>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 17: exact_gu_rows_k<17>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 18: exact_gu_rows_k<18>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
+        case 21: exact_gu_rows_k<21>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 22: exact_gu_rows_k<22>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         case 29: exact_gu_rows_k<29>(k, blob, gu_row, up_off, nb, sg, su, scaled, limit, act + t0, ff + t0, r0, r1); break;
         default: break;
@@ -406,6 +409,8 @@ void exact_rows_nt(int type, const uint8_t* w, size_t row_bytes, int n, const vo
         case 19: exact_rows_k<19>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 16: exact_rows_k<16>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 17: exact_rows_k<17>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 18: exact_rows_k<18>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
+        case 21: exact_rows_k<21>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 22: exact_rows_k<22>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         case 29: exact_rows_k<29>(k, w, row_bytes, nb, act + t0, out + t0, r0, r1); break;
         default: break;
@@ -579,7 +584,7 @@ void iq1s_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const*
     exact_rows_nt(19, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
-bool iq_exact_512_supported(int type) noexcept { return type == 16 || type == 17 || type == 22 || type == 29; }
+bool iq_exact_512_supported(int type) noexcept { return iq512_supported(type) || type == 29; }
 
 void iq_exact_512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, float sg, float su,
                           bool scaled, float limit, const void* const* act, int nt, float* const* ff, int r0, int r1) {

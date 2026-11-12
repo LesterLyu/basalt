@@ -80,14 +80,14 @@ double now_ms() {
 }
 
 // Limited-SwiGLU rows must keep the single-token ggml rounding, including when a token moves within a window.
-int check_exact_iq2s(int n, int rows, int mode) {
+int check_exact(ggml_type type, int n, int rows, int mode, bool bench) {
     constexpr int T = 8;
-    const size_t stride = ggml_row_size(GGML_TYPE_IQ2_S, n), up = stride * rows;
+    const size_t stride = ggml_row_size(type, n), up = stride * rows;
     std::vector<uint8_t> weights(2 * up);
-    fill(weights, 22, 104 + n + mode, mode);
-    const auto* dot = ggml_get_type_traits_cpu_avx512(GGML_TYPE_IQ2_S);
+    fill(weights, type, 104 + n + mode, mode);
+    const auto* dot = ggml_get_type_traits_cpu_avx512(type);
     const auto* quant = ggml_get_type_traits_cpu_avx512(GGML_TYPE_Q8_K);
-    const auto* dw = ggml_get_type_traits(GGML_TYPE_IQ2_S);
+    const auto* dw = ggml_get_type_traits(type);
     std::vector<std::vector<uint8_t>> packed(T, std::vector<uint8_t>(ggml_row_size(GGML_TYPE_Q8_K, n)));
     std::vector<std::vector<float>> x(T, std::vector<float>(n));
     std::vector<std::vector<float>> ref(T, std::vector<float>(rows)), gu(T, std::vector<float>(rows));
@@ -114,8 +114,8 @@ int check_exact_iq2s(int n, int rows, int mode) {
     }
     size_t different = 0;
     for (int nt = 1; nt <= T; ++nt) for (int offset = 0; offset + nt <= T; ++offset) {
-        cpu::iq_exact_512_rows(22, weights.data(), stride, n, act + offset, nt, out, 0, rows);
-        cpu::iq_exact_512_gu_rows(22, weights.data(), stride, up, n, sg, su, scaled, limit, act + offset, nt, out_gu, 0, rows);
+        cpu::iq_exact_512_rows(type, weights.data(), stride, n, act + offset, nt, out, 0, rows);
+        cpu::iq_exact_512_gu_rows(type, weights.data(), stride, up, n, sg, su, scaled, limit, act + offset, nt, out_gu, 0, rows);
         for (int t = 0; t < nt; ++t) for (int r = 0; r < rows; ++r)
             different += std::memcmp(&got[t][r], &ref[t + offset][r], 4) != 0 ||
                          std::memcmp(&got_gu[t][r], &gu[t + offset][r], 4) != 0;
@@ -124,8 +124,8 @@ int check_exact_iq2s(int n, int rows, int mode) {
         std::fill(got[t].begin(), got[t].end(), -12345.f);
         std::fill(got_gu[t].begin(), got_gu[t].end(), -12345.f);
     }
-    cpu::iq_exact_512_rows(22, weights.data(), stride, n, act + 2, 3, out, 1, rows - 1);
-    cpu::iq_exact_512_gu_rows(22, weights.data(), stride, up, n, sg, su, scaled, limit, act + 2, 3, out_gu, 1, rows - 1);
+    cpu::iq_exact_512_rows(type, weights.data(), stride, n, act + 2, 3, out, 1, rows - 1);
+    cpu::iq_exact_512_gu_rows(type, weights.data(), stride, up, n, sg, su, scaled, limit, act + 2, 3, out_gu, 1, rows - 1);
     for (int t = 0; t < T; ++t) for (int r = 0; r < rows; ++r) {
         const bool inside = t < 3 && r >= 1 && r < rows - 1;
         const float a = inside ? ref[t + 2][r] : -12345.f, b = inside ? gu[t + 2][r] : -12345.f;
@@ -149,8 +149,45 @@ int check_exact_iq2s(int n, int rows, int mode) {
             bad += !std::isfinite(gu[t][r]) || eg > 1e-4 + 1e-3 * std::abs(want);
         }
     }
-    std::printf("  exact IQ2_S n=%d rows=%d mode=%d: ggml/width/position differences %zu; vs double dot abs %.3g rel %.3g, "
-                "gate/up abs %.3g rel %.3g\n", n, rows, mode, different, max_abs, max_rel, max_gu_abs, max_gu_rel);
+    std::printf("  exact %s n=%d rows=%d mode=%d: ggml/width/position differences %zu; vs double dot abs %.3g rel %.3g, "
+                "gate/up abs %.3g rel %.3g\n", ggml_type_name(type), n, rows, mode, different, max_abs, max_rel,
+                max_gu_abs, max_gu_rel);
+    if (bench && mode == 0 && rows >= 200) {
+        constexpr int batch = 200, repeats = 400;
+        const auto timed = [&](auto&& run) {
+            run();
+            const double begin = now_ms();
+            for (int rep = 0; rep < repeats; ++rep) run();
+            return (now_ms() - begin) * 1000 / repeats;
+        };
+        for (int nt : {1, 2, 4, 8}) {
+            const double scalar = timed([&] {
+                for (int r = 0; r < batch; ++r) for (int t = 0; t < nt; ++t)
+                    dot->vec_dot(n, out[t] + r, 0, weights.data() + stride * r, 0, act[t], 0, 1);
+            });
+            const double vector = timed([&] { cpu::iq_exact_512_rows(type, weights.data(), stride, n, act, nt, out, 0, batch); });
+            std::printf("    %d tokens, %d dot rows: ggml %.2f us, exact %.2f us (%.2f GB/s)\n",
+                        nt, batch, scalar, vector, stride * batch / (1000.0 * vector));
+            if (n == 5120 && type != GGML_TYPE_IQ2_S) {
+                const double old_gu = timed([&] {
+                    for (int r = 0; r < batch; ++r) for (int t = 0; t < nt; ++t) {
+                        float a, b;
+                        dot->vec_dot(n, &a, 0, weights.data() + stride * r, 0, act[t], 0, 1);
+                        dot->vec_dot(n, &b, 0, weights.data() + up + stride * r, 0, act[t], 0, 1);
+                        a = std::fmin(a, limit);
+                        b = std::fmax(std::fmin(b, limit), -limit);
+                        out_gu[t][r] = (a / (1.f + std::exp(-a))) * b;
+                    }
+                });
+                const double new_gu = timed([&] {
+                    cpu::iq_exact_512_gu_rows(type, weights.data(), stride, up, n, sg, su, scaled, limit, act, nt,
+                                              out_gu, 0, batch);
+                });
+                std::printf("    %d tokens, %d gate/up rows: ggml %.2f us, exact %.2f us (%.2f GB/s)\n",
+                            nt, batch, old_gu, new_gu, 2.0 * stride * batch / (1000.0 * new_gu));
+            }
+        }
+    }
     return bad + (different != 0);
 }
 
@@ -245,10 +282,10 @@ int main(int argc, char** argv) {
         if (max_rel > 1e-3) { std::printf("REFERENCE ERROR too large for type %d (dot rows)\n", type); ++bad; }
         if (max_gu > 1e-4) { std::printf("REFERENCE ERROR too large for type %d (gate/up rows)\n", type); ++bad; }
     }
-    for (int mode = 0; mode < MODES; ++mode) {
-        bad += check_exact_iq2s(256, 33, mode);
-        bad += check_exact_iq2s(5120, 2304, mode);
-        bad += check_exact_iq2s(2304, 5120, mode);
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) for (int mode = 0; mode < MODES; ++mode) {
+        bad += check_exact(type, 256, 33, mode, bench);
+        bad += check_exact(type, 5120, 2304, mode, bench);
+        bad += check_exact(type, 2304, 5120, mode, bench);
     }
     std::printf("iq_avx512_test: %s\n", bad ? "FAIL" : "PASS");
 
