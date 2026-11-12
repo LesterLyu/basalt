@@ -333,7 +333,9 @@ bool DsModel::load(const std::string& path, std::string& err) {
     if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;
+        // Keep recently fetched rows across requests instead of relying on the filesystem to retain their pages.
+        constexpr uint64_t kEngramCacheRows = 1ull << 20;
+        if (!engram_->open(path, e.file_offset, e.rows, 64, kEngramCacheRows, err, e.row_bytes)) return false;
     }
     return true;
 }
