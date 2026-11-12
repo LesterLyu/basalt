@@ -469,7 +469,7 @@ bool ExpertTier::load_ram(core::LoadPlan& plan, std::string& err) {
             const uint64_t slot = (max_blob + 255) / 256 * 256;
             const int n = room > keep ? (int) std::min<uint64_t>(core::policy::kPeerFetchSlots, (room - keep) / slot) : 0;
             std::string se;
-            if (n > 0 && !peers_[c]->open_scratch(n, max_blob, se))
+            if (s_.replacements.empty() && n > 0 && !peers_[c]->open_scratch(n, max_blob, se))
                 basalt::log::warn(s_.area.c_str(), "second card GPU %d fetches no misses over its link: %s",
                                   peers_[c]->device(), se.c_str());
         }

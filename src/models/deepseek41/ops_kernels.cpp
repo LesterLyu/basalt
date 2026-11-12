@@ -141,7 +141,6 @@ public:
         for (const auto& b : el_ik_) if (b) kv += b->backed();
         usage.device(m_.device(), "kv_state", kv);
         usage.device(m_.device(), "scratch", allocated_bytes_ - state_bytes_);
-        if (batch_) batch_->memory_usage(usage);
         if (tier_) tier_->memory_usage(usage);
     }
     bool init(std::string& err) {
@@ -354,6 +353,9 @@ public:
         return batch_ != nullptr;
     }
     void close_batch() override { batch_.reset(); }
+    void batch_memory_usage(core::MemoryUsage& usage) const override {
+        if (batch_) batch_->memory_usage(usage);
+    }
     bool batch_open(std::string& err) const {
         if (!batch_) err = "deepseek41: the batched attention runs only inside a prompt read";
         return batch_ != nullptr;
