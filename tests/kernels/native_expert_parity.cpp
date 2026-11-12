@@ -23,6 +23,8 @@
 #include "basalt/kernels/iq_kernels.hpp"
 
 #include "basalt/ggml/ggml.h"
+#define GGML_COMMON_DECL_CPP
+#include "basalt/ggml/ggml_common.h"
 
 #include <cuda_runtime.h>
 
@@ -322,6 +324,21 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             std::printf("          gpu decode-once vs per-entry kernels: %s\n", same ? "bitwise equal" : "MISMATCH");
             if (!same) ++failures;
         }
+        if (f.d_type == GGML_TYPE_MXFP4) {
+            std::vector<float> single(H);
+            const int32_t stop = 1;
+            cudaMemcpy(dstart + 1, &stop, sizeof(stop), cudaMemcpyHostToDevice);
+            for (int32_t token = 0; token < NT; ++token) {
+                cudaMemcpy(dtok, &token, sizeof(token), cudaMemcpyHostToDevice);
+                basalt::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+                cudaStreamSynchronize(s);
+                cudaMemcpy(single.data(), dout, single.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                if (std::memcmp(single.data(), got_g.data() + token * H, single.size() * sizeof(float))) {
+                    std::printf("          MXFP4 grouped width 1 vs %d: token %d differs\n", NT, token);
+                    ++failures;
+                }
+            }
+        }
         {   // (d) the GPU dequantizers (prompt path: iq_dequant_f32/_f16; embedding: iq_embed_rows) against to_float
             float* dq = nullptr;
             uint16_t* dh = nullptr;
@@ -350,6 +367,8 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                     differ += std::memcmp(&got_dq[i], &(*m.want)[i], 4) != 0;
                     h_differ += got_h[i] != ggml_fp32_to_fp16(got_dq[i]);
                 }
+                if (m.type == GGML_TYPE_MXFP4 &&
+                    std::memcmp(got_dq.data(), m.want->data(), got_dq.size() * sizeof(float))) ++failures;
             }
             // the gate matrix as an embedding table of FF rows of H values
             basalt::kernels::iq_embed_rows(f.gu_type, dblob, f.gu_row, dtk, FF, H, dq, s);
@@ -395,6 +414,16 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     auto quant = [&](int type, int64_t rows, int64_t cols, uint8_t* dst) {
+        if (type == GGML_TYPE_MXFP4) {
+            // Inference consumes raw blocks; exercise all E2M1 codes and several realistic E8M0 scales.
+            for (int64_t b = 0; b < rows * cols / QK_MXFP4; ++b, dst += sizeof(block_mxfp4)) {
+                block_mxfp4 block;
+                block.e = (uint8_t)(119 + rng() % 3);
+                for (auto& q : block.qs) q = (uint8_t)rng();
+                std::memcpy(dst, &block, sizeof(block));
+            }
+            return;
+        }
         std::vector<float> w((size_t) (rows * cols));
         for (int64_t r = 0; r < rows; ++r) {
             const float scale = 0.02f * (0.5f + (float) (r % 7) / 7.0f);

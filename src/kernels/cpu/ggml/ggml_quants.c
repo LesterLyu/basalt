@@ -1395,6 +1395,17 @@ void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_REST
     }
 }
 
+static void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_MXFP4 == 0);
+    for (int64_t i = 0; i < k / QK_MXFP4; ++i) {
+        const float d = fp32_from_bits(ggml_e8m0_half_bits(x[i].e));
+        for (int j = 0; j < QK_MXFP4 / 2; ++j) {
+            y[i * QK_MXFP4 + j] = d * kvalues_fp4[x[i].qs[j] & 0xf];
+            y[i * QK_MXFP4 + j + QK_MXFP4 / 2] = d * kvalues_fp4[x[i].qs[j] >> 4];
+        }
+    }
+}
+
 // UE4M3 scale as ggml decodes it: half the value (kvalues_fp4 is doubled), 0x7F (NaN) as 0, bit 7 ignored (so 0xFF
 // is NaN too, as in the SIMD and CUDA decoders).
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
@@ -1502,6 +1513,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     TYPE(GGML_TYPE_IQ4_XS, "iq4_xs", QK_K, block_iq4_xs, dequantize_row_iq4_xs, NULL),
     TYPE(GGML_TYPE_IQ1_S, "iq1_s", QK_K, block_iq1_s, dequantize_row_iq1_s, NULL),
     TYPE(GGML_TYPE_IQ1_M, "iq1_m", QK_K, block_iq1_m, dequantize_row_iq1_m, NULL),
+    TYPE(GGML_TYPE_MXFP4, "mxfp4", QK_MXFP4, block_mxfp4, dequantize_row_mxfp4, NULL),
     TYPE(GGML_TYPE_NVFP4, "nvfp4", QK_NVFP4, block_nvfp4, dequantize_row_nvfp4, quantize_row_nvfp4_ref),
 #undef TYPE
 };

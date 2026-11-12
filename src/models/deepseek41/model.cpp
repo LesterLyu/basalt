@@ -89,7 +89,9 @@ bool DsModel::load_overlay(const std::string& path, std::string& err) {
         int l,e,gu,d; uint64_t off,bytes;
         if (!(in >> l >> e >> gu >> d >> off >> bytes) || l<0 || l>=g.n_layers || e<0 || e>=g.n_expert ||
             off!=cursor || !bytes || bytes>data.bytes-cursor ||
-            !((gu==19 || gu==16 || gu==17 || gu==22) && (d==10 || d==16 || d==17 || d==18 || d==19 || d==22))) {
+            !((gu==19 || gu==16 || gu==17 || gu==18 || gu==21 || gu==22) &&
+              (d==10 || d==16 || d==17 || d==18 || d==19 || d==21 || d==22 || d==39)) ||
+            !kernels::native_expert_supported(gu,d,g.n_embd,g.n_ff_exp)) {
             err="invalid overlay entry or unsupported format"; return false;
         }
         const size_t key=(size_t)l*g.n_expert+e;

@@ -638,6 +638,33 @@ __device__ __forceinline__ float vec_dot_q6_K_q8_1(const void* __restrict__ vbq,
     return __half2float(bq6->d) * sumf;
 }
 
+struct Mxfp4Dot {
+    struct W { int2 v[4]; float d; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ row, int block, int, const uint32_t* = nullptr) {
+        const block_mxfp4& x = ((const block_mxfp4*) row)[block];
+        W w;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t* q = x.qs + 4 * i;
+            // The 17-byte blocks are unaligned and a packed expert has no readable tail padding.
+            const uint32_t packed = (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24;
+            w.v[i] = get_int_from_table_16(packed, kvalues_fp4);
+        }
+        w.d = __uint_as_float(ggml_e8m0_half_bits(x.e));
+        return w;
+    }
+    __device__ static float apply(const W& w, const block_q8_1* __restrict__ y, int) {
+        int sum = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sum = ggml_cuda_dp4a(w.v[i].x, get_int_b4(y->qs, i), sum);
+            sum = ggml_cuda_dp4a(w.v[i].y, get_int_b4(y->qs, i + 4), sum);
+        }
+        return w.d * (__low2float(y->ds) * (float) sum);
+    }
+};
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
@@ -677,6 +704,11 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0,
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<39> { static constexpr int qk = QK_MXFP4, ipb = 1, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) {
+        return Mxfp4Dot::apply(Mxfp4Dot::load(v, kbx, iqs), y, iqs);
+    }
+};
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 4, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -703,7 +735,7 @@ __device__ __forceinline__ void tail_scale(float (&s)[NC], float sc) {
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #define GU_FMTS(X) X(16) X(17) X(18) X(19) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(14) X(6) X(8) X(40)
-#define D_FMTS(X) X(10) X(11) X(14) X(16) X(17) X(18) X(19) X(20) X(22) X(23) X(29) X(42) X(7) X(6) X(8) X(40)
+#define D_FMTS(X) X(10) X(11) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(7) X(6) X(8) X(39) X(40)
 #define MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(10) X(11) X(12) X(13) X(7) X(6) X(8) X(40)
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -1330,6 +1362,9 @@ template<> struct Split<8> {   // Q8_0
         return r.d * d8_1 * ((float) sumi);
     }
 };
+
+template<> inline constexpr bool kSplit<39> = true;
+template<> struct Split<39> : Mxfp4Dot {};
 
 template<> inline constexpr bool kSplit<40> = true;
 template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1 split; the per-expert FP32 scale is the kernels' (tail_scale)
@@ -2797,6 +2832,18 @@ __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) yy[tid * 8 + j] = cvt<dst_t>(__uint_as_float((uint32_t) x[j] << 16));
 }
 
+template<typename dst_t>
+__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_mxfp4& x = ((const block_mxfp4*) vx)[8 * ibs + tid / 4];
+    const float d = __uint_as_float(ggml_e8m0_half_bits(x.e));
+    const int j0 = (tid & 3) * 4;
+    dst_t* y = yy + (tid / 4) * QK_MXFP4;
+    for (int j = j0; j < j0 + 4; ++j) {
+        y[j] = cvt<dst_t>(d * kvalues_fp4[x.qs[j] & 0xf]);
+        y[j + 16] = cvt<dst_t>(d * kvalues_fp4[x.qs[j] >> 4]);
+    }
+}
+
 // NVFP4: superblock ibs is four 64-value blocks; thread tid writes 8 values of block tid/8, sub-block (tid%8)/2, the
 // low (even tid) or high nibbles.  `s` is the matrix's FP32 scale (1 leaves ggml's to_float values unchanged).
 template<typename dst_t>
@@ -2814,6 +2861,7 @@ __device__ void dq_nvfp4(const void* vx, int64_t ibs, dst_t* yy, int tid, float 
 template<typename dst_t>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid, float s = 1.0f) {
     switch (ty) {
+        case 39: dq_mxfp4(vx, ibs, y, tid); break;
         case 40: dq_nvfp4(vx, ibs, y, tid, s); break;
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
@@ -2858,7 +2906,7 @@ __global__ void dequant_gu_kernel(int ty, int ty_u, const void* __restrict__ gat
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 19 || t == 22 || t == 23 || t == 29 || t == 42 || t == 10 || t == 11 ||
-           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8 || t == 40;
+           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 8 || t == 39 || t == 40;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -3092,6 +3140,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 39: return (size_t) (n / QK_MXFP4) * sizeof(block_mxfp4);
         case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;

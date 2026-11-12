@@ -1506,6 +1506,34 @@ static void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, 
     *s = sumf;
 }
 
+static void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                                  size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1 && n % QK_MXFP4 == 0);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    static_assert(QK_MXFP4 == QK8_0, "MXFP4 and Q8_0 must cover the same values");
+    const block_mxfp4 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    const __m128i values = _mm_loadu_si128((const __m128i *) kvalues_fp4);
+    const __m128i mask = _mm_set1_epi8(0x0f);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < n / QK_MXFP4; ++i) {
+        const __m128i q = _mm_loadu_si128((const __m128i *) x[i].qs);
+        const __m128i lo = _mm_shuffle_epi8(values, _mm_and_si128(q, mask));
+        const __m128i hi = _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(q, 4), mask));
+        const __m256i a = _mm256_loadu_si256((const __m256i *) y[i].qs);
+        const __m256i p = _mm256_madd_epi16(mul_add_epi8(MM256_SET_M128I(hi, lo), a), ones);
+        // Spell out the F16C conversion to keep it in this loop on MSVC, where the scalar helper is out of line.
+        const float d8 = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(y[i].d)));
+        const float d = fp32_from_bits(ggml_e8m0_half_bits(x[i].e)) * d8;
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(p), acc);
+    }
+    *s = hsum_float_8(acc);
+}
+
 // UE4M3 scale as ggml decodes it (half the value, kvalues_fp4 being doubled; 0x7F as 0; bit 7 ignored), built from
 // its bits: exact, and the same as dequantize_row_nvfp4.
 static inline float nvfp4_scale(uint8_t x) {
@@ -1803,6 +1831,7 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IQ4_XS]  = {NULL, ggml_vec_dot_iq4_xs_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_S]   = {NULL, ggml_vec_dot_iq1_s_q8_K, GGML_TYPE_Q8_K, 1},
     [GGML_TYPE_IQ1_M]   = {NULL, ggml_vec_dot_iq1_m_q8_K, GGML_TYPE_Q8_K, 1},
+    [GGML_TYPE_MXFP4]   = {NULL, ggml_vec_dot_mxfp4_q8_0, GGML_TYPE_Q8_0, 1},
     [GGML_TYPE_NVFP4]   = {NULL, ggml_vec_dot_nvfp4_q8_0, GGML_TYPE_Q8_0, 1},
 };
 
