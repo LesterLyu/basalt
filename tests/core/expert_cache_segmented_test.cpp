@@ -52,8 +52,8 @@ int test_malloc_slabs() {
     std::string err;
     if (!c.open_sized(sizes,2,8,err) || !c.malloc_slab_backed() || c.slots() != 8)
         return fail("malloc slab open",err);
-    const auto put = [&](int from) {
-        for (int i=from; i<8; ++i) {
+    const auto put = [&](int from, int until = 8) {
+        for (int i=from; i<until; ++i) {
             std::vector<uint8_t> data((size_t)sizes[i],(uint8_t)(i+19));
             if (!c.fill_slot_blocking(i,data.data(),err,sizes[i])) return false;
         }
@@ -79,6 +79,21 @@ int test_malloc_slabs() {
         return fail("malloc slab grow and refill",err);
     c.close();
     if (c.valid() || c.segmented()) return fail("malloc slab close");
+    for (const int64_t prefix : {0*M, 9*M}) {
+        c.set_initial_bytes(prefix);
+        const int64_t live = prefix ? 3 : 0;
+        if (!c.open_sized(sizes,2,8,err) || !c.valid() || !c.malloc_slab_backed() ||
+            c.full_slots() != 8 || c.slots() != live || c.mapped_bytes() != prefix || c.device_slot((int32_t)live))
+            return fail("malloc slab initial prefix",err);
+        if ((live && (!put(0, (int)live) || !verify(live))) || !c.grow(c.full_bytes(),err) ||
+            c.slots() != 8 || !put((int)live) || !verify(8))
+            return fail("malloc slab prefix grow",err);
+        if (c.slots_after_shrink(0) != 0 || !c.shrink(0,err) || !c.valid() || c.slots() || c.mapped_bytes() || c.device_slot(0))
+            return fail("malloc slab lend all",err);
+        if (!c.grow(c.full_bytes(),err) || !put(0) || !verify(8)) return fail("malloc slab recover after lend all",err);
+        c.close();
+        if (c.valid() || c.segmented()) return fail("malloc prefix close");
+    }
     std::puts("expert cache malloc slabs: mixed slot boundaries, release and byte-for-byte refill");
     return 0;
 }
