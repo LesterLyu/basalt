@@ -654,6 +654,23 @@ struct Mxfp4Dot {
         w.d = __uint_as_float(ggml_e8m0_half_bits(x.e));
         return w;
     }
+    // The row starts on a 4-byte boundary and has a multiple of four blocks. The last block starts
+    // three bytes into its first word, so all five loads fit in the row without tail padding.
+    __device__ static W load_aligned(const uint8_t* __restrict__ row, int block) {
+        const auto* p = reinterpret_cast<const uint32_t*>(row + (17 * block & ~3));
+        const unsigned shift = (block & 3) * 8;
+        uint32_t words[5];
+#pragma unroll
+        for (int i = 0; i < 5; ++i) words[i] = __ldg(p + i);
+        W w;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t packed = __funnelshift_rc(words[i], words[i + 1], shift + 8);
+            w.v[i] = get_int_from_table_16(packed, kvalues_fp4);
+        }
+        w.d = __uint_as_float(ggml_e8m0_half_bits((words[0] >> shift) & 0xff));
+        return w;
+    }
     __device__ static float apply(const W& w, const block_q8_1* __restrict__ y, int) {
         int sum = 0;
 #pragma unroll
@@ -2404,7 +2421,11 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
         for (int c = 0; c < NC; ++c) a[i][c] = 0.0f;
         for (int k = t + 8 * i; k < K; k += 32) {
             const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-            const typename S::W w = S::load(row, kbx, iqs);
+            typename S::W w;
+            if constexpr (TY == 39) {
+                w = (K % 4 == 0 && (reinterpret_cast<uintptr_t>(row) & 3) == 0)
+                        ? S::load_aligned(row, kbx) : S::load(row, kbx, iqs);
+            } else w = S::load(row, kbx, iqs);
 #pragma unroll
             for (int c = 0; c < NC; ++c)
                 if (EXACT_N || c < n) a[i][c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
