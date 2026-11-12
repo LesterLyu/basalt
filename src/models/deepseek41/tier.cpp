@@ -643,7 +643,7 @@ bool ExpertTier::load_ram(std::string& err) {
         const uint64_t slot = (max_blob + 255) / 256 * 256;
         const int n = room > keep ? (int) std::min<uint64_t>(policy::kPeerFetchSlots, (room - keep) / slot) : 0;
         std::string se;
-        if (n > 0 && !peer_->open_scratch(n, max_blob, se))
+        if (!m_.has_overlay() && n > 0 && !peer_->open_scratch(n, max_blob, se))
             basalt::log::warn("basalt deepseek41", "the second card fetches no misses over its link: %s", se.c_str());
     }
     for (int l = 0; l < n_layers_; ++l) {

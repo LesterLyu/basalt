@@ -26,7 +26,8 @@ class CancelledPromptBookkeeping(unittest.TestCase):
         engine.slot_held = [[], []]
         engine.slot_used = [0, 0]
         engine.slot_busy = [False, False]
-        engine.slot_keys = [None, None]
+        engine.slot_owner = {}
+        engine.session_slot = {}
         engine.slot_order = [0, 1]
         prompt = list(range(30))
         engine.last = {"finish": "cancel", "reused": 4, "prompt_read": 8}
@@ -280,7 +281,7 @@ class PickSlot(unittest.TestCase):
         e.slot_held[0] = [1, 2, 3]
         e.claim_slot(0, "main")
         self.assertEqual(e.pick_slot([1, 2, 3, 4], "review"), 1)
-        e.claim_slot(0, None)
+        e.claim_slot(1, "main")  # moving the owner leaves slot 0 unowned
         self.assertEqual(e.pick_slot([1, 2, 3, 4]), 0)        # an unowned prefix remains reusable
 
 

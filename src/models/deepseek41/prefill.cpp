@@ -46,6 +46,7 @@ public:
 
     void memory_usage(core::MemoryUsage& usage) const override {
         usage.device(m_.device(), "long_prefill", allocated_bytes_);
+        ops_.batch_memory_usage(usage);
         if (ffn_) ffn_->memory_usage(usage);
     }
     bool init(std::string& err) {

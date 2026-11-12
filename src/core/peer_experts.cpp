@@ -553,12 +553,12 @@ bool PeerExperts::raise(int64_t layer, const int32_t* ids, const int32_t* kind, 
 bool PeerExperts::open_scratch(int n, uint64_t bytes, std::string& err) {
     On on(device_);
     const uint64_t stride = (bytes + 255) / 256 * 256;
-    const bool ok = ck(cudaMalloc((void**) &scratch_base_, stride * (uint64_t) n), "scratch slots", err) &&
+    const bool ok = ck(allocate_device((void**) &scratch_base_, stride * (uint64_t) n), "scratch slots", err) &&
                     ck(cudaStreamCreateWithFlags(&fetch_, cudaStreamNonBlocking), "fetch stream", err) &&
                     ck(cudaEventCreateWithFlags(&fetch_ev_, cudaEventDisableTiming), "fetch event", err) &&
                     ck(cudaHostAlloc(&h_fplan_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "fetched plan staging", err) &&
                     ck(cudaHostGetDevicePointer(&fplan_map_, h_fplan_, 0), "mapped fetched plan", err) &&
-                    ck(cudaMalloc(&d_fplan_, sizeof(Meta)), "fetched plan", err);
+                    ck(allocate_device(&d_fplan_, sizeof(Meta)), "fetched plan", err);
     if (!ok) return false;   // no slot to fetch into; close() frees what was taken
     scratch_bytes_ = stride;
     scratch_.assign((size_t) n, -1);
