@@ -617,8 +617,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "the budget the thinking is closed and the answer starts, so set it below the request's "
                          "max_tokens")
     ap.add_argument("--thinking-loop-tokens", type=budget_count, default=256, metavar="N",
-                    help="end the thinking and let the model answer when it repeats one token this many times in a "
-                         "row inside the thinking (0 = never)")
+                    help="minimum repeated tokens for the thinking loop safeguard (0 = off): end a single-token "
+                         "loop, or remind the model once for a repeating sequence before ending the thinking")
     ap.add_argument("--video-max-tokens", type=video_tokens, default=VIDEO_MAX_TOKENS, metavar="N",
                     help=f"the most image tokens one video may take over all its frames (default {VIDEO_MAX_TOKENS}): "
                          "frames are sampled at 2 a second (4 to 768; a request's video part may ask fps and "

@@ -2825,6 +2825,7 @@ class SharingTheGpu(unittest.TestCase):
 class ThinkingEngine(MockEngine):
     """Thinks THOUGHT, then answers; a prompt already ending its thinking gets the answer at once. Records prompts."""
     THOUGHT = "Let me think step by step about two plus two. " * 4          # 184 reasoning tokens (one per byte)
+    LONG_THOUGHT = " ".join(f"Step {i}: check assumption {i * i}." for i in range(260))
     ANSWER = "The answer is 4."
     end_in_thought = False      # the turn ends inside the thinking (the end token right after THOUGHT)
 
@@ -2982,7 +2983,7 @@ class ThinkingBudget(unittest.TestCase):
     def test_answer_room_wraps_up_long_thinking_without_a_budget(self):
         """From max_tokens 1024 on, thinking with no budget keeps the answer a quarter of the cap: 1024 - 512."""
         from serve.service import REASONING_CLOSE
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4               # 736 reasoning tokens, more than the 512
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]        # more than the 512-token budget
         code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
@@ -2992,7 +2993,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_answer_room_cuts_a_budget_at_or_near_max_tokens(self):
         from serve.service import REASONING_CLOSE
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         code, b = self.openai(max_tokens=1024, reasoning_budget_tokens=1000)
         self.assertEqual(code, 200, b)
         msg = b["choices"][0]["message"]
@@ -3025,7 +3026,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], self.engine.THOUGHT)   # 924 allowed, 736 used
 
     def test_answer_room_preserves_explicit_opt_outs_and_budget_precedence(self):
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         self.svc.reasoning_budget_tokens = 20
         for fields in ({"reasoning_budget_tokens": 0, "thinking_budget_tokens": 10},
                        {"thinking_budget_tokens": 0, "thinking": {"budget_tokens": 10}},
@@ -3037,7 +3038,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_answer_room_keeps_smaller_budgets_and_clamps_server_defaults(self):
         from serve.service import REASONING_CLOSE
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         for default, fields, expected in ((0, {"reasoning_budget_tokens": 100}, 100),
                                           (100, {}, 100), (1000, {}, 512),
                                           (1000, {"reasoning_budget_tokens": 100}, 100)):
@@ -3053,7 +3054,7 @@ class ThinkingBudget(unittest.TestCase):
     def test_answer_room_uses_the_engine_clipped_cap(self):
         from serve.prompt import PromptText
         from serve.service import REASONING_CLOSE
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         self.engine.takes_text = True
         original = self.engine.generate
 
@@ -3085,7 +3086,7 @@ class ThinkingBudget(unittest.TestCase):
     def test_answer_room_reserves_a_quarter_of_an_8192_token_cap(self):
         from serve.service import REASONING_CLOSE
         self.engine.max_context = 16384
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 40
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:7360]
         code, b = self.openai(max_tokens=8192)
         self.assertEqual(code, 200, b)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"],
@@ -3095,7 +3096,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["completion_tokens"], 6144 + len(extra) + len(ThinkingEngine.ANSWER) + 1)
 
     def test_answer_room_on_both_apis_streaming_and_nonstreaming(self):
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         for path in ("/v1/messages", "/v1/chat/completions"):
             for stream in (False, True):
                 with self.subTest(path=path, stream=stream):

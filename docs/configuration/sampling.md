@@ -97,8 +97,11 @@ while video is on) that this model takes video parts now (image input on, a mode
 
 ## Thinking loops
 
-- **Loops:** when one token repeats 256 times inside the thinking, the server closes the thinking and the model answers
-  (`thinking-loop-tokens`). Only the thinking is watched. `finish_reason` stays honest.
+The server watches only the generated thinking. When one token repeats 256 times in a row, it closes the thinking so
+the model can answer. For an exact repeating sequence of up to 4,096 tokens, it looks for two copies and the start of a
+third, with at least 256 repeated tokens. It adds one reminder to the thinking and continues within the original
+budget. If the loop returns or there is no room for a reminder, it closes the thinking. The actual stop still determines
+`finish_reason`. Set `thinking-loop-tokens` to change the repetition threshold or to `0` to disable both checks.
 
 ## The model file's defaults
 

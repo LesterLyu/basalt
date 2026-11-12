@@ -20,6 +20,7 @@ from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, IM_END, StopMatcher, control_literals, stop_strings
+from serve.util.thinking_loop import ThinkingLoop
 from serve.tool_output import ToolOutputError
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
 from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_MAX_TOKENS, VIDEO_REQUEST_BYTES, Vision
@@ -47,6 +48,8 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                          "elaboration."}
 # the Qwen dialect's closer of thinking; other dialects carry their own
 REASONING_CLOSE = "\n</think>\n\n"
+THINKING_LOOP_REMINDER = ("\n\n[Basalt reminder: This reasoning is repeating. Move on from the repeated branch. "
+                          "Check the remaining requirements against the evidence already established and continue.]\n\n")
 # Automatic answer room: thinking leaves the answer max(512, cap // 4) tokens, at most half the cap; a cap below
 # ANSWER_ROOM_MIN_CAP is too small to split and is left as it is.
 ANSWER_ROOM_MIN_CAP = 32
@@ -149,7 +152,7 @@ class Service:
         self.vram_reserve = None                         # last POST /v1/vram reserve (None: the start's)
         self.reasoning_budget_tokens = 0                 # default thinking budget (0: none)
         self.answer_room: str | int = "auto"             # answer reserve when thinking: "auto" or a fixed token count (0: none)
-        self.thinking_loop_tokens = 256                  # one token repeated this often in the thinking ends it (0: off)
+        self.thinking_loop_tokens = 256                  # minimum repeated tokens inside thinking (0: off)
         self.anthropic_think_unasked = True               # "anthropic_thinking": "on_request" -> False
         self.stop_ids = {t for s in self.dialect.stop_texts for t in tokenizer.encode(s, parse_special=True)}
 
@@ -1257,7 +1260,9 @@ class Service:
                     # answer now stops an engine that takes `stop_soon` at its own pace (see the pass below)
                     soft_stops = live is not None and "stop_soon" in inspect.signature(self.engine.generate).parameters
                     closed_early = False                # the thinking was already closed once
-                    run_id, run_n = None, 0             # the token the thinking is repeating, and how often in a row
+                    loop = (ThinkingLoop(self.thinking_loop_tokens)
+                            if thinking and 0 < self.thinking_loop_tokens < max_new else None)
+                    reminded = False
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -1271,10 +1276,10 @@ class Service:
                                                    session=session, **more) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session, **more)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
-                        looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
                         resumed = False                 # stopped for answer now, but not at a point to close: go on
+                        period, reminder = 0, None       # this pass stopped for a thinking loop
                         ended_thinking = False          # the turn ended inside the thinking
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -1307,11 +1312,6 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
-                                if parser.state == "reasoning":
-                                    run_n = run_n + 1 if t == run_id else 1
-                                    run_id = t
-                                else:
-                                    run_n = 0
                                 thinking_n += parser.state == "reasoning"
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
@@ -1342,18 +1342,29 @@ class Service:
                                 if getattr(parser, "orphaned_tool", False):
                                     finish = "stop"         # drain before the corrective turn
                                     break
-                                if (self.thinking_loop_tokens and run_n >= self.thinking_loop_tokens
-                                        and parser.state == "reasoning" and not parser.buf and not detok.pending()):
-                                    wrap = looped = True
-                                    break
                                 if one_call and any(ev.kind == "tool_call" for ev in evs):
                                     finish = "stop"         # no second call after a forced one
                                     break
-                                if budget and parser.state == "reasoning":
+                                if parser.state != "reasoning":
+                                    loop = None
+                                elif loop is not None or budget:
+                                    # Only intervene at a clean point: no held tag or split character.
+                                    clean = not parser.buf and not detok.pending()
+                                    period = loop.push(t, clean) if loop is not None else 0
                                     thought += 1
-                                    # only at a clean point: no held tag or split character
-                                    if thought >= budget and not parser.buf and not detok.pending():
+                                    if period == 1 or (budget and thought >= budget and clean):
                                         wrap = True
+                                        period = int(period == 1)
+                                        break
+                                    if period:
+                                        if not reminded:
+                                            note = self.tok.encode(THINKING_LOOP_REMINDER)
+                                            close = self.tok.encode(self.dialect.reasoning_close + (force or ""),
+                                                                    parse_special=True)
+                                            if (max_new - n > len(note) + len(close)
+                                                    and (budget is None or budget - thought > len(note))):
+                                                reminder = note
+                                        wrap = reminder is None
                                         break
                                 if live is not None:
                                     live.state = "thinking" if parser.state == "reasoning" else "answering"
@@ -1399,8 +1410,8 @@ class Service:
                                 wrap = asked = True
                             else:                       # a split tag or character, or the thinking ended meanwhile
                                 resumed = True
-                        if (not (wrap or opens or ended_thinking or resumed) and finish == "stop" and not cancel.is_set()
-                                and not looped and (stops is None or stops.hit is None)):
+                        if (not (wrap or opens or ended_thinking or resumed or reminder) and finish == "stop"
+                                and not cancel.is_set() and (stops is None or stops.hit is None)):
                             for ev in cut(parser.finish()):
                                 yield "event", ev
                             if stops is not None and stops.hit is not None:
@@ -1429,16 +1440,22 @@ class Service:
                                 answer_parts.clear()
                                 repaired, closed_early = True, True
                                 finish = "length"
-                                budget, force, tail, run_id, run_n = None, None, "", None, 0
+                                budget, force, tail, loop = None, None, "", None
                                 with self.status_lock:
                                     st.update(phase="repairing tool output", max_tokens=max_new)
                                 print("[server] warning: orphaned tool-call tags, retrying once", flush=True)
                                 continue
-                        if not (wrap or opens or ended_thinking or resumed) or cancel.is_set():
+                        if not (wrap or opens or ended_thinking or resumed or reminder) or cancel.is_set():
                             break
-                        # budget reached or turn ended in thinking: close it and continue; the next prompt extends this
-                        # one, so the engine keeps its prefix
-                        if ended_thinking:
+                        # Extend the live prompt so the engine can keep its prefix.
+                        if reminder:
+                            extra = reminder
+                            reminded = True
+                            loop.reset()
+                            thought += len(extra)
+                            print(f"[server] thinking loop ({period}-token period), reminding the model to move on",
+                                  flush=True)
+                        elif ended_thinking:
                             closed_early = True
                             extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
@@ -1454,8 +1471,10 @@ class Service:
                                 break                   # no room to answer: "length"
                             if asked:
                                 print(f"[server] answer now: closing the thinking after {thinking_n} tokens", flush=True)
-                            elif looped:
-                                print(f"[server] thinking repeated one token {run_n} times, ending it", flush=True)
+                            elif period == 1:
+                                print(f"[server] thinking repeated one token {loop.run} times, ending it", flush=True)
+                            elif period:
+                                print(f"[server] thinking loop ({period}-token period), ending it", flush=True)
                             else:
                                 print(f"[server] thinking budget reached ({thought} tokens), wrapping up", flush=True)
                         elif resumed:

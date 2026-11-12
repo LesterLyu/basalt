@@ -8,7 +8,7 @@ from __future__ import annotations
 class Dialect:
     name = ""
     stop_texts: tuple[str, ...] = ()        # texts that end the model's turn
-    reasoning_close = ""                    # closes thinking the model left open, or that reached its budget or repeats one token
+    reasoning_close = ""                    # closes thinking left open by the model, or cut by a budget or loop
     forced_call_ends_reply = False          # a named tool_choice ends the reply after its one call
     nothink_lead = ""                       # text between a no-thinking prompt and a forced call's opening
     tool_repair_turn = ""                   # an optional corrective turn for orphaned tool-call syntax
