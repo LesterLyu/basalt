@@ -98,6 +98,7 @@ class ThinkingLoopTest(unittest.TestCase):
             with self.subTest(enabled=enabled):
                 engine = MockEngine(tok, [repeat + dialect.reasoning_close + "Done.", "Done."])
                 svc = Service(engine, tok, dialect.template(""), dialect=dialect)
+                svc.answer_room = 0  # isolate the loop guard from the automatic answer budget
                 svc.thinking_loop_tokens = 256 if enabled else 0
                 sampling = {"reasoning_budget_tokens": 350} if enabled else {}
                 events = list(svc.run(tok.encode("question"), True, None, 1000, sampling, threading.Event()))

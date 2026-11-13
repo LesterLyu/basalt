@@ -80,6 +80,7 @@ class AnswerNowServer(unittest.TestCase):
         self.tok = ByteTokenizer()
         self.engine = SlowThinker(self.tok, batch=self.batch)
         self.svc = Service(self.engine, self.tok, ChatTemplate.from_file(ROOT / "serve/chat_template.jinja"))
+        self.svc.thinking_loop_tokens = 0  # the repeated fixture should run until asked to stop
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
