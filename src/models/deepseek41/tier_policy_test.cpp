@@ -89,9 +89,12 @@ int main() {
     CHECK(loan_keep(1024ull<<20,1) == (960ull<<20));
     CHECK(loan_keep(1024ull<<20,128ull<<20) == (896ull<<20));
     CHECK(loan_keep(1024ull<<20,2048ull<<20) == 0);
-    CHECK(refill_reserve(1024,512,256,128,0) == 768);
-    CHECK(refill_reserve(1024,2048,256,128,0) == 256);
-    CHECK(refill_reserve(1024,1024,0,128,0) == 128);
+    CHECK(refill_reserve(1024,512,256,128,0,graph_room(1)) == 768);
+    CHECK(refill_reserve(1024,2048,256,128,0,0) == 256);
+    CHECK(refill_reserve(1024,1024,0,128,0,0) == 128);
+    // The workspace and warm-up reserve can both go away while the other slot still needs graphs.
+    CHECK(refill_reserve(0,0,256ull<<20,128ull<<20,0,graph_room(2)) == (768ull<<20));
+    CHECK(refill_reserve(0,0,256ull<<20,1024ull<<20,0,graph_room(2)) == (1536ull<<20));
 
     // Sparse larger formats must not inflate every slot; initial ranked subsets still fit,
     // even when assigned in arbitrary order by smallest fitting free slot.

@@ -280,8 +280,9 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     }
     const int max_base = *std::max_element(base_count_.begin(), base_count_.end());
     const uint64_t asked_free = (uint64_t) m_.tiers().vram_reserve_mib << 20;
-    int copies = slots_in(free_b, reserve.copies + asked_free);
-    int main_homes = slots_in(free_b, reserve.homes + asked_free);
+    const uint64_t graph_room = policy::graph_room(m_.sessions());
+    int copies = slots_in(free_b, reserve.copies + asked_free + graph_room);
+    int main_homes = slots_in(free_b, reserve.homes + asked_free + graph_room);
     start_floor_ = free_floor_ = asked_free;
     if (m_.tiers().expert_cache > 0) cap_per_layer_ = m_.tiers().expert_cache / n_layers_;
     if (m_.diag_tier_vram() >= 0) cap_per_layer_ = cap_per_layer_ >= 0 ? std::min<int64_t>(cap_per_layer_, m_.diag_tier_vram()) : m_.diag_tier_vram();
@@ -731,7 +732,8 @@ bool ExpertTier::load_ram(std::string& err) {
         return false;
     }
     const int limit = (int)(cap_per_layer_ >= 0 ? std::min<int64_t>(n_expert_,cap_per_layer_) : n_expert_);
-    const int n = slots_fit(free_b,reserve_+modules_+free_floor_,std::max(0,limit-(int)per_layer_),0,true);
+    const int n = slots_fit(free_b,reserve_+modules_+free_floor_+policy::graph_room(m_.sessions()),
+                            std::max(0,limit-(int)per_layer_),0,true);
     // Mixed-size permanent homes can have a loanable cache beside them.
     const bool slab_extra = malloc_slab_backed() && m_.has_overlay();
     const bool elastic_extra = !malloc_slab_backed() || slab_extra;
@@ -1970,7 +1972,8 @@ uint64_t ExpertTier::refill_reserve() const {
     for (const auto& entry : prompt_workspaces_) { held += entry.second.first; margin = std::max(margin,entry.second.second); }
     // This arena releases its workspace at the end of every prompt. Re-lend on the next read.
     const bool loan_on_next_prompt = prompt_workspaces_.empty() && malloc_slab_backed();
-    return policy::refill_reserve(loan_on_next_prompt ? 0 : reserve_,held,margin,free_floor_,token_ ? 0 : modules_);
+    return policy::refill_reserve(loan_on_next_prompt ? 0 : reserve_,held,margin,free_floor_,
+                                  token_ ? 0 : modules_,policy::graph_room(m_.sessions()));
 }
 
 bool ExpertTier::shrink_cache(core::ExpertCache& arena, uint64_t offset, uint64_t keep, std::string& err) {

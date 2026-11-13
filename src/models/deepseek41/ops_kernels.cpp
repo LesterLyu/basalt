@@ -11,6 +11,7 @@
 #include "basalt/models/deepseek41/attn.hpp"
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "models/deepseek41/attn_batch.hpp"
+#include "models/deepseek41/decode_graph.hpp"
 #include "models/deepseek41/elastic.hpp"
 #include "models/deepseek41/layer_ops.hpp"
 #include "models/deepseek41/model.hpp"
@@ -1014,26 +1015,8 @@ public:
         };
         if (shared_out && nhits) {
             cudaGraphExec_t& exec = share_g_[(size_t) il * (kMaxK + 1) + (size_t) nhits];
-            if (!exec) {
-                core::MemoryAuditScope memory_audit("expert-graph", st);
-                cudaGraph_t g = nullptr;
-                if (cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
-                    err = "deepseek41: cannot capture a layer's experts";
-                    return false;
-                }
-                gpu_share();
-                const cudaError_t ce = cudaStreamEndCapture(st, &g);
-                const cudaError_t ci = ce == cudaSuccess ? cudaGraphInstantiateWithFlags(&exec, g, 0) : ce;
-                if (g) cudaGraphDestroy(g);
-                if (ci != cudaSuccess) {
-                    err = std::string("deepseek41: capturing a layer's experts: ") + cudaGetErrorString(ci);
-                    return false;
-                }
-            }
-            if (cudaGraphLaunch(exec, st) != cudaSuccess) {
-                err = "deepseek41: launching a layer's experts failed";
-                return false;
-            }
+            if (!launch_decode_graph(exec, share_graph_direct_, st, 0, "expert-graph",
+                                     [&] { gpu_share(); return true; }, err)) return false;
         } else if (!shared_out && nhits) {
             gpu_share();
         }
@@ -1227,6 +1210,7 @@ private:
     std::shared_ptr<ExpertTier> tier_;
     static constexpr int kMaxK = 8;                 // routed experts of a token
     std::vector<cudaGraphExec_t> share_g_;          // [layer * (kMaxK + 1) + experts on the card]: their launch and the shared expert's
+    bool share_graph_direct_ = false;
     struct OverlayGraph {
         WindowPlan *host = nullptr, *mapped = nullptr;
         cudaGraphExec_t exec = nullptr;

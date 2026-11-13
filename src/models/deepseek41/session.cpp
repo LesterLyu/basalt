@@ -15,6 +15,7 @@
 #include "basalt/models/deepseek41/attn_index.hpp"
 #include "basalt/models/deepseek41/kernels.hpp"
 #include "models/deepseek41/attn_batch.hpp"
+#include "models/deepseek41/decode_graph.hpp"
 #include "models/deepseek41/dspark.hpp"
 #include "models/deepseek41/dspark_kernels.hpp"
 #include "models/deepseek41/layer_ops.hpp"
@@ -992,23 +993,8 @@ private:
     // Captures `body` once into a graph and launches it; later calls launch the instance.
     template <class F>
     bool run_graph(cudaGraphExec_t& exec, F&& body) {
-        core::MemoryAuditScope memory_audit(exec ? nullptr : "decode-graph", stream_);
-        if (!exec) {
-            if (cudaStreamBeginCapture(stream_, cudaStreamCaptureModeRelaxed) != cudaSuccess)
-                return fail("cannot begin a graph capture");
-            const bool ok = body();
-            cudaGraph_t g = nullptr;
-            const cudaError_t ce = cudaStreamEndCapture(stream_, &g);
-            if (!ok || ce != cudaSuccess) {
-                if (g) cudaGraphDestroy(g);
-                return ok ? fail(std::string("graph capture: ") + cudaGetErrorString(ce)) : false;
-            }
-            const cudaError_t ci = cudaGraphInstantiateWithFlags(&exec, g, cudaGraphInstantiateFlagUseNodePriority);
-            cudaGraphDestroy(g);
-            if (ci != cudaSuccess) return fail(std::string("graph instantiate: ") + cudaGetErrorString(ci));
-        }
-        DS_CUDA(cudaGraphLaunch(exec, stream_));
-        return true;
+        return launch_decode_graph(exec, decode_graph_direct_, stream_, cudaGraphInstantiateFlagUseNodePriority,
+                                   "decode-graph", body, err_);
     }
 
     int graph_row(int T) const { return T - 1; }
@@ -1222,6 +1208,7 @@ private:
     DsModel& m_;
     const Geometry& g_;
     std::vector<cudaGraphExec_t> head_g_, tail_g_;
+    bool decode_graph_direct_ = false;
     static constexpr int kHistoryCap = 4096;
     kernels::SamplerParams sampling_{};
     bool draw_kernel_ = false, bias_on_ = false;
