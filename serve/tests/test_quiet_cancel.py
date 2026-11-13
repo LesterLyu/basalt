@@ -184,6 +184,7 @@ class QuietWaitPolicy(unittest.TestCase):
         engine.proc = mock.Mock()
         engine.proc.poll.return_value = None
         engine.proc.stdin = io.StringIO()
+        engine.wlock = threading.Lock()
         engine.lines = mock.Mock()
         engine.can_stop, engine.silence_s, engine.log_path = True, 10, None
         now = [0.0]
@@ -211,6 +212,7 @@ class QuietWaitPolicy(unittest.TestCase):
                 engine.proc = mock.Mock()
                 engine.proc.poll.return_value = None
                 engine.proc.stdin = io.StringIO()
+                engine.wlock = threading.Lock()
                 engine.lines = mock.Mock()
                 engine.can_stop, engine.silence_s = True, 0
                 engine._ctl_mode = 'solo'
