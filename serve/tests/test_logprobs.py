@@ -194,6 +194,19 @@ class Responses(unittest.TestCase):
         adelta = [e for e in events if e["type"] == "response.function_call_arguments.delta"][0]
         self.assertEqual([x["token"] for x in adelta["logprobs"]], ["<call", "args"])
 
+    def test_client_tool_search_keeps_the_next_calls_logprobs_separate(self):
+        names = {"tool_search": (None, "tool_search", "tool_search")}
+        asm = Assembler({logprobs.REQUEST_KEY: 0}, "m", 3, names, False)
+        search = ToolCall("tool_search", {"query": "read"})
+        read = ToolCall("read", {"path": "x"})
+        asm.logprob("tool", lp("search"), 0)
+        asm.feed(Event("tool_call", call=search))
+        asm.logprob("tool", lp("read"), 1)
+        asm.feed(Event("tool_call", call=read))
+        out = asm.finish({"finish": "stop"})[-1]["response"]["output"]
+        self.assertEqual([item["type"] for item in out], ["tool_search_call", "function_call"])
+        self.assertEqual([[x["token"] for x in item["logprobs"]] for item in out], [["search"], ["read"]])
+
 
 class Api(unittest.TestCase):
     start = test_parallel.ParallelService.start

@@ -484,7 +484,7 @@ class Assembler:
     def _open(self, item) -> list[dict]:
         self.response["output"].append(item)
         self.item = item
-        if self.want_lp and item["type"] in ("reasoning", "function_call", "custom_tool_call"):
+        if self.want_lp and item["type"] in ("reasoning", "function_call", "custom_tool_call", "tool_search_call"):
             item["logprobs"] = []
             if item["type"] != "reasoning":
                 self.calls.append(item)
