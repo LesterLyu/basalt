@@ -35,12 +35,14 @@ arena. Descriptors use `NO_BUFFERING | OVERLAPPED`; each positional read has its
 and completion event. Buffers, offsets and byte counts retain a 4 KiB alignment contract.
 A file system that refuses unbuffered reads, or a short read, retains the mapped-copy fallback.
 
-The resident arena is registered after its reads complete. Registration queries each visible
+The compact resident arena prefers host VMM. If that is unavailable, it registers ordinary
+host memory after its reads complete. Registration queries each visible
 adapter's current DXGI non-local budget and usage, leaving the larger of 1 GiB and 5% of its
 budget for later allocations. The adapter contexts are initialized before registration so
 later context creation does not inherit a large mapping. The smallest remaining allowance bounds the portable mapping;
-it is not divided by the number of devices. With several visible devices, the target is also
-bounded by DXGI's available plus existing reservation allowance. This is a conservative working-set
+it is not divided by the number of devices. With multiple WDDM devices, or unknown driver modes,
+the target is also bounded by DXGI's available plus existing reservation allowance. A single WDDM
+card alongside TCC uses the non-local budget without that additional cap. This is a conservative working-set
 target, not a promise that the driver accepts every registration up to it. After loading, the complement is registered
 in chunks of about 1 GiB within that allowance. Cuts lie at aligned expert starts, so no expert spans registrations;
 each chunk keeps its own device alias. A refusal stops at the last registered chunk. The registered prefix supports DMA and mapped
@@ -48,8 +50,8 @@ GPU reads; only the remaining tail is locked with a working-set minimum plus chu
 `VirtualLock`. CUDA-registered pages are not locked again. Startup reports CUDA-mapped and
 resident sizes separately and reports any working-set quota failure.
 
-The full expert arena registers before loading its bytes, using the same budget query and
-whole-layer registration slices. A driver refusal stops the slice probe; unregistered bytes
+The full expert arena also prefers host VMM. Its portable fallback registers before loading its bytes,
+using the same budget query and whole-layer registration slices. A driver refusal stops the slice probe; unregistered bytes
 remain in the resident tail. The registration target leaves the reserve before probing;
 it does not rely on recovering a context after driver exhaustion. Startup reports the budget and prefix.
 The remaining bytes stay resident through the working-set lock; the complete RAM copy is retained.
