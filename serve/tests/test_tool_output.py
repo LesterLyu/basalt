@@ -193,11 +193,11 @@ class Budget(unittest.TestCase):
 
     def test_counted_text_prompt_keeps_the_smaller_repair_cap(self):
         class TextEngine(MockEngine):
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None, session=None):
                 if isinstance(ids, PromptText):
                     ids, max_new = ids.resolve(max_new, self.max_context)
                 self.limits.append((len(ids), max_new))
-                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings, session=session)
 
         tok = ByteTokenizer()
         overhead = tok.encode(REPAIR_TURN, parse_special=True)

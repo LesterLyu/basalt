@@ -1160,9 +1160,9 @@ class GpuChoice(unittest.TestCase):
     def test_vision_sidecar_token_limit(self):
         from serve.engine.vision import Vision
         with mock.patch.object(Vision, "_start"):
-            v = Vision({"vision_bin": "x", "mmproj": "m", "model": "t", "gpu": True, "max_tokens": 8192})
+            v = Vision({"vision_bin": "x", "model": "t", "gpu": True, "max_tokens": 8192})
         self.addCleanup(shutil.rmtree, v.dir, ignore_errors=True)
-        self.assertEqual(v.spawn[0], ["x", "--mmproj", "m", "--model", "t", "--gpu", "--max-tokens", "8192"])
+        self.assertEqual(v.spawn[0], ["x", "--model", "t", "--gpu", "--max-tokens", "8192"])
 
     def test_engine_vision_sends_one_enc_for_the_uncached_images(self):
         from serve.engine.vision import EngineVision
@@ -2206,7 +2206,9 @@ class LiveRate(unittest.TestCase):
         import queue
         from types import SimpleNamespace
         engine = ProcessEngine.__new__(ProcessEngine)
-        engine.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)   # alive() asks it
+        engine.proc = SimpleNamespace(pid=os.getpid(), stdin=io.StringIO(), poll=lambda: None)
+        engine.wlock = threading.Lock()
+        engine.silence_s = 0
         engine.lines = queue.Queue()
         engine.can_stop = False
         engine.max_context = 262144
@@ -3001,7 +3003,7 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
 
     def test_answer_room_zero_reserves_nothing(self):
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         self.svc.answer_room = 0
         code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
@@ -3009,7 +3011,7 @@ class ThinkingBudget(unittest.TestCase):
 
     def test_answer_room_auto_halves_small_caps_without_a_budget(self):
         from serve.service import REASONING_CLOSE
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         for cap in (200, 400, 700):
             with self.subTest(cap=cap):
                 code, b = self.openai(max_tokens=cap)
@@ -3019,7 +3021,7 @@ class ThinkingBudget(unittest.TestCase):
                 self.assertEqual(msg["content"], ThinkingEngine.ANSWER)
 
     def test_answer_room_fixed_reserve_lets_the_model_think_more(self):
-        self.engine.THOUGHT = ThinkingEngine.THOUGHT * 4
+        self.engine.THOUGHT = ThinkingEngine.LONG_THOUGHT[:736]
         self.svc.answer_room = 100                                     # auto would keep 512 at this cap
         code, b = self.openai(max_tokens=1024)
         self.assertEqual(code, 200, b)
@@ -3443,6 +3445,7 @@ class SilentEngine(unittest.TestCase):
         engine.proc = mock.Mock()
         engine.proc.stdin = io.StringIO()
         engine.proc.poll.return_value = None
+        engine.wlock = threading.Lock()
         engine.lines, engine.can_stop, engine.max_context = queue.Queue(), can_stop, 4096
         engine.silence_s, engine.log_path = silence, None
         return engine

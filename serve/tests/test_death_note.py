@@ -21,8 +21,8 @@ def note(log: str, rc, last_err: str = "") -> str:
 
 class DeathNote(unittest.TestCase):
     def test_signal_and_last_error_line(self):
-        got = note("basalt load: ready\nbasalt serve: error: GPU watchdog fired\nbasalt serve: bye\n", -int(signal.SIGKILL))
-        self.assertIn("killed by SIGKILL", got)
+        got = note("basalt load: ready\nbasalt serve: error: GPU watchdog fired\nbasalt serve: bye\n", -int(signal.SIGTERM))
+        self.assertIn("killed by SIGTERM", got)
         self.assertIn("basalt serve: error: GPU watchdog fired", got)
 
     def test_exit_code_and_last_error_line(self):
@@ -35,8 +35,8 @@ class DeathNote(unittest.TestCase):
         self.assertIn("after it reported: bad request", note("basalt serve: ok\n", 1, "bad request"))
 
     def test_no_error_line_says_so_and_does_not_guess(self):
-        got = note("basalt serve: ready\n", -int(signal.SIGKILL))
-        self.assertIn("killed by SIGKILL", got)
+        got = note("basalt serve: ready\n", -int(signal.SIGTERM))
+        self.assertIn("killed by SIGTERM", got)
         self.assertIn("last log line: basalt serve: ready", got)
         self.assertNotIn("RAM", got)
 
