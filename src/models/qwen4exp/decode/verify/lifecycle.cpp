@@ -347,7 +347,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     all_resident_ = false;
     ar_off_ = false;
     if (h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
-    if (hits.h_res != nullptr && hits.d_res != nullptr && hits.cache_base != nullptr) {
+    if (!hits.slabs && hits.h_res != nullptr && hits.d_res != nullptr && hits.cache_base != nullptr) {
         {
             bool all_ok = true;
             for (int64_t l = lb_; l < le_ && all_ok; ++l) {

@@ -154,6 +154,23 @@ uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells) {
     return b;
 }
 
+bool session_kv_movable(const SessionState& s) {
+    const auto* a = s.qsa_states && s.qsa_alloc > 0 ? s.qsa_states[s.qsa_ord0].kv_arena : nullptr;
+    return a && a->movable();
+}
+
+uint64_t session_kv_resize_scratch(const SessionState& s, int64_t cells) {
+    uint64_t scratch = 0;
+    auto add = [&](const KvArena* a) {
+        if (a && a->movable())
+            scratch = std::max(scratch, std::max(a->mapped_bytes(), a->bytes_for(cells)));
+    };
+    for (int64_t j = 0; s.qsa_states && j < s.qsa_alloc; ++j)
+        add(s.qsa_states[s.qsa_ord0 + j].kv_arena);
+    for (const KvArena* a : s.kv_extra) add(a);
+    return scratch;
+}
+
 uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells) {
     uint64_t b = 0;
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)

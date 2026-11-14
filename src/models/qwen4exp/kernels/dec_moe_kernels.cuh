@@ -85,8 +85,13 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
                 p->tok[s_pos[tid]] = tid / a.k;
                 if (s_first[tid]) {
                     const int32_t slot = a.res0[s_ids[tid]];
+#ifdef _WIN32
+                    p->ptr[s_gidx[tid]] = reinterpret_cast<uintptr_t>(a.cache_base) +
+                        (a.slot_off ? a.slot_off[slot] : (size_t) slot * (size_t) a.blob);
+#else
                     p->ptr[s_gidx[tid]] = (unsigned long long) (a.cache_base + (a.slot_off ? (size_t) a.slot_off[slot]
                                                                                               : (size_t) slot * (size_t) a.blob));
+#endif
                 }
             }
             if (pub) {

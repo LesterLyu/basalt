@@ -281,6 +281,7 @@ void qsa_set_kv_int8(bool enabled);
 /// The elastic KV: states initialized while `floor_cells` > 0 (and not streamed, not a ring) put their K/V pools in a
 /// KvArena with the first `floor_cells` cells backed, instead of in the session arena; 0 turns it off.
 void qsa_set_kv_elastic(int64_t floor_cells);
+void qsa_set_kv_movable(bool movable);
 int64_t qsa_kv_elastic();
 /// Frees a state's elastic KV (no-op without one).
 void qsa_state_release(QsaState& st);

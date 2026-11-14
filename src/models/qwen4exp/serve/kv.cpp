@@ -21,7 +21,7 @@ int64_t QfnRuntime::kv_ceiling() {
     if (kv_floor <= 0) return -1;
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    int64_t spare = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+    int64_t spare = std::max<int64_t>(0, (int64_t) free_b - kv_resize_reserve());
     if (xcache.segmented()) {
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         spare += gran * basalt::program::kv_cache_spare_granules(
@@ -113,6 +113,7 @@ bool QfnRuntime::move_routed_below(int64_t first, const char* why, std::string& 
 }
 
 bool QfnRuntime::kv_drain(std::string& e) {
+    if (basalt::core::session_kv_movable(ss) && ba_job) { ba_thr.join(); ba_job = false; }
     if (!ver.wait_commit(e)) return false;
     apply_pending(true);
     if (!xq_drain()) { e = "elastic KV: an adaptive swap failed"; return false; }
@@ -125,6 +126,26 @@ bool QfnRuntime::kv_drain(std::string& e) {
     return true;
 }
 
+bool QfnRuntime::kv_rebind(basalt::core::SessionState& s, std::string& e) {
+    ver.invalidate_kv_graphs(s.qsa_states);
+    if (!s.kv_extra.empty() && mtp_on) mtp.invalidate_kv_graphs();
+    return ver.refresh_slot_pointers(e);
+}
+
+int64_t QfnRuntime::kv_resize_reserve(const basalt::core::SessionState* target, int64_t cells) const {
+    int64_t keep = (int64_t) o.vram_reserve_mib << 20;
+    if (!basalt::core::session_kv_movable(ss)) return keep;
+    const auto count = [&](const basalt::core::SessionState& s, int64_t want) {
+        keep = std::max(keep, (int64_t) basalt::core::session_kv_resize_scratch(s, want));
+    };
+    count(ss, 0);
+    if (!bslot_ss.empty())
+        for (const auto& slot : bslot_ss[0])
+            if (slot.get() != &ss) count(*slot, 0);
+    if (target) count(*target, cells);
+    return keep;
+}
+
 // maps the cache's tail again as far as the free VRAM above the reserve allows, and refills the slots it gets
 // back: each with the expert it held, or (when that one is resident again, or has no RAM copy any more) the
 // layer's most-routed expert that no GPU holds and RAM does
@@ -132,7 +153,7 @@ bool QfnRuntime::cache_regrow(std::string& e) {
     if (!xcache.segmented() || xcache.mapped_bytes() >= xcache.full_bytes()) return true;
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    const int64_t room = (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20);
+    const int64_t room = (int64_t) free_b - kv_resize_reserve();
     if (room <= 0) return true;
     std::string gerr;
     (void) xcache.grow(xcache.mapped_bytes() + room, gerr);   // what it could not map stays with the driver
@@ -168,6 +189,7 @@ bool QfnRuntime::cache_regrow(std::string& e) {
     }
     vram_evicted.swap(keep_out);
     if (!xcache.sync_queued(ferr)) { e = "elastic KV: " + ferr; return false; }
+    if (xcache.malloc_slab_backed() && !ver.refresh_expert_addresses(e)) return false;
     res_upload();
     relend();
     return true;
@@ -269,15 +291,23 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
     kv_short = false;
     if (kv_floor <= 0) return true;
     cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
-    int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
-    if (add <= 0) return true;
-    const auto t0 = Clock::now();
+    const bool movable = basalt::core::session_kv_movable(s);
     const int64_t had = basalt::core::session_kv_cells(s);
+    if (movable && cells <= had) return true;
+    // A relocating allocation synchronizes the device; do not move it under an overlapping prompt read.
+    if (movable && !shrink) { e.clear(); return false; }
+    int64_t add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+    if (add <= 0 && !movable) return true;
+    const auto t0 = Clock::now();
     if (shrink && !kv_drain(e)) return false;
     const int64_t before = xcache.slots();
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
-    int64_t room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+    auto spare = [&](int64_t want) {
+        const int64_t free = (int64_t) free_b - kv_resize_reserve(movable ? &s : nullptr, want);
+        return movable ? free : std::max<int64_t>(0, free);
+    };
+    int64_t room = spare(cells);
     if (!shrink && add > room) { e.clear(); return false; }
     // the KV of idle conversations whose time is up goes before the expert cache's slots, any idle one's before
     // a refusal
@@ -287,19 +317,32 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
         if (got > 0) {
             parked += got;
             cudaMemGetInfo(&free_b, &total_b);
-            room = std::max<int64_t>(0, (int64_t) free_b - ((int64_t) o.vram_reserve_mib << 20));
+            room = spare(cells);
         }
         return got >= 0;
     };
     if (!park(false)) return false;
+    if (movable && add > room && !xcache.segmented()) {
+        kv_short = true;
+        e = "elastic KV: not enough free memory to resize the KV pools";
+        return false;
+    }
     if (add > room && xcache.segmented()) {
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
         auto keep_for = [&](int64_t a) {
-            return std::max<int64_t>(0, (xcache.mapped_bytes() - (a - room)) / gran * gran);
+            const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (a - room)) / gran * gran);
+            return xcache.malloc_slab_backed() ? (int64_t) xcache.malloc_slab_boundary(keep) : keep;
         };
         const int64_t floor = cache_floor_slots();
         auto leaves_floor = [&](int64_t c) {
             const int64_t a = (int64_t) basalt::core::session_kv_grow_bytes(s, c);
+            if (movable) {
+                const int64_t available = spare(c);
+                if (a <= available) return true;
+                const int64_t keep = keep_for(a + room - available);
+                return xcache.mapped_bytes() - xcache.bytes_after_shrink(keep) >= a - available &&
+                       xcache.slots_after_shrink(keep) >= floor;
+            }
             return a <= room || xcache.slots_after_shrink(keep_for(a)) >= floor;
         };
         if (!leaves_floor(cells) && !park(true)) return false;
@@ -326,14 +369,20 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
             }
             cells = best;
             add = (int64_t) basalt::core::session_kv_grow_bytes(s, cells);
+            room = spare(cells);
         }
     }
     if (add > room && xcache.segmented()) {
         // whole tail segments: everything from the first one at or past `keep` goes
         const int64_t gran = (int64_t) std::max<uint64_t>(basalt::core::vmm::granularity(), 1);
-        const int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
+        int64_t keep = std::max<int64_t>(0, (xcache.mapped_bytes() - (add - room)) / gran * gran);
+        if (xcache.malloc_slab_backed()) {
+            keep = (int64_t) xcache.malloc_slab_boundary(keep);
+            if (!home_given_up(xcache.slots_after_shrink(keep), e)) return false;
+        }
         if (kv_keep_routed && !move_routed_below(xcache.slots_after_shrink(keep), "elastic KV", e)) return false;
-        if (!xcache.shrink(keep, e)) return false;
+        const bool shrunk = xcache.shrink(keep, e);
+        if (!shrunk && !xcache.malloc_slab_backed()) return false;
         const int64_t live = xcache.slots();
         std::vector<int32_t> off;
         for (size_t i = 0; i < host_res.size(); ++i)
@@ -342,13 +391,31 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
                 host_res[i] = basalt::core::kNotResident;
                 off.push_back((int32_t) i);
             }
+        if (xcache.malloc_slab_backed()) {
+            std::string refresh_err;
+            if (!ver.refresh_expert_addresses(refresh_err)) { e = refresh_err; return false; }
+        }
         res_upload();
         relend();
+        if (!shrunk) return false;
         // a long prompt's cells take a block of CUDA0's cache: its experts go to the peer; a short request's few
         // are left to the adaptive rounds
         if (cells - had >= kPeerTakeCells && !peer_take(off, e)) return false;
     }
-    if (!basalt::core::session_kv_map(s, cells, e)) { e = "elastic KV: " + e; return false; }
+    const bool mapped = basalt::core::session_kv_map(s, cells, e);
+    if (movable) {
+        std::string bind_err;
+        if (!kv_rebind(s, bind_err)) { e = bind_err; return false; }
+    }
+    if (!mapped) {
+        e = "elastic KV: " + e;
+        if (movable) {
+            kv_short = true;
+            std::string restore_err;
+            if (!cache_regrow(restore_err)) { e += "; " + restore_err; kv_short = false; }
+        }
+        return false;
+    }
     if (parked > 0 && !cache_regrow(e)) return false;   // the rest of what they held is the cache's again
     ++kv_moves;
     basalt::log::info("basalt serve", "elastic KV: %lld cells backed (+%.0f MiB), the expert cache %lld -> %lld "
@@ -367,7 +434,12 @@ bool QfnRuntime::kv_release(basalt::core::SessionState& s, int64_t cells, std::s
     const auto t0 = Clock::now();
     if (!kv_drain(e)) return false;
     const int64_t before = xcache.slots(), had = basalt::core::session_kv_cells(s);
-    if (!basalt::core::session_kv_unmap(s, cells, e)) { e = "elastic KV: " + e; return false; }
+    const bool unmapped = basalt::core::session_kv_unmap(s, cells, e);
+    if (basalt::core::session_kv_movable(s)) {
+        std::string bind_err;
+        if (!kv_rebind(s, bind_err)) { e = bind_err; return false; }
+    }
+    if (!unmapped) { e = "elastic KV: " + e; return false; }
     if (!cache_regrow(e)) return false;
     ++kv_moves;
     basalt::log::info("basalt serve", "elastic KV: %lld -> %lld cells backed, the expert cache %lld -> %lld "

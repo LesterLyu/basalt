@@ -15,6 +15,7 @@
 #pragma once
 
 #include "basalt/core/model_file.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
@@ -110,6 +111,8 @@ public:
     bool malloc_slab_backed() const { return !slabs_.empty(); }
     /// The largest malloc slab boundary at or below keep_bytes.
     uint64_t malloc_slab_boundary(uint64_t keep_bytes) const;
+    /// Slot count in the contiguous prefix available to borrowers.
+    int64_t loan_slots() const { return malloc_slab_backed() ? std::min(slots(), slots_within(head_end_)) : slots(); }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
     int64_t mapped_bytes() const;
@@ -119,6 +122,7 @@ public:
     bool shrink(int64_t keep_bytes, std::string& err);
     /// `slots()` after `shrink(keep_bytes)`, without shrinking.
     int64_t slots_after_shrink(int64_t keep_bytes) const;
+    int64_t bytes_after_shrink(int64_t keep_bytes) const;
     /// Maps segments again up to `want_bytes` (rounded DOWN to a segment, at most the arena; the last, shorter
     /// segment only when `want_bytes` covers the arena).  Stops at the first segment the driver cannot back (false,
     /// `err`: what was mapped by then stays).  The new slots are empty until the caller fills them.

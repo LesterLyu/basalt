@@ -6,6 +6,7 @@
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/expert_cache.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/log.hpp"
@@ -17,6 +18,27 @@
 
 namespace basalt::core {
 using namespace verify_detail;
+
+bool Verifier::refresh_expert_addresses(std::string& err) {
+    if (!hits_.slabs) return true;
+    std::vector<unsigned long long> offsets((size_t) hits_.n_slots);
+    const auto base = reinterpret_cast<uintptr_t>(hits_.cache_base);
+    for (int64_t i = 0; i < hits_.slabs->slots(); ++i)
+        offsets[(size_t) i] = reinterpret_cast<uintptr_t>(hits_.slabs->device_slot((int32_t) i)) - base;
+    for (auto* dst : {dm_ ? dm_->slot_off : nullptr, slot_off_d_}) {
+        if (dst && cudaMemcpyAsync(dst, offsets.data(), offsets.size() * sizeof(offsets[0]), cudaMemcpyHostToDevice,
+                                   cudaStreamLegacy) != cudaSuccess) {
+            err = "verify: cannot upload expert slab addresses";
+            return false;
+        }
+    }
+    if (cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess) {
+        err = "verify: cannot synchronize expert slab addresses";
+        return false;
+    }
+    if (dm_) std::fill(dm_->shadow0.begin(), dm_->shadow0.end(), INT32_MIN);
+    return true;
+}
 
 // The residency tables the window classifies with: host_res and the peer's, as they are now (between windows).
 // Each upload is queued on the stream that reads it (CUDA0's window, the peer's): a plain cudaMemcpy from pageable
@@ -59,9 +81,10 @@ bool Verifier::dm_sync(std::string& err) {
         if (!pin) { pv.resize(b - a); p = pv.data(); }
         for (size_t i = a; i < b; ++i) {
             const int32_t slot = d->shadow0[i];
-            p[i - a] = slot >= 0 ? (unsigned long long) (hits_.cache_base + (hits_.slot_off ? (size_t) hits_.slot_off[slot]
-                                                                                             : (size_t) slot * hits_.blob))
-                                 : 0ull;
+            p[i - a] = slot < 0 ? 0ull : hits_.slabs
+                ? reinterpret_cast<uintptr_t>(hits_.slabs->device_slot(slot))
+                : reinterpret_cast<uintptr_t>(hits_.cache_base + (hits_.slot_off ? (size_t) hits_.slot_off[slot]
+                                                                                 : (size_t) slot * hits_.blob));
         }
         if (copy_small(d->ptab0 + a, p, (b - a) * 8, cs_) != cudaSuccess) {
             err = "verify: glue table upload";

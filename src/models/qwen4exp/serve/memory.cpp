@@ -24,7 +24,7 @@ void QfnRuntime::memory_usage(basalt::core::MemoryUsage& usage) const {
         uint64_t loan = 0;
         for (const auto& p : pf_parts)
             if (p.cache == &c && !p.lent.empty() && p.first_now >= 0)
-                loan += c.bytes() - c.bytes_of(p.first_now);
+                loan += c.bytes_of(c.loan_slots()) - c.bytes_of(p.first_now);
         const uint64_t mapped = (uint64_t) c.mapped_bytes();
         loan = std::min(loan, mapped);
         usage.device(dev, kind, mapped - loan);
@@ -72,6 +72,7 @@ void QfnRuntime::memory_usage(basalt::core::MemoryUsage& usage) const {
 // the prompt path's loan with `live` slots: its chunk as large as fits, and the first slot it covers
 int32_t QfnRuntime::loan_plan(int64_t live, int64_t& chunk) {
     PfPart& p = pf_parts[0];
+    live = std::min(live, xcache.loan_slots());
     auto fits = [&](int64_t c) {
         const int64_t k = part_slots(p, c);
         return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > auto_lend_pct * live);
@@ -197,6 +198,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
                 vram_evicted.emplace_back((int32_t) i, host_res[i]);
                 host_res[i] = basalt::core::kNotResident;
             }
+        if (xcache.malloc_slab_backed() && !ver.refresh_expert_addresses(e)) return false;
         res_upload();
         if (!shrunk) return false;
     } else if (mapped < xcache.full_bytes()) {
@@ -247,6 +249,7 @@ bool QfnRuntime::vram_command(const std::string& cmd, std::string& e, bool for_s
         }
         vram_evicted.swap(keep_out);
         if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
+        if (xcache.malloc_slab_backed() && !ver.refresh_expert_addresses(e)) return false;
         res_upload();
         relend();
         // the slots hold the experts again: every expert in a slot below the loan has its RAM home freed (the
