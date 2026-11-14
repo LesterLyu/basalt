@@ -76,6 +76,7 @@ struct ExpertTierSpec {
     int admit_uses = 0;
     int main_promote_misses = 0;
     bool gpu_single_miss = false;
+    bool direct_peer_results = false;
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
     int claims_per_row = 0;
@@ -243,6 +244,7 @@ public:
     };
     Source locate(int layer, int e) const;
     /// The first second card (null without any): for "is there a second card" questions; per-layer work takes peer_for.
+    float* peer_decode_rows() const { return peer_decode_rows_; }
     core::PeerExperts* peer() const { return peers_.empty() ? nullptr : peers_[0].get(); }
     /// The second card that holds `layer`'s second-card homes (each card owns a block of layers), or null.
     core::PeerExperts* peer_for(int layer) const {
@@ -440,6 +442,7 @@ private:
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
     std::vector<uint64_t> ram_stride_;
+    float* peer_decode_rows_ = nullptr;
     RamAllocation peer_workspace_backup_;
     std::vector<core::RamAllocation> ram_allocations_;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got

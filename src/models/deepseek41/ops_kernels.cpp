@@ -696,7 +696,8 @@ public:
         // caches are small) the largest chunk the context allows
         const uint64_t prompt_room = std::max(m_.context_bytes() * (uint64_t) m_.sessions() + prefillp::workspace_bytes(d, prefillp::kHomeChunk),
                                               prefillp::workspace_bytes(d, std::min(prefillp::kMaxChunk, ctx_)));
-        r.homes = prompt_room + prefillp::ahead_bytes(d) + prefillp::kMargin + kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
+        r.homes = prompt_room + prefillp::ahead_bytes(d, std::min(prefillp::kMaxChunk, ctx_)) + prefillp::kMargin +
+                  kModuleRoom + (m_.pack().vision.bytes ? kVisionRoom : 0);
         r.beside_homes = prefillp::workspace_bytes(d, prefillp::kShortChunk) + prefillp::kShortMargin;
         r.modules = kModuleRoom;
         // the tier is opened once, in the start's plan, which reads its experts in the start's pass
@@ -758,11 +759,12 @@ public:
         cudaStream_t st = (cudaStream_t) stream;
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer_for(il);   // the card that holds this layer's second-card homes
+        float* peer_rows = route_prefill_ ? nullptr : tier_->peer_decode_rows();
         PeerArm armed;
         if (peer && !m_.has_overlay()) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->arm(limited, h_x_, T, K, core::policy::peer_groups(T), err)) return false;
+            if (!peer->arm(limited, h_x_, T, K, core::policy::peer_groups(T), err, peer_rows)) return false;
             armed.peer = peer;
         }
         tier_->pump(il, 2 + T);   // what this layer's head leaves the bus of the promotions queued before it
@@ -823,7 +825,7 @@ public:
             const kernels::NativeExpertLayout* layouts[core::ExpertTier::kMaxK]{};
             for (int r = 0; r < T*K; ++r) if (const auto* v = m_.replacement(il,h_ids_[r])) layouts[r] = &v->layout;
             TierScope launch_profile(m_.tier_profile(),TierProfile::PeerLaunch);
-            if (!tier_->launch_peer(il, limited, h_x_, h_ids_, T, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
+            if (!tier_->launch_peer(il, limited, h_x_, h_ids_, T, K, kind, err, layouts, peer_rows)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
@@ -871,8 +873,11 @@ public:
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         WindowRowPtrs rp{};
-        for (int r = 0; r < T * K; ++r)
-            rp.p[r] = lk.dev[uidx[r]] ? ex_rows_ + (size_t) r * n : lk.dropped[uidx[r]] ? tier_->zero_row() : d_rows_ + (size_t) r * n;
+        for (int r = 0; r < T * K; ++r) {
+            const int u = uidx[r];
+            const float* rows = lk.dev[u] ? ex_rows_ : (peer_rows && lk.peer[u] ? peer_rows : d_rows_);
+            rp.p[r] = lk.dropped[u] ? tier_->zero_row() : rows + (size_t) r * n;
+        }
         if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;
@@ -939,11 +944,12 @@ public:
         cudaStream_t st = (cudaStream_t) stream;
         // the second card's share goes out while the head runs: its kernels wait on the card for the plan
         core::PeerExperts* peer = tier_->peer_for(il);   // the card that holds this layer's second-card homes
+        float* peer_rows = route_prefill_ ? nullptr : tier_->peer_decode_rows();
         PeerArm armed;
         if (peer && !m_.has_overlay()) {
             kernels::NativeExpertLayout limited = L;
             limited.swiglu_limit = g_.clamp_exp[(size_t) il];
-            if (!peer->arm(limited, h_x_, 1, K, core::policy::peer_groups(1), err)) return false;
+            if (!peer->arm(limited, h_x_, 1, K, core::policy::peer_groups(1), err, peer_rows)) return false;
             armed.peer = peer;
         }
         tier_->pump(il, 3);
@@ -985,7 +991,7 @@ public:
             const kernels::NativeExpertLayout* layouts[core::ExpertTier::kMaxK]{};
             for (int r = 0; r < K; ++r) if (const auto* v = m_.replacement(il,lk.experts[r])) layouts[r] = &v->layout;
             TierScope launch_profile(m_.tier_profile(),TierProfile::PeerLaunch);
-            if (!tier_->launch_peer(il, limited, h_x_, lk.experts, 1, K, kind, err, m_.has_overlay() ? layouts : nullptr)) return false;
+            if (!tier_->launch_peer(il, limited, h_x_, lk.experts, 1, K, kind, err, layouts, peer_rows)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
@@ -1040,8 +1046,10 @@ public:
         // the sum goes out now, behind the word the host writes once the CPU's and the second card's rows landed: its
         // launch and the next layer's are off the path from the last rows to the sum
         RowPtrs rp{};
-        for (int k = 0; k < K; ++k)
-            rp.p[k] = lk.dev[k] ? ex_rows_ + (size_t) k * g_.n_embd : lk.dropped[k] ? tier_->zero_row() : d_rows_ + (size_t) k * g_.n_embd;
+        for (int k = 0; k < K; ++k) {
+            const float* rows = lk.dev[k] ? ex_rows_ : (peer_rows && lk.peer[k] ? peer_rows : d_rows_);
+            rp.p[k] = lk.dropped[k] ? tier_->zero_row() : rows + (size_t) k * g_.n_embd;
+        }
         if (cpu || reading || on_peer) {
             jw.word = h_join_;
             jw.value = ++join_seq_;

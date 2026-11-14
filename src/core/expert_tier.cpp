@@ -57,6 +57,7 @@ constexpr size_t kEvents = 2 * kMaxPending;      // a window's and the last one'
 ExpertTier::ExpertTier(ExpertTierSpec spec) : s_(std::move(spec)) {}
 
 ExpertTier::~ExpertTier() {
+    if (peer_decode_rows_) cudaFree(peer_decode_rows_);
     std::string read_err;
     await_reads(read_err);   // the reads write into the RAM tier freed below
     report("final");
@@ -233,6 +234,25 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, core::LoadPlan& rea
     if (homes_.peer == 0) {
         shares_.clear();
         peers_.clear();
+    }
+
+    if (s_.direct_peer_results && peers_.size() == 1 && core::vmm::tcc_mode()) {
+        const int helper = peers_[0]->device();
+        int tcc = 0, access = 0;
+        if (cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, helper) == cudaSuccess && tcc &&
+            cudaDeviceCanAccessPeer(&access, helper, device_) == cudaSuccess && access) {
+            cudaError_t enabled;
+            {
+                OnDevice on(helper);
+                enabled = cudaDeviceEnablePeerAccess(device_, 0);
+                if (enabled != cudaSuccess) cudaGetLastError();
+            }
+            if (enabled == cudaSuccess || enabled == cudaErrorPeerAccessAlreadyEnabled) {
+                if (cudaMalloc((void**) &peer_decode_rows_, (size_t) kMaxK * s_.n_embd * sizeof(float)) == cudaSuccess)
+                    basalt::log::info(s_.area.c_str(), "decode experts: direct peer results");
+                else { peer_decode_rows_ = nullptr; cudaGetLastError(); }
+            }
+        }
     }
 
     // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; plan_ext() sizes what fills it
