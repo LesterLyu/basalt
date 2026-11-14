@@ -41,6 +41,8 @@ void ExpertTier::memory_usage(core::MemoryUsage& usage) const {
     if (!usage.claim(this)) return;
     usage.device(m_.device(), "experts", cache_.mapped_bytes() + ext_.mapped_bytes());
     usage.device(m_.device(), "scratch", fetch_stride_*(uint64_t)fetch_slots_*kFetchRings);
+    if (peer_decode_rows_)
+        usage.device(m_.device(), "scratch", (uint64_t) kMaxK * m_.geo().n_embd * sizeof(float));
     if (peer_) {
         usage.device(peer_->device(), "expert_helper", peer_->cache().mapped_bytes() - peer_workspace_bytes_);
         usage.device(peer_->device(), "scratch", peer_->device_scratch_bytes());
@@ -132,6 +134,7 @@ struct ExpertTier::PeerCompute {
     bool quit=false, pending=false, ok=true, mixed=false;
     int layer=0, tokens=0, k=0;
     const float* x=nullptr;
+    float* output_rows=nullptr;
     kernels::NativeExpertLayout layout{}, formats[kMaxK]{};
     const kernels::NativeExpertLayout* layouts[kMaxK]{};
     int32_t ids[kMaxK]{},kind[kMaxK]{};
@@ -150,7 +153,7 @@ struct ExpertTier::PeerCompute {
               if (!pending && quit) return; pending=false; }
             try {
                 error.clear();
-                ok=peer.launch_window(layer,layout,x,ids,tokens,k,kind,error,mixed?layouts:nullptr);
+                ok=peer.launch_window(layer,layout,x,ids,tokens,k,kind,error,mixed?layouts:nullptr,output_rows);
                 if (ok) ok=peer.finish(nullptr,error);
             } catch (const std::exception& e) { ok=false; error=e.what(); }
             done.store(true,std::memory_order_release);
@@ -164,10 +167,11 @@ struct ExpertTier::PeerCompute {
     }
     bool launch(int il, const kernels::NativeExpertLayout& f, const float* input, const int32_t* experts,
                 int nt, int topk, const int32_t* mask, std::string& err,
-                const kernels::NativeExpertLayout* const* replacements) {
+                const kernels::NativeExpertLayout* const* replacements, float* rows) {
         if (!finish(err)) return false;
         std::lock_guard lock(mutex);
         layer=il; layout=f; x=input; tokens=nt; k=topk; mixed=replacements!=nullptr;
+        output_rows=rows;
         for (int i=0;i<nt*topk;++i) {
             ids[i]=experts[i]; kind[i]=mask[i]; layouts[i]=nullptr;
             if (replacements && replacements[i]) { formats[i]=*replacements[i]; layouts[i]=&formats[i]; }
@@ -182,9 +186,9 @@ ExpertTier::ExpertTier(const DsModel& model) : m_(model) {}
 
 bool ExpertTier::launch_peer(int layer, const kernels::NativeExpertLayout& layout, const float* x, const int32_t* ids,
                              int tokens, int k, const int32_t* kind, std::string& err,
-                             const kernels::NativeExpertLayout* const* layouts) {
-    return peer_compute_ ? peer_compute_->launch(layer,layout,x,ids,tokens,k,kind,err,layouts)
-                         : peer_->launch_window(layer,layout,x,ids,tokens,k,kind,err,layouts);
+                             const kernels::NativeExpertLayout* const* layouts, float* rows) {
+    return peer_compute_ ? peer_compute_->launch(layer,layout,x,ids,tokens,k,kind,err,layouts,rows)
+                         : peer_->launch_window(layer,layout,x,ids,tokens,k,kind,err,layouts,rows);
 }
 
 bool ExpertTier::finish_peer(std::string& err) {
@@ -215,6 +219,12 @@ ExpertTier::~ExpertTier() {
     if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (return_stream_) cudaStreamSynchronize(return_stream_);
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
+    if (peer_decode_rows_) {
+        // The helper owns the writes and may have graphs that refer to these rows.
+        share_.reset();
+        peer_.reset();
+        cudaFree(peer_decode_rows_);
+    }
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     for (cudaEvent_t e : return_events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
@@ -281,16 +291,9 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     const int max_base = *std::max_element(base_count_.begin(), base_count_.end());
     const uint64_t asked_free = (uint64_t) m_.tiers().vram_reserve_mib << 20;
     const uint64_t graph_room = policy::graph_room(m_.sessions());
-    int copies = slots_in(free_b, reserve.copies + asked_free + graph_room);
-    int main_homes = slots_in(free_b, reserve.homes + asked_free + graph_room);
     start_floor_ = free_floor_ = asked_free;
     if (m_.tiers().expert_cache > 0) cap_per_layer_ = m_.tiers().expert_cache / n_layers_;
     if (m_.diag_tier_vram() >= 0) cap_per_layer_ = cap_per_layer_ >= 0 ? std::min<int64_t>(cap_per_layer_, m_.diag_tier_vram()) : m_.diag_tier_vram();
-    if (cap_per_layer_ >= 0) {
-        copies = (int) std::min<int64_t>(copies, cap_per_layer_);
-        main_homes = (int) std::min<int64_t>(main_homes, cap_per_layer_);
-    }
-
     int peer_slots = 0;
     uint64_t peer_room = 0;
     if (m_.peer_device() >= 0) {
@@ -308,6 +311,17 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     }
 
     if (m_.tiers().diag_tier_peer >= 0) peer_slots = std::min(peer_slots, m_.tiers().diag_tier_peer);
+    if (peer_slots > 0 && !open_peer_decode_rows(err)) return false;
+    if (peer_decode_rows_ && !core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
+        return false;
+    }
+    int copies = slots_in(free_b, reserve.copies + asked_free + graph_room);
+    int main_homes = slots_in(free_b, reserve.homes + asked_free + graph_room);
+    if (cap_per_layer_ >= 0) {
+        copies = (int) std::min<int64_t>(copies, cap_per_layer_);
+        main_homes = (int) std::min<int64_t>(main_homes, cap_per_layer_);
+    }
     main_homes = std::min(main_homes, n_expert_ - peer_slots);
     copies = std::min(copies, n_expert_ - peer_slots);
     const int peer_homes = std::min(peer_slots, n_expert_);
@@ -409,7 +423,14 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
             --peer_slots; plan_homes();
         }
     }
-    if (homes_.peer == 0) { share_.reset(); peer_.reset(); }
+    if (homes_.peer == 0) {
+        share_.reset();
+        peer_.reset();
+        if (peer_decode_rows_) cudaFree(peer_decode_rows_);
+        peer_decode_rows_ = nullptr;
+    } else if (peer_decode_rows_) {
+        basalt::log::info("basalt deepseek41", "decode experts: direct peer results");
+    }
 
     // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; grow() fills it beside a short prompt
     reserve_ = reserve.beside_homes;
@@ -503,6 +524,34 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
     // the RAM the tier took emptied the file cache; with no expert read from the file, it takes the token embedding back
     if (homes_.file == 0) m_.warm_token_table();
+    return true;
+}
+
+bool ExpertTier::open_peer_decode_rows(std::string& err) {
+    // TCC peer stores have been verified on this path; keep mapped RAM on other driver modes.
+    if (!core::vmm::tcc_mode()) return true;
+    const int main = m_.device(), helper = peer_->device();
+    int tcc = 0, access = 0;
+    if (cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, helper) != cudaSuccess || !tcc ||
+        cudaDeviceCanAccessPeer(&access, helper, main) != cudaSuccess || !access ||
+        cudaSetDevice(helper) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return true;
+    }
+    const auto enabled = cudaDeviceEnablePeerAccess(main, 0);
+    if (enabled != cudaSuccess) (void) cudaGetLastError();
+    if (cudaSetDevice(main) != cudaSuccess) {
+        err = "deepseek41: could not restore the primary device after enabling peer access";
+        return false;
+    }
+    // A regular allocation inherits peer access. The default async pool does not.
+    if (enabled == cudaSuccess || enabled == cudaErrorPeerAccessAlreadyEnabled) {
+        float* rows = nullptr;
+        if (cudaMalloc((void**) &rows, (size_t) kMaxK * m_.geo().n_embd * sizeof(float)) == cudaSuccess)
+            peer_decode_rows_ = rows;
+        else
+            (void) cudaGetLastError();
+    }
     return true;
 }
 

@@ -144,13 +144,14 @@ public:
     };
     Source locate(int layer, int e) const;
     core::PeerExperts* peer() const { return peer_.get(); }
+    float* peer_decode_rows() const { return peer_decode_rows_; }
     /// The second card's share of a prompt chunk's experts; null without a second card.
     prefill::PeerShare* peer_share() const { return share_.get(); }
     /// What the split of a layer's experts between the cards prices them at.
     const prefill::ShareRates& share_rates(int layer) const { return rates_[(size_t) layer]; }
     bool launch_peer(int layer, const kernels::NativeExpertLayout& layout, const float* x, const int32_t* ids,
                      int tokens, int k, const int32_t* kind, std::string& err,
-                     const kernels::NativeExpertLayout* const* layouts);
+                     const kernels::NativeExpertLayout* const* layouts, float* rows);
     bool finish_peer(std::string& err);
     /// The prompt path's and the images' host buffers, allocated before the RAM tier is sized.
     PromptHost& host() { return host_; }
@@ -216,6 +217,7 @@ private:
     };
     bool load_ram(std::string& err);
     bool open_share(std::string& err);
+    bool open_peer_decode_rows(std::string& err);
     int ranked(int layer, int r) const;
     bool load_rank(std::string& err);
     void seed_copies(int64_t n);
@@ -339,6 +341,7 @@ private:
     std::vector<std::pair<int32_t, int32_t>> peer_workspace_lent_;
     std::vector<int> peer_workspace_backed_;
     std::unique_ptr<prefill::PeerShare> share_;
+    float* peer_decode_rows_ = nullptr;
     std::vector<prefill::ShareRates> rates_;    ///< [layer]
     std::unique_ptr<PeerSubmitter> peer_submitter_;
     std::unique_ptr<PeerCompute> peer_compute_;

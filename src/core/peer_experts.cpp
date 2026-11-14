@@ -2,6 +2,7 @@
 #include "basalt/core/memory_audit.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/vmm.hpp"
 
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -108,6 +109,7 @@ void PeerExperts::close() {
     refill_ev_ = evict_ev_ = nullptr;
     fsrc_ = nullptr;
     rows_map_ = nullptr;
+    armed_rows_ = nullptr;
     meta_map_ = nullptr;
     x_host_ = nullptr;
     x_map_ = nullptr;
@@ -297,6 +299,24 @@ uint64_t PeerExperts::room() const {
 
 bool PeerExperts::open_slots(const std::vector<int64_t>& slot_bytes, std::string& err) {
     On on(device_);
+#ifdef _WIN32
+    if (vmm::tcc_mode() && vmm::can_map_device_memory()) {
+        // Vision borrows a span across slots, so use one address range with smaller physical backings.
+        constexpr int64_t kSegment = 256ll << 20;
+        cache_.set_segment_bytes(kSegment);
+        std::string segmented_error;
+        if (cache_.open_sized(slot_bytes, n_layers_, n_expert_, segmented_error)) {
+            if (!ck(cudaDeviceSynchronize(), "slots", err)) return false;
+            basalt::log::info("basalt peer", "expert cache on GPU %d: segmented VMM (%.0f MiB segments, %.2f GiB backed)",
+                              device_, cache_.segment_bytes() / 1048576., cache_.mapped_bytes() / 1073741824.);
+            return true;
+        }
+        cache_.set_segment_bytes(0);
+        (void) cudaGetLastError();
+        basalt::log::warn("basalt peer", "segmented expert cache unavailable on GPU %d: %s",
+                          device_, segmented_error.c_str());
+    }
+#endif
     if (!cache_.open_sized(slot_bytes, n_layers_, n_expert_, err)) return false;
     return ck(cudaDeviceSynchronize(), "slots", err);
 }
@@ -426,8 +446,8 @@ bool PeerExperts::launch_plain(int64_t layer, const kernels::NativeExpertLayout&
 
 bool PeerExperts::launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids,
                                 int64_t n_tok, int64_t k, const int32_t* kind, std::string& err,
-                                const kernels::NativeExpertLayout* const* layouts) {
-    return launch_layout(layer, L, x, ids, n_tok, k, kind, err, rows_map_, layouts);
+                                const kernels::NativeExpertLayout* const* layouts, float* device_rows) {
+    return launch_layout(layer, L, x, ids, n_tok, k, kind, err, device_rows ? device_rows : rows_map_, layouts);
 }
 
 bool PeerExperts::launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n,
@@ -500,7 +520,7 @@ bool same_kernels(const basalt::kernels::NativeExpertLayout& a, const basalt::ke
 }  // namespace
 
 bool PeerExperts::arm(const kernels::NativeExpertLayout& L, const float* x, int64_t n_tok, int64_t k, int64_t grid_groups,
-                      std::string& err) {
+                      std::string& err, float* device_rows) {
     if (armed_ && !raise(0, nullptr, nullptr, err)) return false;
     if (queued_ && !idle(err)) return false;   // the last share has read its plan and its scratch slots
     scratch_used_ = 0;
@@ -529,7 +549,8 @@ bool PeerExperts::arm(const kernels::NativeExpertLayout& L, const float* x, int6
     basalt::kernels::quantize_q8_1_rows_copy(x_map_, n_tok, n_embd_, d_q8_, meta_map_, d_meta_, (int) (sizeof(Meta) / 4), s);
     basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, cap, cap, d_q8_, d_scratch_,
                                            d_out_, s, std::min(cap, std::max<int64_t>(1, grid_groups)));
-    basalt::kernels::scatter_rows_f32(d_out_, rows_map_, dm->out_row, cap, n_embd_, s, dm->count + 1);
+    armed_rows_ = device_rows ? device_rows : rows_map_;
+    basalt::kernels::scatter_rows_f32(d_out_, armed_rows_, dm->out_row, cap, n_embd_, s, dm->count + 1);
     armed_ = queued_ = true;
     armed_tok_ = n_tok;
     armed_k_ = k;
@@ -621,7 +642,7 @@ bool PeerExperts::run_fetched(std::string& err) {
     basalt::kernels::quantize_q8_1_rows_copy(nullptr, 0, n_embd_, nullptr, fplan_map_, d_fplan_, (int) (sizeof(Meta) / 4), s);
     basalt::kernels::native_expert_grouped(armed_L_, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, fetched_groups_, fetched_rows_,
                                            d_q8_, d_scratch_, d_out_, s, fetched_groups_);
-    basalt::kernels::scatter_rows_f32(d_out_, rows_map_, dm->out_row, fetched_rows_, n_embd_, s, dm->count + 1);
+    basalt::kernels::scatter_rows_f32(d_out_, armed_rows_, dm->out_row, fetched_rows_, n_embd_, s, dm->count + 1);
     launched_rows_ += fetched_rows_;
     queued_ = true;
     fetched_groups_ = fetched_rows_ = 0;
@@ -634,7 +655,7 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
     if (layouts) {
         const int64_t n = n_tok * k;
         if (n < 0 || n > CAP) { err = "peer experts: window too large"; return false; }
-        if (!out) { err = "peer experts: mixed layouts require mapped output rows"; return false; }
+        if (!out) { err = "peer experts: mixed layouts require device-accessible output rows"; return false; }
         bool done[CAP]{};
         int32_t mask[CAP]{};
         int next_plan = 0;
@@ -696,7 +717,7 @@ bool PeerExperts::launch_layout(int64_t layer, const kernels::NativeExpertLayout
         basalt::kernels::native_expert_grouped(L, dm->ptr, dm->start, dm->count, dm->dst, dm->tok, groups, rows, d_q8_,
                                                d_scratch_, d_out_, s);
         basalt::kernels::native_grouped_set_mma_hint(false);
-        if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
+        if (direct) {   // coalesced writes into mapped RAM or peer device memory
             try {
                 basalt::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, n_embd_, s);
             } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }

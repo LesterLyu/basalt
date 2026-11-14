@@ -82,12 +82,13 @@ public:
     /// open_plain: a share queued on the card before its plan is known, so it starts when the plan does, not a launch
     /// later.  `arm` queues a wait for a word in mapped memory and behind it the quantize of the pinned activations `x`
     /// [n_tok][n_embd] with the plan's copy to the card, the grouped kernels (`L`) over at most n_tok * k entries,
-    /// `grid_groups` of them side by side, and the scatter of the rows into open_plain's rows, each reading the plan's
+    /// `grid_groups` of them side by side, and the scatter into open_plain's rows (or peer-accessible `device_rows`),
+    /// each reading the plan's
     /// counts on the card.  `raise` writes the plan, entry t * k + j computing ids[t * k + j] of `layer` over row t
     /// where kind says so (kind null: nothing to do), then the word.  An armed share is raised before the card is
     /// waited for (finish, close).
     bool arm(const kernels::NativeExpertLayout& L, const float* x, int64_t n_tok, int64_t k, int64_t grid_groups,
-             std::string& err);
+             std::string& err, float* device_rows = nullptr);
     bool raise(int64_t layer, const int32_t* ids, const int32_t* kind, std::string& err);
     /// open_plain: `n` scratch slots of `bytes` each, for experts the card computes for one share without holding them.
     bool open_scratch(int n, uint64_t bytes, std::string& err);
@@ -105,10 +106,10 @@ public:
     bool launch_plain(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t k,
                       const int32_t* kind, std::string& err);
     /// The share of a window of `n_tok` rows over the pinned activations `x` [n_tok][n_embd]: entry t * k + j computes
-    /// ids[t * k + j] over row t where kind says so; the rows land at that entry of open_plain's rows.
+    /// ids[t * k + j] over row t where kind says so; the result goes to open_plain's rows or peer-accessible `device_rows`.
     bool launch_window(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n_tok,
                        int64_t k, const int32_t* kind, std::string& err,
-                       const kernels::NativeExpertLayout* const* layouts = nullptr);
+                       const kernels::NativeExpertLayout* const* layouts = nullptr, float* device_rows = nullptr);
     /// `n` rows, each with its own activation in `x` (pinned, portable): entry i computes expert ids[i] over x[i] and its row
     /// lands at out[i], `out` as this card addresses mapped host memory (`map_rows`). At most kRowBatch entries; `finish` waits.
     static constexpr int64_t kRowBatch = 80;
@@ -247,6 +248,7 @@ private:
     bool launched_direct_ = false;
     int64_t n_embd_ = 0;                              ///< activation width of the launched shares
     float* rows_map_ = nullptr;                       ///< open_plain's rows as this card addresses them
+    float* armed_rows_ = nullptr;                     ///< destination for both resident and fetched rows of the armed share
     void* meta_map_ = nullptr;                        ///< open_plain: the plan staging as this card addresses it
     const float* x_host_ = nullptr;                   ///< open_plain: the last activations armed, and as this card
     const float* x_map_ = nullptr;                    ///< addresses them
