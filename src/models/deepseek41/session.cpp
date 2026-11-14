@@ -606,18 +606,20 @@ private:
         const uint64_t margin = std::max(beside ? prefillp::kShortMargin : prefillp::kMargin, tier ? tier->free_floor() : 0);
         const bool slabs = tier && tier->malloc_slab_backed();
         if (beside && !slabs) tokens = prefillp::kShortChunk;  // a retained workspace must fit the next short read
-        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b + (tier ? tier->loanable_bytes() : 0), margin, tokens, m_.tiers().prefill_chunk);
+        const prefillp::Fit fit = prefillp::plan_chunk(d, free_b + (tier ? tier->loanable_bytes() : 0), margin, tokens,
+                                                     m_.tiers().prefill_chunk, prefillp::kMinChunk, slabs);
         if (!fit.chunk) {
             err = "deepseek41: " + fit.error;
             return false;
         }
-        for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap /= 2) {
+        for (int cap = fit.chunk; cap >= prefillp::kMinChunk; cap = prefillp::next_chunk(cap, slabs)) {
             const uint64_t wanted = prefillp::chunk_bytes(d, cap, tokens) + margin;
             for (uint64_t extra = 0;; extra += 64ull << 20) {
                 std::string e;
                 if (tier && !tier->lend(wanted+extra,e)) { if (!e.empty()) err=e; break; }
-                prefill_ = make_prefill(m_, *ops_, stream_, cap, e);
-                const uint64_t after = prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap) + margin;
+                prefill_ = make_prefill(m_, *ops_, stream_, cap, prefillp::use_ahead(d, cap, tokens), e);
+                const uint64_t after = margin + (d.reuse_stage ? 0 :
+                    prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap));
                 if (prefill_ && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b >= after) {
                     cudaGetLastError();
                     core::MemoryUsage usage;
@@ -637,8 +639,13 @@ private:
                 drop_prefill();
                 cudaGetLastError();
                 if (!e.empty()) err=e;
+                else err = "prompt workspace leaves " + std::to_string(free_b >> 20) +
+                           " MiB free, needs " + std::to_string(after >> 20) + " MiB of headroom";
                 if (!slabs || extra >= (512ull << 20)) break;
             }
+            if (slabs && cap > prefillp::kMinChunk && !err.empty())
+                basalt::log::info("basalt deepseek41", "prompt workspace: trying a smaller chunk after %d tokens did not fit (%s)",
+                                  cap, err.c_str());
         }
         if (err.empty()) err = "deepseek41: not enough free device memory for the prompt workspaces";
         return false;

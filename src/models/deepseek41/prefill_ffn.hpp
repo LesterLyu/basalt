@@ -46,6 +46,7 @@ public:
     virtual bool shared(int layer, int n_tokens, const float* x, float* out, void* stream, std::string& err) = 0;
 };
 
-std::unique_ptr<PrefillFfn> make_prefill_ffn(const DsModel& model, LayerOps& ops, int max_tokens, std::string& err);
+std::unique_ptr<PrefillFfn> make_prefill_ffn(const DsModel& model, LayerOps& ops, void* stream, int max_tokens, bool ahead,
+                                           std::string& err);
 
 }  // namespace basalt::models::deepseek41

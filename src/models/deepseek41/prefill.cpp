@@ -49,7 +49,7 @@ public:
         ops_.batch_memory_usage(usage);
         if (ffn_) ffn_->memory_usage(usage);
     }
-    bool init(std::string& err) {
+    bool init(bool ahead, std::string& err) {
         const size_t n = (size_t) g_.n_embd, C = (size_t) cap_;
         const size_t cols = (size_t) m_.pack().engram.hash.n_cols() * 256;
         auto buf = [&](auto*& p, size_t count) {
@@ -61,7 +61,7 @@ public:
             return true;
         };
         dump_dir_ = m_.diag_dump();
-        ffn_ = make_prefill_ffn(m_, ops_, cap_, err);
+        ffn_ = make_prefill_ffn(m_, ops_, stream_, cap_, ahead, err);
         if (!ffn_) return false;
         ExpertTier* tier = ops_.expert_tier(err);   // the FFN has it open by now
         if (!tier) return false;
@@ -453,9 +453,9 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Prefill> make_prefill(DsModel& model, LayerOps& ops, void* stream, int max_chunk, std::string& err) {
+std::unique_ptr<Prefill> make_prefill(DsModel& model, LayerOps& ops, void* stream, int max_chunk, bool ahead, std::string& err) {
     auto p = std::make_unique<PrefillImpl>(model, ops, stream, max_chunk);
-    if (!p->init(err)) return nullptr;
+    if (!p->init(ahead, err)) return nullptr;
     return p;
 }
 

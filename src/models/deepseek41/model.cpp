@@ -3,6 +3,7 @@
 #include "basalt/core/device.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/vmm.hpp"
+#include "models/deepseek41/prompt_host.hpp"
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/log.hpp"
@@ -364,8 +365,9 @@ prefillp::Dims DsModel::prompt_dims() const {
     d.n_ff_exp = g.n_ff_exp;
     d.engram_cols = (int64_t) pack_.engram.hash.n_cols() * 256;
     d.replacement_blob_bytes = overlay_max_bytes();
+    d.reuse_stage = core::vmm::tcc_mode();
     for (const ExpertLayer& e : pack_.experts) {
-        d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, e.blob_bytes);
+        d.expert_blob_bytes = std::max<uint64_t>(d.expert_blob_bytes, d.reuse_stage ? staged_stride(e) : e.blob_bytes);
     }
     d.attn_fixed_bytes = attn_batch_fixed_bytes(cache_format_);
     d.attn_token_bytes = attn_batch_token_bytes();

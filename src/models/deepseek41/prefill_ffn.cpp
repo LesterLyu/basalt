@@ -11,6 +11,7 @@
 
 #include "basalt/core/on_device.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/vmm.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -60,14 +61,26 @@ constexpr int kTransferRows = prefill::PeerShare::kQuantRows;
 
 class Impl final : public PrefillFfn {
 public:
-    Impl(const DsModel& m, LayerOps& ops, int cap) : m_(m), g_(m.geo()), ops_(ops), cap_(cap) {}
+    Impl(const DsModel& m, LayerOps& ops, cudaStream_t stream, int cap) : m_(m), g_(m.geo()), ops_(ops), stream_(stream), cap_(cap) {}
     ~Impl() override {
         stop_prefetch();
         for (cudaEvent_t e : pf_events_) cudaEventDestroy(e);
         for (const auto& o : pf_out_) cudaEventDestroy(o.first);
         if (replacement_copied_) cudaEventDestroy(replacement_copied_);
-        for (void* p : dev_) cudaFree(p);
+        if (pool_) {
+            if (copy_) cudaStreamSynchronize(copy_);
+            for (void* p : dev_) cudaFreeAsync(p, stream_);
+            cudaStreamSynchronize(stream_);
+            cudaMemPoolTrimTo(pool_, 0);
+            cudaMemPoolDestroy(pool_);
+        } else {
+            for (void* p : dev_) cudaFree(p);
+        }
         for (Stage& b : stage_) {
+            if (b.copied) cudaEventDestroy(b.copied);
+            if (b.done) cudaEventDestroy(b.done);
+        }
+        for (Stage& b : dstage_) {
             if (b.copied) cudaEventDestroy(b.copied);
             if (b.done) cudaEventDestroy(b.done);
         }
@@ -78,7 +91,7 @@ public:
         usage.device(m_.device(), "long_prefill", allocated_bytes_);
         usage.device(m_.device(), "mmq_buffers", ctx_.allocated_bytes());
     }
-    bool init(std::string& err) {
+    bool init(bool ahead, std::string& err) {
         namespace mmq = basalt::prefill::mmq;
         for (const ExpertLayer& e : m_.pack().experts)
             if (!mmq::fits(e.gu_type, 2 * g_.n_ff_exp) || !mmq::fits(e.d_type, g_.n_embd)) {
@@ -99,6 +112,19 @@ public:
             return false;
         }
         slot_ = host.slot;   // the products step from expert to expert in whole blocks of the layer's two formats
+        reuse_stage_ = core::vmm::tcc_mode();
+        if (ahead && reuse_stage_) {
+            int supported = 0;
+            if (cudaDeviceGetAttribute(&supported, cudaDevAttrMemoryPoolsSupported, m_.device()) == cudaSuccess && supported) {
+                cudaMemPoolProps props{};
+                props.allocType = cudaMemAllocationTypePinned;
+                props.location = {cudaMemLocationTypeDevice, m_.device()};
+                if (cudaMemPoolCreate(&pool_, &props) != cudaSuccess) {
+                    pool_ = nullptr;
+                    cudaGetLastError();
+                }
+            }
+        }
         const size_t K = (size_t) g_.n_used, n = (size_t) g_.n_embd;
         max_rows_ = prefillp::stage_rows(K, cap_);
         const size_t E = (size_t) cap_ * K, R = (size_t) max_rows_, ff = (size_t) g_.n_ff_exp;
@@ -119,8 +145,11 @@ public:
                  cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) == cudaSuccess;
         }
         ok = ok && cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking) == cudaSuccess;
+        // Take these before touching the prompt state: the caller can retry a smaller chunk if any of them do not fit.
+        if (ok && ahead && reuse_stage_ && !m_.has_overlay()) ok = ahead_buffers();
+        if (ok && pool_) ok = cudaStreamSynchronize(stream_) == cudaSuccess;
         if (!ok) {
-            err = "out of memory for the prefill expert buffers";
+            if (err.empty()) err = "out of memory for the prefill expert buffers";
             return false;
         }
         mmq::iota(ident_, (int64_t) E, nullptr);
@@ -708,7 +737,7 @@ private:
         ring_ = host.ring;
         ring_pieces_ = host.ring_pieces;
         if (pf_base_.back() > 0 && ring_pieces_ < kStageExperts) return false;   // a launch's pieces must fit at once
-        if (!m_.has_overlay() && !ahead_buffers()) return false;
+        if (!m_.has_overlay() && (reuse_stage_ ? !dstage_[0].blobs : !ahead_buffers())) return false;
         cudaStreamSynchronize(copy_);
         for (const auto& o : pf_out_) pf_events_.push_back(o.first);
         pf_out_.clear();
@@ -792,8 +821,10 @@ private:
         if (!dstage_[0].blobs) {
             const size_t E = (size_t) cap_ * g_.n_used;
             if (!dev(tok_all_, E * 4) || !dev(bnd_, (kStageExperts + 1) * 4)) return false;
-            for (Stage& b : dstage_) {
-                if (!dev(b.blobs, slot_ * kStageExperts) ||
+            for (int i = 0; i < ahead_slots(); ++i) {
+                Stage& b = dstage_[i];
+                if (reuse_stage_ && i < 2) b.blobs = stage_[i].blobs;
+                if ((!b.blobs && !dev(b.blobs, slot_ * kStageExperts)) ||
                     cudaEventCreateWithFlags(&b.copied, cudaEventDisableTiming) != cudaSuccess ||
                     cudaEventCreateWithFlags(&b.done, cudaEventDisableTiming) != cudaSuccess)
                     return false;
@@ -802,12 +833,14 @@ private:
         return true;
     }
 
+    int ahead_slots() const { return reuse_stage_ ? prefillp::kReusedAheadSlots : prefillp::kAheadSlots; }
+
     // Starts the copies of the next group of experts (in layer order) into its slot; they depend on no routing. The second
     // card's experts stay where they are.
     bool issue_next(std::string& err) {
         const int G = (g_.n_expert + kStageExperts - 1) / kStageExperts;
         const int l = (int) (issued_ / G), g = (int) (issued_ % G);
-        Stage& D = dstage_[issued_ % prefillp::kAheadSlots];
+        Stage& D = dstage_[issued_ % ahead_slots()];
         const ExpertLayer& el = m_.pack().experts[(size_t) l];
         int64_t last = -1;   // the group's last ring piece
         if (pf_on_)
@@ -899,7 +932,7 @@ private:
         for (int g = 0; g < G; ++g) {
             while (issued_ <= consumed_)
                 if (!issue_next(err)) return false;
-            Stage& D = dstage_[consumed_ % prefillp::kAheadSlots];
+            Stage& D = dstage_[consumed_ % ahead_slots()];
             const int e0 = g * kStageExperts, e1 = std::min(NE, e0 + kStageExperts);
             cudaStreamWaitEvent(st, D.copied, 0);
             // sub-ranges of experts of at most max_rows_ rows (one range unless the routing is very skewed); an expert
@@ -964,7 +997,7 @@ private:
             }
             cudaEventRecord(D.done, st);
             ++consumed_;
-            while (issued_ < std::min<int64_t>(consumed_ + prefillp::kAheadSlots, (int64_t) run_layers_ * G))
+            while (issued_ < std::min<int64_t>(consumed_ + ahead_slots(), (int64_t) run_layers_ * G))
                 if (!issue_next(err)) return false;
         }
         if (!peer.empty() && !tier_->peer_share()->join(st, err)) return false;
@@ -1043,7 +1076,8 @@ private:
     template <class P>
     bool dev(P*& p, size_t bytes) {
         void* v = nullptr;
-        if (cudaMalloc(&v, bytes) != cudaSuccess) return false;
+        const auto status = pool_ ? cudaMallocFromPoolAsync(&v, bytes, pool_, stream_) : cudaMalloc(&v, bytes);
+        if (status != cudaSuccess) return false;
         dev_.push_back(v);
         allocated_bytes_ += bytes;
         p = (P*) v;
@@ -1054,7 +1088,10 @@ private:
     const Geometry& g_;
     LayerOps& ops_;
     ExpertTier* tier_ = nullptr;
+    cudaStream_t stream_ = nullptr;
+    cudaMemPool_t pool_ = nullptr;
     bool tier_tried_ = false;
+    bool reuse_stage_ = false;
     struct Stage {
         uint8_t *blobs = nullptr, *host = nullptr;
         int32_t *tok = nullptr, *bounds = nullptr;
@@ -1103,9 +1140,10 @@ private:
 
 }  // namespace
 
-std::unique_ptr<PrefillFfn> make_prefill_ffn(const DsModel& model, LayerOps& ops, int max_tokens, std::string& err) {
-    auto p = std::make_unique<Impl>(model, ops, max_tokens);
-    if (!p->init(err)) return nullptr;
+std::unique_ptr<PrefillFfn> make_prefill_ffn(const DsModel& model, LayerOps& ops, void* stream, int max_tokens, bool ahead,
+                                           std::string& err) {
+    auto p = std::make_unique<Impl>(model, ops, (cudaStream_t) stream, max_tokens);
+    if (!p->init(ahead, err)) return nullptr;
     return p;
 }
 

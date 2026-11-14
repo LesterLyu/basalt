@@ -24,6 +24,7 @@ constexpr int kRingPieces = kRing * 48;            // most experts the pinned ri
 constexpr int kEmbedRows = 512;                    // token embeddings a chunk stages in host RAM at a time
 constexpr int kEngramRows = 2048;                  // tokens of Engram rows a chunk dequantizes in host RAM at a time
 constexpr int kAheadSlots = 6;                     // staged groups of experts in flight in a long chunk
+constexpr int kReusedAheadSlots = 4;               // smaller ring when its first two buffers also serve short reads
 constexpr int kShareRows = 2048;                   // rows a layer of a short read may compute on the CPU
 constexpr int kStepPrompt = 12;                    // a prompt this short reads one decode step at a time, faster than a chunk's bus copies
 constexpr int kShortPrompt = 2048;                 // a prompt this short takes no staged groups and reads beside a tier's copies
@@ -61,6 +62,7 @@ struct Dims {
     uint64_t expert_blob_bytes = 0;   // the largest expert
     uint64_t attn_fixed_bytes = 0, attn_token_bytes = 0;   // the batched attention's workspaces
     uint64_t replacement_blob_bytes = 0; // one replacement staged at a time, without the ahead device groups
+    bool reuse_stage = false;             // the long path can borrow the two ordinary staging buffers
 };
 
 /// Device bytes that grow with the chunk: streams and scratch rows, router outputs, the expert inputs, the experts' rows
@@ -88,7 +90,23 @@ inline uint64_t fixed_bytes(const Dims& d, int chunk) {
 inline uint64_t workspace_bytes(const Dims& d, int chunk) { return fixed_bytes(d, chunk) + per_token_bytes(d) * (uint64_t) chunk; }
 
 /// Device bytes of the long chunks' staged groups of experts, ahead of their products.
-inline uint64_t ahead_bytes(const Dims& d) { return d.replacement_blob_bytes ? 0 : kAheadSlots * d.expert_blob_bytes * kStageExperts; }
+inline uint64_t ahead_bytes(const Dims& d, int chunk) {
+    if (d.replacement_blob_bytes) return 0;
+    if (!d.reuse_stage) return kAheadSlots * d.expert_blob_bytes * kStageExperts;
+    return (kReusedAheadSlots - 2) * d.expert_blob_bytes * kStageExperts +
+           4 * ((uint64_t) chunk * d.n_used + kStageExperts + 1);
+}
+
+inline bool use_ahead(const Dims& d, int chunk, int tokens) {
+    return (int64_t) (chunk < tokens ? chunk : tokens) * d.n_used >= kAheadPairs;
+}
+
+inline int next_chunk(int chunk, bool tcc) {
+    // The 12K step keeps the read-ahead path when 16K falls short by a few buffers.
+    if (tcc && chunk == kMaxChunk) return 12288;
+    if (tcc && chunk == 12288) return 8192;
+    return chunk / 2;
+}
 
 struct Fit {
     int chunk = 0;       ///< tokens per chunk; 0 when even the least does not fit
@@ -97,15 +115,16 @@ struct Fit {
 
 /// What a chunk of `chunk` tokens takes on the device for a prompt of `tokens`: its workspaces and, in a long one, the staged groups.
 inline uint64_t chunk_bytes(const Dims& d, int chunk, int tokens) {
-    const int64_t pairs = (int64_t) (chunk < tokens ? chunk : tokens) * d.n_used;
-    return workspace_bytes(d, chunk) + (pairs >= kAheadPairs ? ahead_bytes(d) : 0);
+    return workspace_bytes(d, chunk) + (use_ahead(d, chunk, tokens) ? ahead_bytes(d, chunk) : 0);
 }
 
-/// The largest chunk a prompt of `tokens` can use (halving from `max_chunk`, never below `min_chunk`) that leaves `margin` free.
-inline Fit plan_chunk(const Dims& d, uint64_t free_bytes, uint64_t margin, int tokens, int max_chunk = kMaxChunk, int min_chunk = kMinChunk) {
+/// The largest chunk a prompt of `tokens` can use, bounded by `max_chunk` and `min_chunk`, that leaves `margin` free.
+inline Fit plan_chunk(const Dims& d, uint64_t free_bytes, uint64_t margin, int tokens, int max_chunk = kMaxChunk,
+                      int min_chunk = kMinChunk, bool tcc = false) {
     Fit f;
-    for (int c = max_chunk; c >= min_chunk; c /= 2) {
-        if (c / 2 >= tokens && c / 2 >= min_chunk) continue;   // half of it holds the prompt
+    for (int c = max_chunk; c >= min_chunk; c = next_chunk(c, tcc)) {
+        const int smaller = next_chunk(c, tcc);
+        if (smaller >= tokens && smaller >= min_chunk) continue;
         if (chunk_bytes(d, c, tokens) + margin <= free_bytes) {
             f.chunk = c;
             return f;
