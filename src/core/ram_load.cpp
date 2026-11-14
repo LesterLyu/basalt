@@ -451,7 +451,7 @@ RamAllocation& RamAllocation::operator=(RamAllocation&& other) noexcept {
     data_ = std::exchange(other.data_, nullptr);
     bytes_ = std::exchange(other.bytes_, 0);
     capacity_ = std::exchange(other.capacity_, 0);
-    allocation_pinned_ = std::exchange(other.allocation_pinned_, false);
+    mapping_ = std::exchange(other.mapping_, {});
     return *this;
 }
 
@@ -460,8 +460,10 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
     if (!bytes) return true;
     if (bytes > SIZE_MAX - ((2ull << 20) - 1)) return false;
     if constexpr (platform::kPreferHostVmm) {
-        if (pin) data_ = vmm::alloc_host(bytes, capacity_, vmm::HostBacking::Bounded);
-        allocation_pinned_ = data_ != nullptr;
+        // TCC transfers use registered host pointers for asynchronous DMA.
+        if (pin && !vmm::tcc_mode()) mapping_ = vmm::alloc_host(bytes, vmm::HostBacking::Bounded);
+        data_ = mapping_.host;
+        capacity_ = mapping_.bytes;
     }
     if (!data_) {
         data_ = alloc_ram(bytes);
@@ -473,11 +475,11 @@ bool RamAllocation::allocate(uint64_t bytes, bool pin) {
 }
 
 void RamAllocation::reset() {
-    if (allocation_pinned_) vmm::free_host(data_, capacity_, vmm::HostBacking::Bounded);
+    if (allocation_pinned()) vmm::free_host(mapping_);
     else platform::free_aligned(data_);
     data_ = nullptr;
     bytes_ = capacity_ = 0;
-    allocation_pinned_ = false;
+    mapping_ = {};
 }
 
 RamPin pin_ram(const RamAllocation& allocation, const std::vector<uint64_t>& bounds, bool mapped,
@@ -488,7 +490,7 @@ RamPin pin_ram(const RamAllocation& allocation, const std::vector<uint64_t>& bou
         RamPin p;
         p.registered_bytes = allocation.capacity();
         p.allocation_backed = true;
-        if (device) *device = allocation.data();
+        if (device) *device = allocation.device_data();
         return p;
     }
     return pin_ram(allocation.data(), allocation.capacity(), allocation.bytes(), bounds, mapped, device);

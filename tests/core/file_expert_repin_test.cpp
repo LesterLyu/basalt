@@ -44,13 +44,16 @@ struct TempDirectory {
     }
 };
 
-// the alias is a device address (cudaHostGetDevicePointer), not the host pointer: on a driver that does not map registered
-// host memory at its own address the two differ, so the check is that the alias reads back the host bytes
+// Read the alias the same way a routed expert does: through a kernel, not as a host-copy endpoint.
 void require_alias_maps(const void* alias, const uint8_t* host, size_t bytes, const char* what) {
     require(alias != nullptr, std::string(what) + ": no device alias");
-    std::vector<uint8_t> via(bytes);
-    require(cudaMemcpy(via.data(), alias, bytes, cudaMemcpyDeviceToHost) == cudaSuccess, std::string(what) + ": copy through the alias");
-    require(std::memcmp(via.data(), host, bytes) == 0, std::string(what) + ": the alias maps the host bytes");
+    int32_t via[32]{}, *gpu = nullptr;
+    require(bytes >= sizeof via && cudaMalloc(&gpu, sizeof via) == cudaSuccess, std::string(what) + ": readback buffer");
+    basalt::kernels::copy_i32_from_mapped(gpu, static_cast<const int32_t*>(alias), 32, nullptr);
+    const auto result = cudaMemcpy(via, gpu, sizeof via, cudaMemcpyDeviceToHost);
+    const auto release = cudaFree(gpu);
+    require(result == cudaSuccess && release == cudaSuccess, std::string(what) + ": kernel read through the alias");
+    require(std::memcmp(via, host, sizeof via) == 0, std::string(what) + ": the alias maps the host bytes");
 }
 
 bool registered(const void* p) {

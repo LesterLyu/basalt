@@ -18,12 +18,11 @@ vector spelling of the same F16C conversion.
 
 ## DeepSeek resident expert memory
 
-On native Windows the engine automatically allocates the resident RAM expert tier as
-CUDA-pinned system memory using host NUMA virtual memory. Only the primary GPU maps
-the entire tier; helper transfers use the RAM slots directly. If any layer cannot be
-mapped, the engine releases the mappings before allocating ordinary RAM and registering
-what it can. Expert placement and RAM headroom are unchanged. Linux and WSL use ordinary
-RAM registration.
+DeepSeek uses ordinary CUDA host registration on TCC: its expert transfers need a host
+address that CUDA can copy from without blocking the submission thread. WDDM retains
+its existing host NUMA VMM path. CPU reads use the host alias; kernels use the device
+address. If any layer cannot be mapped, the engine releases the mappings before
+allocating ordinary RAM and registering what it can. Linux and WSL use ordinary RAM registration.
 For diagnostics, set `BASALT_DS_PROFILE_PEER_EXCHANGE=1` to time helper exchanges.
 By default the engine neither times these exchanges nor prints their timing summary.
 
@@ -35,8 +34,10 @@ arena. Descriptors use `NO_BUFFERING | OVERLAPPED`; each positional read has its
 and completion event. Buffers, offsets and byte counts retain a 4 KiB alignment contract.
 A file system that refuses unbuffered reads, or a short read, retains the mapped-copy fallback.
 
-The compact resident arena prefers host VMM. If that is unavailable, it registers ordinary
-host memory after its reads complete. Registration queries each visible
+The compact and full resident arenas use ordinary CUDA host registration on TCC.
+Elsewhere they try host VMM and check that the CPU aliases are contiguous across the
+backing allocations. The compact arena registers ordinary host memory after its reads
+complete when it cannot use VMM. Registration queries each visible
 adapter's current DXGI non-local budget and usage, leaving the larger of 1 GiB and 5% of its
 budget for later allocations. The adapter contexts are initialized before registration so
 later context creation does not inherit a large mapping. The smallest remaining allowance bounds the portable mapping;
@@ -50,7 +51,7 @@ GPU reads; only the remaining tail is locked with a working-set minimum plus chu
 `VirtualLock`. CUDA-registered pages are not locked again. Startup reports CUDA-mapped and
 resident sizes separately and reports any working-set quota failure.
 
-The full expert arena also prefers host VMM. Its portable fallback registers before loading its bytes,
+The full expert arena registers ordinary host memory before loading its bytes,
 using the same budget query and whole-layer registration slices. A driver refusal stops the slice probe; unregistered bytes
 remain in the resident tail. The registration target leaves the reserve before probing;
 it does not rely on recovering a context after driver exhaustion. Startup reports the budget and prefix.

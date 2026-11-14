@@ -107,7 +107,7 @@ bool DsModel::load_overlay(const std::string& path, std::string& err) {
     if (cursor!=data.bytes || entries.empty()) {err="incomplete overlay layout"; return false;}
     overlay_bytes_=cursor;
     overlay_source_ = data;
-    const uint64_t grain = platform::kDirectHostVmmExchange ? core::vmm::host_granularity() : 0;
+    const uint64_t grain = expert_host_vmm_granularity();
     overlay_ram_budget_ = 0;
     for (const auto& entry : entries) {
         const auto bytes = overlay_[entry.first].layout.bytes;

@@ -149,7 +149,7 @@ bool parse(int argc, char** argv, Options& o) {
 
 struct Host {
     unsigned char* p = nullptr;
-    uint64_t mapped = 0;
+    basalt::core::vmm::HostMapping mapping;
     bool registered = false;
     int owner = 0;
     std::string mode;
@@ -166,14 +166,15 @@ struct Host {
             throw std::runtime_error("host allocation would exhaust available RAM");
         if (mode == "vmm-primary" || mode == "vmm-all") {
             if (!basalt::core::vmm::host_granularity()) throw Unsupported("host NUMA VMM not supported");
-            p = basalt::core::vmm::alloc_host(bytes, mapped, basalt::core::vmm::HostBacking::Bounded);
+            mapping = basalt::core::vmm::alloc_host(bytes, basalt::core::vmm::HostBacking::Bounded, false);
+            p = mapping.host;
             if (!p) throw std::runtime_error("host VMM allocation failed");
             if (mode == "vmm-all") {
                 for (int gpu : gpus) {
                     CUmemAccessDesc access{};
                     access.location = {CU_MEM_LOCATION_TYPE_DEVICE, gpu};
                     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                    driver_check(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(p), mapped, &access, 1));
+                    driver_check(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(mapping.device), mapping.bytes, &access, 1));
                 }
             }
         } else if (mode == "pageable" || mode == "registered") {
@@ -193,7 +194,7 @@ struct Host {
     ~Host() {
         if (!p) return;
         cudaSetDevice(owner);
-        if (mapped) basalt::core::vmm::free_host(p, mapped, basalt::core::vmm::HostBacking::Bounded);
+        if (mapping.device) basalt::core::vmm::free_host(mapping);
         else if (mode == "pageable" || mode == "registered") {
             if (registered) cudaHostUnregister(p);
             basalt::platform::free_aligned(p);
@@ -542,8 +543,8 @@ int main(int argc, char** argv) {
                 }
                 char note[256]{};
                 std::snprintf(note, sizeof note, "Round %d %s: %.2f MiB %s; allocation + touch %.3f s.",
-                              round, mode.c_str(), (host.mapped ? host.mapped : o.host_bytes) / double(MiB),
-                              host.mapped ? "mapped" : "requested",
+                              round, mode.c_str(), (host.mapping.bytes ? host.mapping.bytes : o.host_bytes) / double(MiB),
+                              host.mapping.bytes ? "mapped" : "requested",
                               seconds(Clock::now() - start));
                 allocations.emplace_back(note);
                 phase = mode + " RAM transfers, round " + std::to_string(round);

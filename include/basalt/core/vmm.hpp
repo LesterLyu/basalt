@@ -14,16 +14,26 @@ namespace basalt::core::vmm {
 bool supported();
 /// Whether the current CUDA device runs in TCC driver mode.
 bool tcc_mode();
+#ifdef _WIN32
+/// TCC can advertise VMM even when the driver rejects device backing.
+bool can_map_device_memory();
+#endif
 /// The allocation granularity of the current device (every size and offset below is a multiple of it); 0 on failure.
 uint64_t granularity();
 /// The minimum host allocation granularity on the current device, or 0 without host VMM.
 uint64_t host_granularity();
-/// CUDA-pinned system memory accessible to the CPU and current GPU; other GPUs may copy through host endpoints.
-/// Bounded backing lets a large arena exceed the driver's single-allocation allowance. Layer spans keep one backing.
-/// Returns the padded mapping size; free_host must receive the same backing policy. No portable registration is involved.
+/// Bounded backing lets a large arena exceed the driver's single-allocation allowance.
 enum class HostBacking { Whole, Bounded };
-uint8_t* alloc_host(uint64_t bytes, uint64_t& mapped, HostBacking backing = HostBacking::Whole);
-void free_host(uint8_t* ptr, uint64_t mapped, HostBacking backing = HostBacking::Whole);
+struct HostMapping {
+    uint8_t* host = nullptr;    ///< CPU alias, contiguous across all pieces
+    uint8_t* device = nullptr;  ///< reserved CUDA VA, also used to unmap the pieces
+    uint64_t bytes = 0;
+    uint64_t stride = 0;        ///< size of one physical backing allocation
+};
+/// Map CUDA-pinned system RAM into the current GPU and, by default, the other visible TCC GPUs.
+/// An empty mapping leaves the caller free to use ordinary RAM registration.
+HostMapping alloc_host(uint64_t bytes, HostBacking backing = HostBacking::Whole, bool map_peers = true);
+void free_host(HostMapping mapping);
 /// Reserves `bytes` of address space (a multiple of the granularity); null on failure.
 uint8_t* reserve(uint64_t bytes);
 void release_range(uint8_t* va, uint64_t bytes);

@@ -129,6 +129,7 @@ int main() {
     RamAllocation moved = std::move(allocations[0]);
     require(!allocations[0].data() && moved.data() == at, "allocation move copied or lost the span");
     const uint8_t* alias = nullptr;
+    if (vmm::tcc_mode()) require(!moved.allocation_pinned(), "TCC must use ordinary host registration");
     const RamPin mapped_pin = pin_ram(moved, {}, true, &alias);
     require(alias && mapped_pin.registered_bytes >= moved.bytes(), "shared mapped alias");
     int32_t* gpu_values = nullptr;
@@ -149,7 +150,7 @@ int main() {
     if constexpr (kPreferHostVmm) {
         const bool host_vmm = vmm::host_granularity() > 0;
         if (!host_vmm) std::printf("host VMM unavailable; ordinary registration tested\n");
-        if (host_vmm) {
+        if (host_vmm && !vmm::tcc_mode()) {
             {
                 PinnedArena arena(chunk + 1);
                 require(arena.valid() && arena.allocation.allocation_pinned(), "full resident arena host mapping");
@@ -161,30 +162,46 @@ int main() {
             // One expert can straddle the boundary between two physical backing allocations.
             constexpr uint64_t boundary = 2ull << 30;
             RamAllocation spanning;
-            require(spanning.allocate(boundary + chunk) && spanning.allocation_pinned(), "multi-piece host mapping");
+            // Equal-sized pieces have the best chance of getting contiguous CPU aliases.
+            require(spanning.allocate(2 * boundary), "multi-piece host allocation");
             std::memset(spanning.data() + boundary - chunk, 0x2b, 2 * chunk);
             roundtrip(spanning.data() + boundary - chunk, 2 * chunk, cards);
-            int32_t* gpu = nullptr;
-            ck(cudaMalloc(&gpu, 128));
-            const auto* src = spanning.data() + boundary - 64;
-            basalt::kernels::copy_i32_from_mapped(gpu, (const int32_t*) src, 32, nullptr);
-            int32_t back[32]{};
-            ck(cudaMemcpy(back, gpu, sizeof back, cudaMemcpyDeviceToHost));
-            require(std::memcmp(back, src, sizeof back) == 0, "GPU read across physical backing boundary");
-            ck(cudaFree(gpu));
+            if (spanning.allocation_pinned()) {
+                const auto* src = spanning.device_data() + boundary - 64;
+                int primary_tcc = 0;
+                ck(cudaDeviceGetAttribute(&primary_tcc, cudaDevAttrTccDriver, 0));
+                for (int d = 0; d < cards; ++d) {
+                    int tcc = 0;
+                    ck(cudaDeviceGetAttribute(&tcc, cudaDevAttrTccDriver, d));
+                    if (d != 0 && !(tcc && primary_tcc)) continue;
+                    ck(cudaSetDevice(d));
+                    int32_t* gpu = nullptr;
+                    ck(cudaMalloc(&gpu, 128));
+                    basalt::kernels::copy_i32_from_mapped(gpu, (const int32_t*) src, 32, nullptr);
+                    int32_t back[32]{};
+                    ck(cudaMemcpy(back, gpu, sizeof back, cudaMemcpyDeviceToHost));
+                    require(std::memcmp(back, spanning.data() + boundary - 64, sizeof back) == 0,
+                            "GPU read across physical backing boundary");
+                    ck(cudaFree(gpu));
+                    std::printf("CUDA%d: host VMM kernel read across the backing boundary\n", d);
+                }
+                ck(cudaSetDevice(0));
+            } else {
+                require(!spanning.device_data(), "ordinary fallback exposed a device address");
+                std::puts("noncontiguous host VMM: ordinary RAM fallback tested");
+            }
         }
         for (int i = 0; host_vmm && i < 3; ++i) {
-            uint64_t mapped = 0;
-            uint8_t* p = vmm::alloc_host(chunk + 1, mapped);
-            require(p && mapped >= chunk + 1 && mapped % vmm::host_granularity() == 0, "host mapping extent");
-            std::memset(p, 0xa7, chunk + 1);
+            const auto m = vmm::alloc_host(chunk + 1);
+            require(m.host && m.device && m.bytes >= chunk + 1 && m.bytes % vmm::host_granularity() == 0,
+                    "host mapping extent");
+            std::memset(m.host, 0xa7, chunk + 1);
             std::printf("host VMM roundtrip %d\n", i);
-            roundtrip(p, chunk + 1, cards);
-            vmm::free_host(p, mapped);
+            roundtrip(m.host, chunk + 1, cards);
+            vmm::free_host(m);
         }
-        uint64_t mapped = 99;
-        require(vmm::alloc_host(0, mapped) == nullptr && mapped == 0, "empty host mapping");
-        require(vmm::alloc_host(~uint64_t(0), mapped) == nullptr && mapped == 0, "host mapping overflow");
+        require(!vmm::alloc_host(0).device, "empty host mapping");
+        require(!vmm::alloc_host(~uint64_t(0)).device, "host mapping overflow");
     }
     ck(cudaGetLastError());
     std::printf("PASS: host registration and endpoints on %d cards\n", cards);

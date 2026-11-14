@@ -5,9 +5,17 @@
 #include "basalt/platform/memory.hpp"
 
 namespace basalt::models::deepseek41 {
+// Host VMM may be addressable from TCC without being a fast asynchronous host-copy endpoint.
+inline uint64_t expert_host_vmm_granularity() {
+    if constexpr (platform::kDirectHostVmmExchange)
+        if (!core::vmm::tcc_mode()) return core::vmm::host_granularity();
+    return 0;
+}
+
 struct ExpertRam {
     uint8_t* data = nullptr;
-    uint64_t bytes = 0, mapped = 0;
+    uint64_t bytes = 0;
+    core::vmm::HostMapping mapping;
     core::RamPin pin;
     bool ready = false;
 
@@ -16,12 +24,15 @@ struct ExpertRam {
     ExpertRam& operator=(const ExpertRam&) = delete;
     ~ExpertRam() {
         if (!data) return;
-        if (mapped) core::vmm::free_host(data, mapped);
+        if (mapping.device) core::vmm::free_host(mapping);
         else { core::unpin_ram(data, pin); platform::free_aligned(data); }
     }
     bool allocate(uint64_t size) {
         bytes = size;
-        if constexpr (platform::kDirectHostVmmExchange) data = core::vmm::alloc_host(bytes, mapped);
+        if (expert_host_vmm_granularity()) {
+            mapping = core::vmm::alloc_host(bytes);
+            data = mapping.host;
+        }
         if (!data) {
             data = core::alloc_ram(bytes);
             if (!data) return false;
@@ -29,7 +40,7 @@ struct ExpertRam {
         }
         return true;
     }
-    uint64_t allocated() const { return data ? (mapped ? mapped : bytes) : 0; }
-    uint64_t registered() const { return mapped ? mapped : pin.registered_bytes; }
+    uint64_t allocated() const { return data ? (mapping.device ? mapping.bytes : bytes) : 0; }
+    uint64_t registered() const { return mapping.device ? mapping.bytes : pin.registered_bytes; }
 };
 }

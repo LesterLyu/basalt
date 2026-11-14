@@ -6,6 +6,7 @@
 #pragma once
 
 #include "basalt/core/load_progress.hpp"
+#include "basalt/core/vmm.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -123,13 +124,14 @@ public:
     bool allocate(uint64_t bytes, bool pin = true);
     void reset();
     uint8_t* data() const { return data_; }
+    const uint8_t* device_data() const { return mapping_.device; }
     uint64_t bytes() const { return bytes_; }
     uint64_t capacity() const { return capacity_; }
-    bool allocation_pinned() const { return allocation_pinned_; }
+    bool allocation_pinned() const { return mapping_.device != nullptr; }
 private:
     uint8_t* data_ = nullptr;
     uint64_t bytes_ = 0, capacity_ = 0;
-    bool allocation_pinned_ = false;
+    vmm::HostMapping mapping_;
 };
 
 RamPin pin_ram(const RamAllocation& allocation, const std::vector<uint64_t>& bounds, bool mapped,

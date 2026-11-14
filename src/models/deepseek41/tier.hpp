@@ -298,7 +298,7 @@ private:
     uint64_t start_floor_ = 0, free_floor_ = 0;
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
-    std::vector<uint64_t> host_vmm_bytes_;  ///< nonempty only for primary-only pinned system allocations
+    std::vector<core::vmm::HostMapping> host_vmm_; ///< backing for CUDA-pinned system allocations
     bool profile_peer_exchange_ = false;
     uint64_t peer_exchanges_ = 0, peer_exchange_ns_ = 0, peer_read_ns_ = 0, peer_host_ns_ = 0, peer_write_ns_ = 0;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got

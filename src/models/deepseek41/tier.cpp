@@ -47,9 +47,9 @@ void ExpertTier::memory_usage(core::MemoryUsage& usage) const {
     }
     if (share_) share_->memory_usage(usage);
     for (size_t l = 0; l < ram_.size(); ++l)
-        if (ram_[l]) usage.host["resident_experts"] += host_vmm_bytes_.empty()
-            ? core::ram_padded(ram_bytes_[l]) : host_vmm_bytes_[l];
-    for (uint64_t n : host_vmm_bytes_) usage.host["pinned_experts"] += n;
+        if (ram_[l]) usage.host["resident_experts"] += host_vmm_.empty()
+            ? core::ram_padded(ram_bytes_[l]) : host_vmm_[l].bytes;
+    for (const auto& mapping : host_vmm_) usage.host["pinned_experts"] += mapping.bytes;
     for (const auto& pin : ram_pins_) {
         usage.host["pinned_experts"] += pin.registered_bytes;
         usage.host["locked_experts"] += pin.locked_bytes;
@@ -227,7 +227,7 @@ ExpertTier::~ExpertTier() {
     for (size_t l = 0; l < ram_.size(); ++l) {
         if (ram_[l] == nullptr) continue;
         if (l < ram_pins_.size()) core::unpin_ram(ram_[l], ram_pins_[l]);
-        if (!host_vmm_bytes_.empty()) core::vmm::free_host(ram_[l], host_vmm_bytes_[l]);
+        if (!host_vmm_.empty()) core::vmm::free_host(host_vmm_[l]);
         else platform::free_aligned(ram_[l]);
     }
     platform::free_aligned(act_);
@@ -472,7 +472,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         if (peer_) peer_compute_=std::make_unique<PeerCompute>(*peer_);
     }
     if constexpr (platform::kDirectHostVmmExchange) {
-        if (peer_ && !host_vmm_bytes_.empty() && !profile_peer_exchange_) {
+        if (peer_ && !host_vmm_.empty() && !profile_peer_exchange_) {
             peer_submitter_ = std::make_unique<PeerSubmitter>(*peer_);
             basalt::log::info("basalt deepseek41", "helper expert exchange: dedicated submission thread");
         }
@@ -778,7 +778,7 @@ bool ExpertTier::load_ram(std::string& err) {
     if (cudaDeviceSynchronize() != cudaSuccess) { err="deepseek41: initializing expert arenas failed"; return false; }
     // Rebudget after final GPU placement, before reading or allocating any expert RAM.
     // Only CPU-owned replacements are mandatory; GPU homes never receive host copies.
-    const uint64_t grain = platform::kDirectHostVmmExchange ? core::vmm::host_granularity() : 0;
+    const uint64_t grain = expert_host_vmm_granularity();
     uint64_t replacements = 0;
     std::vector<std::vector<int>> remaining(n_layers_);
     std::vector<policy::RamLayer> needs;
@@ -895,16 +895,20 @@ bool ExpertTier::load_ram(std::string& err) {
     core::RamLoadStats read;
     bool loaded = false;
     if constexpr (platform::kDirectHostVmmExchange) {
-        if (cover_ > 0) {
+        if (cover_ > 0 && !core::vmm::tcc_mode()) {
             // Map each layer on its reader thread so earlier layers can be filled while
             // Windows backs the rest. No second arena or extra file staging.
-            host_vmm_bytes_.resize(n_layers_);
+            host_vmm_.resize(n_layers_);
             std::atomic<bool> map_failed{false};
             load.groups.resize(n_layers_);
             load.chunk = std::max(load.chunk, max_blob);
             load.prepare_group = [&](int64_t l, std::vector<core::RamRun>& runs, std::string& e) {
-                if (cudaSetDevice(m_.device()) != cudaSuccess ||
-                    (span_bytes[l] && !(ram_[l] = core::vmm::alloc_host(span_bytes[l], host_vmm_bytes_[l])))) {
+                const bool selected = cudaSetDevice(m_.device()) == cudaSuccess;
+                if (selected && span_bytes[l]) {
+                    host_vmm_[l] = core::vmm::alloc_host(span_bytes[l]);
+                    ram_[l] = host_vmm_[l].host;
+                }
+                if (!selected || (span_bytes[l] && !ram_[l])) {
                     map_failed.store(true);
                     e = "could not map a host expert layer";
                     return false;
@@ -919,10 +923,10 @@ bool ExpertTier::load_ram(std::string& err) {
                 // All readers have joined. Drop partial mappings before the ordinary
                 // allocation; GPU homes are refilled with the same immutable weights.
                 for (int l = 0; l < n_layers_; ++l) {
-                    core::vmm::free_host(ram_[l], host_vmm_bytes_[l]);
+                    core::vmm::free_host(host_vmm_[l]);
                     ram_[l] = nullptr;
                 }
-                host_vmm_bytes_.clear();
+                host_vmm_.clear();
                 basalt::log::warn("basalt deepseek41", "host VMM unavailable; using normal RAM registration");
                 if (ram_load) ram_load.emplace("ram", ram_bytes);
                 if (main_load) main_load.emplace(core::LoadProgress::cuda(0), main_bytes);
@@ -949,10 +953,10 @@ bool ExpertTier::load_ram(std::string& err) {
             return false;
         }
     }
-    if (!host_vmm_bytes_.empty()) {
+    if (!host_vmm_.empty()) {
         uint64_t n = 0;
-        for (auto b : host_vmm_bytes_) n += b;
-        basalt::log::info("basalt deepseek41", "RAM expert tier: %.2f GiB CUDA-pinned (host VMM, primary GPU)", n / 1073741824.0);
+        for (const auto& mapping : host_vmm_) n += mapping.bytes;
+        basalt::log::info("basalt deepseek41", "RAM expert tier: %.2f GiB CUDA-pinned (host VMM)", n / 1073741824.0);
     } else if (cover_ > 0) {
         ram_pins_ = core::pin_ram_spans(ram_, span_bytes, /*mapped=*/false);
         int unpinned = 0;
@@ -1726,7 +1730,7 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     if (place >= 0) { spare_[layer] = -1; out = ram_place(layer,place); }
     const uint64_t out_bytes = needs_home ? expert_bytes(layer,victim) : 0;
     PeerMove move{layer, e, victim, slot, place, out, src, out_bytes, bytes};
-    if (profile_peer_exchange_ && !host_vmm_bytes_.empty()) {
+    if (profile_peer_exchange_ && !host_vmm_.empty()) {
         using Clock = std::chrono::steady_clock;
         const auto stamp = [this]() { return profile_peer_exchange_ ? Clock::now() : Clock::time_point{}; };
         const auto start = stamp();
