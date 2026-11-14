@@ -37,6 +37,7 @@ public:
         int64_t launch_rows = 1024;    ///< rows of one launch; a group with more takes several
         int stage_bufs = kMaxBufs;     ///< groups staged at once (1 to 3)
         int bufs = kMaxBufs;           ///< launches in flight (2 or 3)
+        bool direct = false;           ///< use already enabled, bidirectional CUDA peer access
     };
     /// Device bytes on the second card, and pinned host bytes, `open` takes.
     static uint64_t peer_bytes(const Dims& d);

@@ -311,9 +311,21 @@ int main() {
         ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
         int fail = 0;
         double peer_ms = 0;
-        struct Cut { int experts; int64_t rows; };
+        int forward = 0, reverse = 0;
+        ck(cudaDeviceCanAccessPeer(&forward, 0, 1), "peer access 0 to 1");
+        ck(cudaDeviceCanAccessPeer(&reverse, 1, 0), "peer access 1 to 0");
+        if (forward && reverse) {
+            for (int dev : {0, 1}) {
+                const basalt::core::OnDevice od(dev);
+                const auto status = cudaDeviceEnablePeerAccess(1 - dev, 0);
+                if (status == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+                else ck(status, "enable peer access");
+            }
+        }
+        struct Cut { int experts; int64_t rows; bool direct; };
         std::vector<float> first;
-        for (const Cut c : {Cut{8, 2048}, Cut{3, 700}}) {
+        for (const Cut c : {Cut{8, 2048, false}, Cut{3, 700, false}, Cut{8, 2048, true}}) {
+            if (c.direct && !(forward && reverse)) continue;
             basalt::prefill::PeerShare::Dims d;
             d.n_embd = N;
             d.n_ff = FF;
@@ -324,6 +336,7 @@ int main() {
             d.n_expert = E;
             d.launch_experts = c.experts;
             d.launch_rows = c.rows;
+            d.direct = c.direct;
             basalt::prefill::PeerShare share;
             std::string err;
             if (!share.open(0, 1, d, err)) throw std::runtime_error(err);
@@ -349,7 +362,7 @@ int main() {
             ck(cudaStreamSynchronize(st), "share");
             float t = 0;
             cudaEventElapsedTime(&t, a, b);
-            if (c.experts == 8) peer_ms = t;
+            if (c.experts == 8 && !c.direct) peer_ms = t;
             cudaEventDestroy(a);
             cudaEventDestroy(b);
             // the share's rows lie expert by expert; put each at its pair
@@ -366,9 +379,10 @@ int main() {
                 first = got;
             } else {
                 const Err s = compare(got, first, rt);
-                std::printf("peer share, launches cut two ways: %lld/%lld rows bitwise, max rel %.3g\n", (long long) s.same,
-                            (long long) s.n, s.max_rel);
-                if (s.max_rel > 1e-2) ++fail;
+                std::printf("peer share (%s): %lld/%lld rows bitwise, max rel %.3g, %.3f ms\n",
+                            c.direct ? "direct P2P vs host staging" : "launches cut two ways", (long long) s.same,
+                            (long long) s.n, s.max_rel, t);
+                if (c.direct ? s.same != s.n : s.max_rel > 1e-2) ++fail;
             }
         }
 
