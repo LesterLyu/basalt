@@ -109,6 +109,8 @@ void session_release(SessionState& s);
 /// backed (-1: not elastic, every cell is).  `session_kv_grow_bytes`: the VRAM backing `cells` would add.  `map`
 /// backs at least `cells` cells in every layer (zeroed); `unmap` gives back what lies past `cells`.
 int64_t session_kv_cells(const SessionState& s);
+bool session_kv_movable(const SessionState& s);
+uint64_t session_kv_resize_scratch(const SessionState& s, int64_t cells);
 uint64_t session_kv_grow_bytes(const SessionState& s, int64_t cells);
 uint64_t session_kv_bytes_for(const SessionState& s, int64_t cells);
 /// The VRAM backing the session's elastic KV now (0 when it is not elastic).

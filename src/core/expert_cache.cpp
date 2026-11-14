@@ -230,12 +230,15 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
 }
 
 int64_t ExpertCache::slots_after_shrink(int64_t keep_bytes) const {
+    return slots_within(bytes_after_shrink(keep_bytes));
+}
+
+int64_t ExpertCache::bytes_after_shrink(int64_t keep_bytes) const {
     int64_t keep = 0;
     while (keep < mapped_segs_ && seg_off_[(size_t) keep] < keep_bytes) ++keep;
     if (malloc_slab_backed() && initial_req_ < 0) keep = std::max<int64_t>(1, keep);
-    if (keep >= mapped_segs_) return slots();
-    const int64_t kept = keep > 0 ? seg_off_[(size_t) keep - 1] + seg_size_[(size_t) keep - 1] : 0;
-    return slots_within(kept);
+    if (keep >= mapped_segs_) return mapped_bytes();
+    return keep > 0 ? seg_off_[(size_t) keep - 1] + seg_size_[(size_t) keep - 1] : 0;
 }
 
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
@@ -298,6 +301,7 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 }
 
 int64_t ExpertCache::elastic_bytes() const {
+    if (malloc_slab_backed() && tail_req_ > 0) return full_bytes() - head_end_;
     return segs_.empty() || seg_req_ > 0 ? 0 : (int64_t) reserved_ - head_end_;
 }
 
@@ -388,7 +392,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
     // Split only between complete slots and at the initial prefix.
-    if (malloc_slabs_requested_ && seg_req_ > 0 && !tail_req_) {
+    if (malloc_slabs_requested_ && seg_req_ > 0) {
         close();
         const uint64_t initial = initial_req_ < 0 ? off.back() : std::min(off.back(), (uint64_t)initial_req_);
         const uint64_t backed = *std::lower_bound(off.begin(), off.end(), initial);
@@ -402,8 +406,13 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         n_expert_ = n_expert;
         residency_.assign((size_t) (n_layers * n_expert), kNotResident);
         seg_ = seg_req_;
+        if (tail_req_ > 0) {
+            const uint64_t keep = off.back() > (uint64_t) tail_req_ + (uint64_t) seg_
+                ? off.back() - (uint64_t) tail_req_ - (uint64_t) seg_ : 0;
+            head_end_ = (int64_t) *std::lower_bound(off.begin() + 1, off.end(), keep);
+        }
         for (size_t first = 0; first < slot_bytes.size();) {
-            uint64_t limit = off[first] + (uint64_t)seg_;
+            uint64_t limit = first == 0 && tail_req_ > 0 ? (uint64_t) head_end_ : off[first] + (uint64_t)seg_;
             if (off[first] < backed) limit = std::min(limit, backed);
             const auto end = std::upper_bound(off.begin() + first + 1, off.end(), limit);
             const size_t next = std::max(first + 1, (size_t) (end - off.begin() - 1));
@@ -450,6 +459,7 @@ void ExpertCache::close() {
         cudaFree(base_);
         base_ = nullptr;
     }
+    head_end_ = 0;
     residency_.clear();
     slots_ = 0;
     live_slots_ = 0;

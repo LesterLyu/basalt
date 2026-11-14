@@ -25,6 +25,20 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 }
 }  // namespace
 
+void MtpDrafter::invalidate_kv_graphs() {
+    auto clear = [](auto& graphs) {
+        for (auto& graph : graphs) {
+            if (graph) cudaGraphExecDestroy(graph);
+            graph = nullptr;
+        }
+    };
+    clear(prefill_exec_);
+    clear(prefill_dev_exec_);
+    for (auto& row : round_exec_) clear(row);
+    for (auto& row : step_exec_) clear(row);
+    for (auto& row : cond_exec_) clear(row);
+}
+
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
     using namespace basalt::kernels;

@@ -416,6 +416,8 @@ private:
     bool move_routed_below(int64_t first, const char* why, std::string& e,
                            const std::vector<serve_loans::LentEntry>* lent_out = nullptr);
     bool kv_drain(std::string& e);
+    bool kv_rebind(basalt::core::SessionState& s, std::string& e);
+    int64_t kv_resize_reserve(const basalt::core::SessionState* target = nullptr, int64_t cells = 0) const;
     bool cache_regrow(std::string& e);
     bool peer_take(const std::vector<int32_t>& off, std::string& e);
     void peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent);

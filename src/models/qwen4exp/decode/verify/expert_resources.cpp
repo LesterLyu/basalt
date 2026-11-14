@@ -80,7 +80,9 @@ bool Verifier::dm_init(std::string& err) {
     d->vram = -1;
     if (ok && hits_.slot_off != nullptr && hits_.n_slots > 0)
         ok = cudaMalloc((void**) &d->slot_off, (size_t) hits_.n_slots * 8) == cudaSuccess &&
-             cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8, cudaMemcpyHostToDevice) == cudaSuccess;
+             (hits_.slabs || cudaMemcpy(d->slot_off, hits_.slot_off, (size_t) hits_.n_slots * 8,
+                                      cudaMemcpyHostToDevice) == cudaSuccess);
+    if (ok && hits_.slabs && !refresh_expert_addresses(err)) return false;
     if (ok)
         ok = cudaMalloc((void**) &d->ptab0, (size_t) LE * 8) == cudaSuccess &&
              cudaMemset(d->ptab0, 0, (size_t) LE * 8) == cudaSuccess;

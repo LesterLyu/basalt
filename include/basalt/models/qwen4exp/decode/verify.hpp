@@ -54,6 +54,7 @@ struct DecMoe;
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                              int64_t layer);
 
+class ExpertCache;
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
@@ -61,6 +62,7 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   // host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;   // how many (for the device copy)
     int64_t blob = 0;
+    const ExpertCache* slabs = nullptr;
 };
 
 /// --profile: the GPU's idle time between a verify window and the draft round after it, and back (from globaltimer
@@ -293,6 +295,9 @@ public:
     // No drafting here: the caller supplies the tokens of every segment.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    bool refresh_slot_pointers(std::string& err);
+    void invalidate_kv_graphs(const QsaState* states);
+    bool refresh_expert_addresses(std::string& err);
     int n_slots() const { return (int) slots_.size(); }
     /// Captures every window width's graph now (the solo windows, and the batch windows when slots exist), so no
     /// request pays a capture while others decode.  After the verifier is configured.

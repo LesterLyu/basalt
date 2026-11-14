@@ -492,9 +492,16 @@ bool QfnRuntime::park_one(int b, std::string& e) {
     ids.clear();
     imgs.clear();
     cks.clear();
-    for (int64_t j = 0; j < u.qsa_alloc; ++j)
-        if (basalt::core::KvArena* a = u.qsa_states[u.qsa_ord0 + j].kv_arena)
-            if (!a->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
+    if (basalt::core::session_kv_movable(u)) {
+        const bool unmapped = basalt::core::session_kv_unmap(u, kv_floor, e);
+        std::string bind_err;
+        if (!kv_rebind(u, bind_err)) { e = bind_err; return false; }
+        if (!unmapped) { e = "elastic KV: " + e; return false; }
+    } else {
+        for (int64_t j = 0; j < u.qsa_alloc; ++j)
+            if (basalt::core::KvArena* a = u.qsa_states[u.qsa_ord0 + j].kv_arena)
+                if (!a->unmap(kv_floor, e)) { e = "elastic KV: " + e; return false; }
+    }
     ++kv_moves;
     char where[64];
     if (to_ram) std::snprintf(where, sizeof where, "to RAM (%.0f MiB)", (double) bytes / 1048576.0);

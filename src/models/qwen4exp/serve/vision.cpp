@@ -155,8 +155,8 @@ void QfnRuntime::enc_command(const std::string& cmd) {
             for (size_t i = 0; i < host_res.size(); ++i)
                 in_ram[i] = src.resident_blob((int64_t) i / g.n_expert, (int64_t) i % g.n_expert) != nullptr;
         }
-        const int64_t floor = basalt::program::image_lend_floor(host_res, in_ram, p.cache->slots());
-        int64_t r = p.cache->slots() - std::min<int64_t>(floor, p.first);
+        const int64_t floor = basalt::program::image_lend_floor(host_res, in_ram, p.cache->loan_slots());
+        int64_t r = p.cache->loan_slots() - std::min<int64_t>(floor, p.first);
         if (batch_on()) r = std::min<int64_t>(r, kLendCapDecoding);
         return r;
     };
@@ -181,11 +181,12 @@ void QfnRuntime::enc_command(const std::string& cmd) {
     if (kv_given > 0)
         basalt::log::info("basalt serve", "image encoder: %lld KV cells given back for %lld cache slots",
                      (long long) kv_given, (long long) k);
-    const int32_t first = (int32_t) (p.cache->slots() - k);
+    const int64_t loan_end = p.cache->loan_slots();
+    const int32_t first = (int32_t) (loan_end - k);
     for (int64_t l = p.lb; l < p.le; ++l)
         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
             const size_t i = (size_t) (l * g.n_expert + ex);
-            if (host_res[i] >= first) {
+            if (host_res[i] >= first && host_res[i] < loan_end) {
                 p.lent.emplace_back((int32_t) i, host_res[i]);
                 host_res[i] = basalt::core::kNotResident;
             }

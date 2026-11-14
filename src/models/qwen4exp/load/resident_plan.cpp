@@ -191,7 +191,7 @@ int resident_plan(Context& context) {
         int64_t chunk = o.prefill_chunk;
         const int64_t k = serve_loans::plan_lend(chunk, xcache, g, ss, o.prefill_auto, auto_ceiling,
                                                 (int) auto_lend_pct);
-        if (k > 0) { lend_from = xcache.slots() - k; lend_chunk = chunk; }
+        if (k > 0) { lend_from = xcache.loan_slots() - k; lend_chunk = chunk; }
     }
     // a layer split: the stages' caches are GPU tiers the RAM copy leaves out, except each one's last slots, which the
     // prompt path lends for the chunk the first card's loan was sized for
@@ -210,8 +210,10 @@ int resident_plan(Context& context) {
     }
     // the elastic KV's tail keeps its experts in RAM too (a slot lent to the KV becomes a CPU miss read from RAM),
     // below it the prompt path's lend region as before: the RAM decides how far down that goes, as it does today
-    if (kv_tail_slots > 0)
+    if (kv_tail_slots > 0 && !xcache.malloc_slab_backed())
         lend_from = lend_from >= 0 ? std::max<int64_t>(0, lend_from - kv_tail_slots) : xcache.slots() - kv_tail_slots;
+    else if (kv_tail_slots > 0 && lend_from < 0)
+        lend_from = xcache.loan_slots();
     // ---- the start-up picks for the settings the user left out (peer-exclusive, resident RAM, pool affinity and
     // size): one pure rule over what this machine and pack have, so a given setting is never replaced.  The pool is
     // built here, with the picks.

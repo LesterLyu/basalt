@@ -16,6 +16,13 @@ The AVX2 flag supplies the CPU router warm-up's intrinsics on MSVC, where GCC's
 per-function target attribute is unavailable. Scalar half conversion uses the portable
 vector spelling of the same F16C conversion.
 
+## Qwen elastic KV in TCC
+
+When a TCC device does not expose CUDA virtual memory management, Qwen resizes
+its KV pools with ordinary CUDA allocations between inference windows. The
+expert cache can return memory in small blocks, while its contiguous region
+continues to lend workspace to prefill. Devices with VMM keep the original path.
+
 ## DeepSeek resident expert memory
 
 DeepSeek uses ordinary CUDA host registration on TCC: its expert transfers need a host

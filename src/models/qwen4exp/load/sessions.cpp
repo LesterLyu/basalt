@@ -1,5 +1,6 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "basalt/core/vmm.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -181,6 +182,11 @@ int sessions(Context& context) {
     const int64_t kv_floor = o.serve && !multi_gpu && o.kv_resident == 0 && !o.vram_elastic &&
                              o.max_context > kv_base ? kv_base : 0;
     basalt::core::qsa_set_kv_elastic(kv_floor);
+#ifdef _WIN32
+    const bool movable_kv = kv_floor > 0 && basalt::core::vmm::tcc_mode() && !basalt::core::vmm::can_map_device_memory();
+    basalt::core::qsa_set_kv_movable(movable_kv);
+    if (movable_kv) basalt::log::info("basalt generate", "elastic KV: using movable CUDA allocations in TCC mode");
+#endif
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR

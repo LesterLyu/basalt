@@ -28,6 +28,7 @@ int QfnRuntime::init_verify() {
     vh.blob = thits.blob;
     vh.slot_off = xcache.slot_offsets();   // the device plan's pointers
     vh.n_slots = xcache.slots();
+    if (xcache.malloc_slab_backed()) vh.slabs = &xcache;
 
     pair_snap = nullptr;
 

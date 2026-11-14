@@ -270,6 +270,16 @@ int cache_size(Context& context) {
             for (const auto& u : bslot_ss[0])
                 if (u.get() != &ss) add(*u);
         xcache.set_elastic_tail((int64_t) kv_tail_bytes);
+        if (kv_tail_bytes > 0 && !sized_slots.empty() && basalt::core::session_kv_movable(ss)) {
+            xcache.set_malloc_slabs(true);
+            xcache.set_segment_bytes(64ll << 20);
+        } else if (basalt::core::session_kv_movable(ss)) {
+            // No expert profile: leave enough memory for the KV to grow without evicting experts.
+            xcache.set_elastic_tail(0);
+            if (o.expert_cache > 0)
+                o.expert_cache = (int) std::max<int64_t>(0, o.expert_cache -
+                    (int64_t) ((kv_tail_bytes + cache_slot_bytes - 1) / cache_slot_bytes));
+        }
     }
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
@@ -322,7 +332,8 @@ int cache_size(Context& context) {
                 return fatal_start_error(err);
             }
             if (!auto_cache || attempt - failed >= 6) break;
-            cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
+            if (!xcache.malloc_slab_backed())
+                cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);

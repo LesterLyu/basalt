@@ -96,6 +96,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     d_qsegs_ = d_qrows_ + basalt::kernels::kQsaSegMaxRows;
     d_ple_slots_ = (float**) ((uint8_t*) d + b3);
     ple_work_ = (float*) ((uint8_t*) d + b4);
+    slots_ = slots;
     {   // static per-slot pointers: the PLE histories and, per QSA layer, the slots' caches and indexer state
         std::vector<float*> ph((size_t) S);
         for (int64_t i = 0; i < S; ++i) ph[(size_t) i] = slots[(size_t) i]->ple_hist;
@@ -106,23 +107,11 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
             if (!is_qsa_layer(*g_, l)) continue;
             int64_t qi = 0;
             for (int64_t m = 0; m < l; ++m) qi += is_qsa_layer(*g_, m) ? 1 : 0;
-            std::vector<QsaSegSlot> hs((size_t) S);
-            for (int64_t i = 0; i < S; ++i) {
-                const QsaState& st = slots[(size_t) i]->qsa_states[qi];
-                QsaSegSlot& e = hs[(size_t) i];
-                e.k_pool = st.k_pool; e.v_pool = st.v_pool; e.k_q = st.k_q; e.v_q = st.v_q;
-                e.k_scale = st.k_scale; e.v_scale = st.v_scale; e.page_table = st.page_table; e.host = st.host;
-                if (st.kv_mode == 1) e.map = st.map;   // a resident slot keeps the null map the resolve skips
-                e.tail = st.idx_tail; e.dead = st.idx_dead; e.pooled = st.idx_pooled;
-                e.tail_snap = tail_snap_b_ + ((size_t) i * nQ + qi) * TS;
-                e.block_pos = st.idx_block_pos; e.max_cells = (int32_t) st.max_cells;
-            }
-            cudaMemcpy(dev, hs.data(), (size_t) S * sizeof(QsaSegSlot), cudaMemcpyHostToDevice);
             d_qslots_[(size_t) qi] = dev;
             dev += S;
         }
     }
-    slots_ = slots;
+    if (!refresh_slot_pointers(err)) return false;
     batch_dm_ = dm_ != nullptr;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
     basalt::log::info("basalt verify", "batch windows of up to %lld sequences (layers [%lld, %lld))%s", (long long) S,
@@ -131,6 +120,51 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         basalt::log::info("basalt verify", "batch windows: a layer with %d+ CPU misses sends a share of them over PCIe to "
                           "CUDA0", dm_->stage_min);
     return true;
+}
+
+bool Verifier::refresh_slot_pointers(std::string& err) {
+    using namespace basalt::kernels;
+    const int64_t nQ = g_->n_qsa_layers(), TS = (shapes_of(*g_).idx_block - 1) * g_->idx_key_dim;
+    std::vector<QsaSegSlot> rows(slots_.size());
+    for (size_t qi = 0; qi < d_qslots_.size(); ++qi) {
+        if (!d_qslots_[qi]) continue;
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            const QsaState& st = slots_[i]->qsa_states[qi];
+            QsaSegSlot& e = rows[i];
+            e = {};
+            e.k_pool = st.k_pool; e.v_pool = st.v_pool; e.k_q = st.k_q; e.v_q = st.v_q;
+            e.k_scale = st.k_scale; e.v_scale = st.v_scale; e.page_table = st.page_table; e.host = st.host;
+            if (st.kv_mode == 1) e.map = st.map;
+            e.tail = st.idx_tail; e.dead = st.idx_dead; e.pooled = st.idx_pooled;
+            e.tail_snap = tail_snap_b_ + (i * nQ + qi) * TS;
+            e.block_pos = st.idx_block_pos; e.max_cells = (int32_t) st.max_cells;
+        }
+        if (cudaMemcpy(d_qslots_[qi], rows.data(), rows.size() * sizeof(rows[0]), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "verify: updating the batch K/V pointers failed";
+            return false;
+        }
+    }
+    if (!slots_.empty() && cudaStreamSynchronize(cudaStreamLegacy) != cudaSuccess) {
+        err = "verify: synchronizing the batch K/V pointers failed";
+        return false;
+    }
+    return true;
+}
+
+void Verifier::invalidate_kv_graphs(const QsaState* states) {
+    auto destroy = [](cudaGraphExec_t& graph) {
+        if (graph) cudaGraphExecDestroy(graph);
+        graph = nullptr;
+    };
+    auto clear = [&](auto& a, auto& b, cudaGraphExec_t& commit) {
+        for (auto& graph : a) destroy(graph);
+        for (auto& graph : b) destroy(graph);
+        destroy(commit);
+    };
+    if (ss_ && ss_->qsa_states == states) clear(exec_, exec_nr_, commit_exec_);
+    for (auto& [session, graphs] : solo_sets_)
+        if (session->qsa_states == states) clear(graphs.exec, graphs.exec_nr, graphs.commit);
+    // Batch graphs capture the device slot table, not the individual K/V addresses.
 }
 
 bool Verifier::bind_session(SessionState* s, std::string& err) {

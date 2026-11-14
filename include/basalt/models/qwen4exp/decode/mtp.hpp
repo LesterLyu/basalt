@@ -80,6 +80,7 @@ public:
     /// Captures every conditional draft graph (each draft-head tier, each window width) now rather than at its first
     /// use. After `bind` and `set_max_drafts`.
     bool prewarm(std::string& err);
+    void invalidate_kv_graphs();
     /// The cumulative draft rule's threshold for the next draft() chain (default: the rule's own): the device stops the
     /// chain where the rule fails with it.
     void set_cum_th(float th) { cum_th_ = th; }

@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace basalt::core {
@@ -25,7 +27,9 @@ public:
     /// indexer's spare rows).  Nothing is backed yet.  False with `err` when the driver offers no virtual memory
     /// management.
     bool open(const std::vector<uint64_t>& page_bytes, int64_t pages, int64_t page_cells, std::string& err,
-              const std::vector<uint64_t>& tail_bytes = {});
+              const std::vector<uint64_t>& tail_bytes = {}, bool movable = false);
+    /// The CUDA allocation backend rebinds the layer's pool pointers when it moves.
+    void on_move(std::function<void()> bind) { bind_ = std::move(bind); }
     /// Array `i` is a table, not a cache: every byte `map` backs is filled from `bytes` (from the same offset)
     /// instead of zeroed, as far as `bytes` reaches.
     void set_contents(size_t i, std::vector<uint8_t> bytes);
@@ -35,6 +39,7 @@ public:
     void set_extent_cells(int64_t cells) { extent_cells_ = std::max<int64_t>(cells, 0); }
     void close();
     bool valid() const { return !arrays_.empty(); }
+    bool movable() const { return movable_; }
 
     uint8_t* array(size_t i) const { return i < arrays_.size() ? arrays_[i].base : nullptr; }
     int64_t page_cells() const { return page_cells_; }
@@ -67,6 +72,8 @@ private:
         uint64_t mapped() const { return extents.empty() ? 0 : extents.back().off + extents.back().bytes; }
     };
     uint64_t need(const Array& a, int64_t cells) const;
+    uint64_t packed_bytes(int64_t cells) const;
+    bool resize(int64_t cells, std::string& err);
     void recount();
     std::vector<Array> arrays_;
     int64_t pages_ = 0;
@@ -74,6 +81,9 @@ private:
     int64_t cells_ = 0;
     int64_t extent_cells_ = 0;
     uint64_t gran_ = 0;
+    bool movable_ = false;
+    uint8_t* packed_ = nullptr;
+    std::function<void()> bind_;
 };
 
 }  // namespace basalt::core

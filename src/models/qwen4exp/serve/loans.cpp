@@ -16,9 +16,9 @@ namespace basalt::models::qwen4exp::serve {
 
 int64_t cache_slots_for(const basalt::core::ExpertCache& xc, uint64_t need) {
     if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
+        const int64_t slots = xc.loan_slots(), bytes = xc.bytes_of(slots);
         int64_t k = 0;
-        while (k < xc.slots() &&
-               (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
+        while (k < slots && (uint64_t) (bytes - (int64_t) xc.slot_offsets()[slots - k]) < need) ++k;
         return k;
     }
     const int64_t blob = (int64_t) basalt::kernels::cpu::expert_layout().max_blob;
@@ -56,14 +56,14 @@ int64_t plan_lend(int64_t& chunk, const basalt::core::ExpertCache& xc, const bas
 
         const int64_t c = basalt::models::qwen4exp::engine_local::biggest_chunk(auto_ceiling, [&](int64_t t) -> bool {
             const int64_t k = slots_for(t);
-            return k + 128 <= xc.slots() && k * 100 <= auto_lend_pct * xc.slots();
+            return k + 128 <= xc.loan_slots() && k * 100 <= auto_lend_pct * xc.loan_slots();
         });
         if (c > 0) { chunk = c; return slots_for(c); }
         return 0;
     }
     for (int64_t c = chunk; c >= 256; c /= 2) {
         const int64_t k = slots_for(c);
-        if (k + 128 <= xc.slots()) { chunk = c; return k; }
+        if (k + 128 <= xc.loan_slots()) { chunk = c; return k; }
     }
     return 0;
 }

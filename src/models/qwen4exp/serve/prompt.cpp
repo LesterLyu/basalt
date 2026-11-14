@@ -10,8 +10,8 @@ int64_t QfnRuntime::part_slots(const PfPart& p, int64_t c) {
 
 uint64_t QfnRuntime::part_bytes(const PfPart& p, int32_t first) {
     basalt::core::ExpertCache& xc = *p.cache;
-    return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
-                             : (uint64_t) (xc.slots() - first) *
+    return xc.slot_offsets() ? (uint64_t) (xc.bytes_of(xc.loan_slots()) - (int64_t) xc.slot_offsets()[first])
+                             : (uint64_t) (xc.loan_slots() - first) *
                                    (uint64_t) basalt::kernels::cpu::expert_layout().max_blob;
 }
 
@@ -149,7 +149,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
         // the RAM-backed slots are the cache's last ones: those still live after the KV took its share
         if (runtime_.src.complement_ready())
             loan_lim = std::min<int64_t>(loan_lim, std::max<int64_t>(0, runtime_.src.resident_lent_slots() -
-                                                                         (runtime_.xcache.full_slots() - runtime_.xcache.slots())));
+                                                                         (runtime_.xcache.full_slots() - runtime_.xcache.loan_slots())));
     }
     if (loan_lim != std::numeric_limits<int64_t>::max() && !runtime_.pf_parts.empty() && runtime_.pf_parts[0].first >= 0) {
         const int64_t lc = std::max<int64_t>(256, engine_local::biggest_chunk(cap, [&](int64_t t) {
@@ -175,7 +175,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     const int ring_now = (int) basalt::prefill::Prefill::ring_slots_for(want);
     for (PfPart& p : runtime_.pf_parts) {
         if (p.first < 0) continue;
-        const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - runtime_.part_slots(p, want)));
+        const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->loan_slots() - runtime_.part_slots(p, want)));
         std::vector<serve_loans::LentEntry> again;   // taken again: their slots hold no expert
         if (!p.lent.empty()) {
             if (want <= p.lent_chunk && p.sp->ring_depth() == ring_now && !ov_copied &&
@@ -209,7 +209,7 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
         for (int64_t l = p.lb; l < p.le; ++l)              // this participant's layers only
             for (int64_t ex = 0; ex < runtime_.g.n_expert; ++ex) {
                 const size_t i = (size_t) (l * runtime_.g.n_expert + ex);
-                if (runtime_.host_res[i] >= first) {
+                if (runtime_.host_res[i] >= first && runtime_.host_res[i] < p.cache->loan_slots()) {
                     p.lent.emplace_back((int32_t) i, runtime_.host_res[i]);
                     runtime_.host_res[i] = basalt::core::kNotResident;
                     any = true;
@@ -293,8 +293,8 @@ int QfnRuntime::init_prompt() {
         // (no split) this reduces to plan_lend exactly, so the single-GPU loan is unchanged from main.
         auto fits_one = [&](const PfPart& p, int64_t c, bool cap) -> bool {
             const int64_t k = part_slots(p, c);
-            if (k <= 0 || k + 128 > p.cache->slots()) return false;
-            return !(cap && k * 100 > auto_lend_pct * p.cache->slots());
+            if (k <= 0 || k + 128 > p.cache->loan_slots()) return false;
+            return !(cap && k * 100 > auto_lend_pct * p.cache->loan_slots());
         };
         // `only`: CUDA0's cache alone (what one GPU would choose, for the log below); null: every one
         auto fits = [&](int64_t c, bool cap, const PfPart* only = nullptr) -> bool {
@@ -349,7 +349,7 @@ int QfnRuntime::init_prompt() {
                                      "every expert cache", (long long) o.prefill_chunk, (long long) chunk);
             o.prefill_chunk = chunk;
             for (PfPart& p : pf_parts) {
-                p.first = (int32_t) (p.cache->slots() - part_slots(p, chunk));
+                p.first = (int32_t) (p.cache->loan_slots() - part_slots(p, chunk));
                 p.first_now = p.first;
             }
             // a split stage whose card still has room for the chunk's buffers (its cache already holds every
@@ -398,7 +398,7 @@ int QfnRuntime::init_prompt() {
     if (any_loan) {
         if (borrow != nullptr)
             basalt::log::info("basalt serve", "the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)",
-                         (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
+                         (long long) (xcache.loan_slots() - lend_first), (double) borrow_bytes / 1073741824.0);
         for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
             if (pf_parts[i].first >= 0) basalt::log::info("basalt serve", "  CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)",
                          pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),
@@ -467,7 +467,7 @@ int QfnRuntime::init_prompt() {
             if (any_loan) {                  // smaller loans for the smaller chunk
                 for (PfPart& p : pf_parts)
                     if (p.first >= 0) {
-                        p.first = (int32_t) (p.cache->slots() - part_slots(p, next));
+                        p.first = (int32_t) (p.cache->loan_slots() - part_slots(p, next));
                         p.first_now = p.first;
                     }
                 lend_first = pf_parts[0].first;

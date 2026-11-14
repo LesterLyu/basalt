@@ -2,6 +2,7 @@
 // back and keeps the cells below the cut exactly as they were; the addresses never move.  Needs a CUDA device with
 // virtual memory management (exits 77 without one).
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
+#include "basalt/core/vmm.hpp"
 
 #include <cuda_runtime.h>
 
@@ -29,6 +30,42 @@ bool all(const uint8_t* p, uint64_t bytes, uint8_t v) {
         if (x != v) return false;
     return true;
 }
+
+#ifdef _WIN32
+int test_movable() {
+    constexpr int64_t page = 64, step = 4096;
+    constexpr uint64_t codes = 32768, key = 512;
+    basalt::core::KvArena a;
+    std::string err;
+    if (!a.open({codes, key}, 1024, page, err, {0, 2 * key}, true)) return fail("open movable", err);
+    a.set_extent_cells(step);
+    const uint8_t* bound = nullptr;
+    a.on_move([&] { bound = a.array(0); });
+    if (!a.map(step, err) || bound != a.array(0)) return fail("allocate movable", err);
+    if (cudaMemset(a.array(0), 0xa5, step / page * codes) != cudaSuccess ||
+        cudaMemset(a.array(1), 0x5a, (step / page + 2) * key) != cudaSuccess)
+        return fail("initialize movable");
+    const uint8_t* old = bound;
+    const auto base = a.mapped_bytes();
+    if (!a.map(step + 1, err) || a.cells() != 2 * step || bound == old ||
+        a.mapped_bytes() != a.bytes_for(2 * step) || a.mapped_bytes() <= base)
+        return fail("grow movable", err);
+    if (!all(bound, step / page * codes, 0xa5) ||
+        !all(bound + step / page * codes, step / page * codes, 0) ||
+        !all(a.array(1), (step / page + 2) * key, 0x5a))
+        return fail("copy movable prefix and tail");
+    const size_t grown_free = free_vram();
+    const uint64_t growth = a.mapped_bytes() - base;
+    if (!a.unmap(step, err) || a.mapped_bytes() != base || !all(bound, step / page * codes, 0xa5))
+        return fail("shrink movable", err);
+    if (free_vram() + (4u << 20) < grown_free + growth) return fail("movable VRAM not given back");
+    if (!a.map(2 * step, err) || !all(bound + step / page * codes, step / page * codes, 0))
+        return fail("regrow movable", err);
+    if (!a.unmap(0, err) || a.mapped_bytes() != 0 || bound != nullptr) return fail("release movable", err);
+    std::puts("movable KV: preserved prefix, zeroed new pages, rebound pointers, and released VRAM");
+    return 0;
+}
+#endif
 }  // namespace
 
 int main() {
@@ -37,6 +74,12 @@ int main() {
         std::puts("no CUDA device: skipped");
         return 77;
     }
+#ifdef _WIN32
+    if (basalt::core::vmm::tcc_mode()) {
+        const int status = test_movable();
+        if (status || !basalt::core::vmm::can_map_device_memory()) return status;
+    }
+#endif
     // INT8 geometry of one QSA layer: per page of 64 cells, 4 KV heads x 128 codes (K, V) and 2 scales each (K, V)
     constexpr int64_t kPage = 64, kPages = 4096;
     const std::vector<uint64_t> page_bytes = {kPage * 4 * 128, kPage * 4 * 128, kPage * 4 * 2 * 2, kPage * 4 * 2 * 2};
