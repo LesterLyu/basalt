@@ -97,10 +97,16 @@ int main() {
     // the staged groups count from the pairs a chunk of this prompt holds
     CHECK(chunk_bytes(d, 1024, 554) == workspace_bytes(d, 1024));
     CHECK(chunk_bytes(d, 1024, 5000) == workspace_bytes(d, 1024));
-    CHECK(chunk_bytes(d, 16384, 20000) == workspace_bytes(d, 16384) + ahead_bytes(d));
+    CHECK(chunk_bytes(d, 16384, 20000) == workspace_bytes(d, 16384) + ahead_bytes(d, 16384));
+    Dims reused = d;
+    reused.reuse_stage = true;
+    CHECK(ahead_bytes(reused, 16384) == 2 * d.expert_blob_bytes * kStageExperts + 4 * (16384 * d.n_used + kStageExperts + 1));
+    const uint64_t w12288 = chunk_bytes(reused, 12288, kLong) + kMargin;
+    CHECK(plan_chunk(reused, w12288, kMargin, kLong, kMaxChunk, kMinChunk, true).chunk == 12288);
+    CHECK(plan_chunk(reused, w12288 - 1, kMargin, kLong, kMaxChunk, kMinChunk, true).chunk <= 8192);
     // a chunk that fits only without its staged groups does not fit
     const int64_t pairs_chunk = (kAheadPairs + d.n_used - 1) / d.n_used;
-    CHECK(chunk_bytes(d, (int) pairs_chunk, kLong) == workspace_bytes(d, (int) pairs_chunk) + ahead_bytes(d));
+    CHECK(chunk_bytes(d, (int) pairs_chunk, kLong) == workspace_bytes(d, (int) pairs_chunk) + ahead_bytes(d, (int) pairs_chunk));
     CHECK(plan_chunk(d, workspace_bytes(d, 16384) + kMargin, kMargin, kLong).chunk < 16384);
     // the batched attention is a prompt workspace: it counts in every chunk, so the room a tier leaves beside a short
     // read (the short chunk's workspaces and kShortMargin) holds it, and a chunk is never planned without it
@@ -117,7 +123,7 @@ int main() {
     // Replacement prompts use the host read-ahead ring and one device blob, not six device groups.
     Dims overlay = d;
     overlay.replacement_blob_bytes = 12ull << 20;
-    CHECK(ahead_bytes(overlay) == 0);
+    CHECK(ahead_bytes(overlay, 16384) == 0);
     CHECK(chunk_bytes(overlay, 16384, kLong) == workspace_bytes(d, 16384) + overlay.replacement_blob_bytes);
     CHECK(plan_chunk(overlay, chunk_bytes(overlay, 16384, kLong) + kMargin, kMargin, kLong).chunk == 16384);
     CHECK(plan_chunk(overlay, 24 * GiB, kMargin, kLong, 8192).chunk == 8192);

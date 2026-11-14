@@ -42,6 +42,6 @@ public:
 };
 
 /// `ops` and `stream` (a cudaStream_t) outlive the result.
-std::unique_ptr<Prefill> make_prefill(DsModel& model, LayerOps& ops, void* stream, int max_chunk, std::string& err);
+std::unique_ptr<Prefill> make_prefill(DsModel& model, LayerOps& ops, void* stream, int max_chunk, bool ahead, std::string& err);
 
 }  // namespace basalt::models::deepseek41
