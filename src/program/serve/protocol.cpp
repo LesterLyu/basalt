@@ -253,9 +253,6 @@ int Runtime::init_protocol() {
                 take_prompt_ids(l);
                 continue;
             }
-            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0 ||
-                l.rfind("PROMPT ", 0) == 0) {
-                const bool prompt = l.rfind("PROMPT ", 0) == 0;
             if (l.rfind("HOTSPOTS ", 0) == 0) {
                 // Host counters only: no queued GPU work is drained or paused for this diagnostic.
                 std::istringstream args(l.substr(9));
@@ -270,7 +267,9 @@ int Runtime::init_protocol() {
                 std::fflush(stdout);
                 continue;
             }
-            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0) {
+            if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0 ||
+                l.rfind("PROMPT ", 0) == 0) {
+                const bool prompt = l.rfind("PROMPT ", 0) == 0;
                 std::string rewritten;
                 const bool framed = take_text(l, rewritten);
                 if (prompt && !rewritten.empty()) {   // refused: said at once, like the answer

@@ -454,10 +454,11 @@ class ToolsWithStructuredOutput(Server):
                         self.assertEqual((code, result["error"]["code"]), (502, "structured_output_failed"))
 
     def test_cut_off_tool_call_stays_incomplete(self):
-        self.scripts(CALL)
-        prefix = CALL[:CALL.index("cat a.txt") + 3]
+        call = CALL.split("</think>", 1)[1].lstrip()
+        self.scripts(call)
+        prefix = call[:call.index("cat a.txt") + 3]
         code, result = self.post({"model": "basalt", "input": "read the file", "tools": TOOLS,
-                                 "text": {"format": self.fmt}, "stream": True,
+                                 "text": {"format": self.fmt}, "stream": True, "reasoning": {"effort": "none"},
                                  "max_output_tokens": len(self.tok.encode(prefix, parse_special=True))})
         self.assertEqual(code, 200, result)
         self.assertEqual(result[-1]["type"], "response.incomplete")

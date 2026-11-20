@@ -1451,7 +1451,7 @@ class ProcessEngine:
                     self._note_first_reused(first, last0)
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     if not cont and cancel.is_set():
-                        self._solo_kept(slot, prompt, out[admit0:] + pending)
+                        self._solo_kept(slot, len(prompt), out[admit0:] + pending)
                     phase = "slot" if cont else "none"
                     while pending:
                         t = pending.pop(0)
@@ -1542,7 +1542,7 @@ class ProcessEngine:
                         phase = "slot"
                 if drained and phase != "slot":
                     if phase == "admit" and slot is not None:
-                        self._solo_kept(slot, prompt, out[admit0:])
+                        self._solo_kept(slot, len(prompt), out[admit0:])
                     self._carry_run(carry, first, last0, True)     # a request that ran in earlier runs too
             except EngineDied:
                 pass
@@ -1583,8 +1583,10 @@ class ProcessEngine:
         the last) there."""
         if slot is None:
             return
-        self._hold(slot, run_size + len(gen) - 1 if gen else min(run_size, max(0, (self.last or {}).get("reused", 0) + (self.last or {}).get("prompt_read", 0)))
-                   if (self.last or {}).get("finish") == "cancel" else 0)
+        kept = run_size + len(gen) - 1 if gen else 0
+        if not gen and self.last and self.last.get("finish") == "cancel":
+            kept = min(run_size, (self.last.get("reused") or 0) + (self.last.get("prompt_read") or 0))
+        self._hold(slot, kept)
         self.slot_used[slot] = time.time()
 
     @staticmethod

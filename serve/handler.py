@@ -870,6 +870,7 @@ def make_handler(target: Service | Router):
                 done = None
                 with closing(self.svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
                                           session=self._session_id(req), live=self.live)) as inference:
+                    for kind, x in inference:
                         if kind == "event":
                             out = asm.feed(x)
                             if out:

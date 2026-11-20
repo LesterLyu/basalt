@@ -1,4 +1,5 @@
 """Live route counters do not consume the generation channel or wait for the service FIFO."""
+import http.client
 import io
 import json
 import queue
@@ -7,7 +8,7 @@ from unittest import mock
 
 from serve.engine.errors import EngineDied
 from serve.engine.process import ProcessEngine
-from serve.tests import test_vram as vram_fixture
+from serve.tests.test_responses import Server
 
 
 class Protocol(unittest.TestCase):
@@ -18,7 +19,7 @@ class Protocol(unittest.TestCase):
         e.proc.stdin = io.StringIO()
         e.ended, e.gen = False, 1
         e.info["expert_hotspots_protocol"] = 1
-        e.lines, e.slot_q = queue.Queue(), [queue.Queue()]
+        e.lines, e.slot_q, e.prompt_q = queue.Queue(), [queue.Queue()], queue.Queue()
         return e
 
     def test_isolated_sequence_and_no_generation_consumption(self):
@@ -57,12 +58,20 @@ class Protocol(unittest.TestCase):
             e.expert_hotspots()
 
 
-class Route(unittest.TestCase):
-    tearDown = vram_fixture.Route.tearDown
-    request = vram_fixture.Route.request
+class Route(Server):
+    def request(self, path, body=None, headers=None):
+        if body is not None:
+            return self.post(body, path, headers)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            conn.close()
 
     def setUp(self):
-        vram_fixture.Route.setUp(self)
+        super().setUp()
         self.engine.expert_hotspots = mock.Mock(return_value={"supported": True, "recording": True})
 
     def test_live_counter_controls(self):
