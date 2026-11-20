@@ -339,6 +339,7 @@ class MemoryFrames(unittest.TestCase):
         engine.log = None
         engine.lines = queue.Queue()
         engine.slot_q = [queue.Queue()]
+        engine.prompt_q = queue.Queue()
         engine.proc = mock.Mock()
         engine.proc.stdout = iter(['MEMORY {"gpus":{"0":{"experts":100}},"host":{}}\n',
                                    'BT 0 42\n', 'MEMORY {"gpus":{"0":{"experts":90}},"host":{}}\n',
@@ -366,8 +367,8 @@ class PerGpu(unittest.TestCase):
         engine = MockEngine(tok, "ok")
         allocations = {"resident_experts": 80, "pinned_experts": 40, "expert_homes": 12,
                        "expert_prefetch": 4, "expert_staging": 2, "prefill_activations": 1,
-                       "embedding_workspace": 3, "engram_workspace": 5, "engram_reader": 6,
-                       "vision_workspace": 7, "decode_workspace": 8}
+                       "embedding_workspace": 3, "embedding_weights": 9, "engram_workspace": 5, "engram_reader": 6,
+                       "vision_workspace": 7, "vision_weights": 10, "decode_workspace": 8}
         engine.ram_usage = lambda: allocations
         svc = Service(engine, tok, ChatTemplate.from_file(TEMPLATE))
         svc.telemetry = mock.Mock()
@@ -402,7 +403,7 @@ class PerGpu(unittest.TestCase):
     def test_other_apps_partitions_only_reconciled_vram(self):
         tok = ByteTokenizer()
         engine = MockEngine(tok, "ok", max_context=16384)
-        engine.vram_usage = lambda: {0: {"mmq_buffers": 30, "dense_prefill": 20}, 1: {"expert_helper": 80}}
+        engine.vram_usage = lambda: {0: {"mmq_buffers": 20, "dense_prefill": 20, "dfly": 10}, 1: {"expert_helper": 80}}
         svc = Service(engine, tok, ChatTemplate.from_file(TEMPLATE))
         svc.engine_gpu_indices = [0, 1]
         svc.telemetry = mock.Mock()
@@ -411,7 +412,7 @@ class PerGpu(unittest.TestCase):
                              {"index": 1, "mem_used": 100}]}, "history": {}, "static": {},
             "gpu_other_apps": {0: 15, 1: 30}}
         gpu0, gpu1 = [g["vram_breakdown"] for g in svc.metrics()["hardware"]["gpus"]]
-        self.assertEqual(gpu0["components"], {"mmq_buffers": 30, "dense_prefill": 20,
+        self.assertEqual(gpu0["components"], {"mmq_buffers": 20, "dense_prefill": 20, "dfly": 10,
                                               "system_reserved": 10, "other_apps": 15})
         self.assertEqual(gpu0["unattributed"], 25)
         self.assertEqual(gpu1, {"components": {"expert_helper": 80, "other_apps": 20}, "unattributed": 0})

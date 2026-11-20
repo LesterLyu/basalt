@@ -95,6 +95,7 @@ static_assert(sizeof(WindowPut) <= 4 * kPutWords, "a window's plan fits put_word
 // slots lent to them).
 struct Bufs {
     int rows = 0, arows = 0, steps = 0;   // the chunk's rows, the rows of an attention step, and the steps of a chunk
+    size_t device_bytes = 0, host_bytes = 0, mmq_bytes = 0;
     std::vector<void*> dev, host;
     float *X = nullptr, *Xn = nullptr, *coef = nullptr, *hcws = nullptr, *e = nullptr, *cur = nullptr, *xn = nullptr, *attn = nullptr,
           *attn_raw = nullptr, *mlp = nullptr, *mlp2 = nullptr, *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr,
@@ -117,6 +118,7 @@ struct Bufs {
 // syncs its stream before it returns, so one set serves every session; only a conversation's own state is per session.
 struct Scratch {
     Bufs dec;
+    size_t device_bytes = 0, host_bytes = 0, prefill_bytes = 0, mmq_bytes = 0;
     std::vector<void*> dev, pinned;
     float *iscore = nullptr, *ex_rows = nullptr;
     int32_t *iidx_meta = nullptr, *pos_d = nullptr, *pos_h = nullptr, *heads_ids = nullptr, *heads_bounds = nullptr, *bounds_tab = nullptr;
@@ -139,6 +141,35 @@ struct Scratch {
 class Session final : public model::BatchSession {
 public:
     explicit Session(Hy4Model& m) : m_(m), g_(m.geo()) {}
+    void memory_usage(core::MemoryUsage& usage) const override {
+        uint64_t kv = kv_state_bytes_;
+        for (const auto& a : ea_) if (a) kv += a->backed();
+        for (const auto& a : pea_) if (a) kv += a->backed();
+        const int device = m_.device();
+        usage.device(device, "kv_state", kv);
+        size_t scratch = device_bytes_ - kv_state_bytes_;
+        size_t mmq = big_.mmq_bytes + mmq_.allocated_bytes();
+        size_t prefill = big_.device_bytes + (ring_ ? expert_ring_bytes() : 0);
+        size_t host = host_bytes_ + (hist_.capacity() + picks_.capacity()) * sizeof(int32_t);
+        if (sc_ && usage.claim(sc_.get())) {
+            scratch += sc_->device_bytes - sc_->prefill_bytes - sc_->mmq_bytes + sc_->dec.device_bytes;
+            mmq += sc_->mmq_bytes + sc_->dec.mmq_bytes;
+            prefill += sc_->prefill_bytes;
+            host += sc_->host_bytes + sc_->dec.host_bytes;
+        }
+        usage.device(device, "scratch", scratch);
+        usage.device(device, "mmq_buffers", mmq);
+        usage.device(device, "long_prefill", prefill);
+        usage.device(device, "sampler", d_hist_len_ * sizeof(int32_t));
+        dfly_.memory_usage(usage, device);
+
+        usage.host["decode_workspace"] += host;
+        usage.host["prefill_activations"] += big_.host_bytes + cpu_prefill_bytes_;
+        uint64_t engram = lookup_host_.capacity() * sizeof(float);
+        for (const auto& p : pf_) engram += p.raw.capacity() + p.valid.capacity() * sizeof(float);
+        usage.host["engram_workspace"] += engram;
+    }
+
     ~Session() override {
         settle_early();
         big_.release();
@@ -183,8 +214,12 @@ public:
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
         auto pin = [&](size_t n) {
             void* p = nullptr;
-            if (cudaMallocHost(&p, n * 4) != cudaSuccess) ok = false;
-            else pinned_.push_back(p);
+            const size_t bytes = n * 4;
+            if (cudaMallocHost(&p, bytes) != cudaSuccess) ok = false;
+            else {
+                pinned_.push_back(p);
+                host_bytes_ += bytes;
+            }
             return (float*) p;
         };
         fin_ = f(kMaxWindow * E);
@@ -206,6 +241,7 @@ public:
             else {
                 pinned_.push_back(h_ids_);
                 pinned_.push_back(h_words_);
+                host_bytes_ += (size_t) kLookupK * 4 + 64;
                 h_words_[0] = h_words_[1] = 0;
                 if (cudaHostGetDevicePointer((void**) &d_ids_, h_ids_, 0) != cudaSuccess ||
                     cudaHostGetDevicePointer((void**) &d_words_, h_words_, 0) != cudaSuccess)
@@ -214,9 +250,11 @@ public:
             if (cudaHostAlloc((void**) &stage_h_, kStageInts * 4, kMapped) != cudaSuccess) ok = false;
             else {
                 pinned_.push_back(stage_h_);
+                host_bytes_ += kStageInts * 4;
                 if (cudaHostGetDevicePointer((void**) &stage_d_, stage_h_, 0) != cudaSuccess) ok = false;
             }
         }
+        const size_t before_kv = device_bytes_;
         rope_dev_ = (int32_t*) alloc((size_t) ctx * 12, ok);   // [vision] the 3-D rotary position of every cell
         stride_ = m_.expert_stride();
         for (Stage& b : stage_)
@@ -256,6 +294,7 @@ public:
             err = "out of device memory for the session";
             return false;
         }
+        kv_state_bytes_ = device_bytes_ - before_kv;
         if (!ensure_positions(kv_base(), err)) return false;   // the elastic KV's base; the rest comes from the expert tier
         use(sc_->dec);
         // DFLY HOOK: the drafter's tap and scratch (nothing without a drafter in the pack)
@@ -270,6 +309,7 @@ public:
         const int64_t ctx = m_.context();
         namespace mmq = basalt::prefill::mmq;
         bool ok = true;
+        const size_t before = device_bytes_;
         alloc_to_ = &sc.dev;
         pin_to_ = &sc.pinned;
         auto f = [&](int64_t n) { return (float*) alloc((size_t) n * 4, ok); };
@@ -277,8 +317,10 @@ public:
         sc.iscore = f(pools * kIdxRows);
         sc.iidx_meta = (int32_t*) alloc((size_t) kIdxRows * 3 * 4, ok);
         sc.pos_d = (int32_t*) alloc(16, ok);
-        if (ok && cudaMallocHost((void**) &sc.pos_h, 16) == cudaSuccess) sc.pinned.push_back(sc.pos_h);
-        else ok = false;
+        if (ok && cudaMallocHost((void**) &sc.pos_h, 16) == cudaSuccess) {
+            sc.pinned.push_back(sc.pos_h);
+            sc.host_bytes += 16;
+        } else ok = false;
         size_t attw = 0;   // the chunked attention's workspace: the largest a layer needs; zero from the start
         for (int l = 0; l < g_.n_layers; ++l) attw = std::max(attw, mla_attend_work_bytes(g_.heads[(size_t) l], max_cells(l), kMaxWindow));
         sc.attw = alloc(attw, ok);
@@ -292,20 +334,28 @@ public:
         sc.ex_plan2 = alloc(sizeof(WindowPlan), ok);
         // the prompt path's experts: two staged launches (blobs, rows and bounds), the pairs' outputs, and the quantised rows
         const size_t stride = m_.expert_stride();
+        const size_t before_staging = device_bytes_;
         for (Scratch::Staged& b : sc.stage) {
             b.blobs = (uint8_t*) alloc(stride * kStageExperts, ok);
             b.tok = (int32_t*) alloc((size_t) kLaunchRows * 4, ok);
             b.bounds = (int32_t*) alloc((kStageExperts + 1) * 4, ok);
         }
+        sc.prefill_bytes = device_bytes_ - before_staging;
+        const size_t before_mmq = device_bytes_;
         sc.xq1 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_latent), ok);
         sc.xq2 = alloc(mmq::q8_bytes(kLaunchRows, g_.n_ff_exp), ok);
+        sc.mmq_bytes = device_bytes_ - before_mmq;
         sc.heads_ids = (int32_t*) alloc((size_t) max_heads_ * kAttRows * 4, ok);
         sc.heads_bounds = (int32_t*) alloc((size_t) (max_heads_ + 1) * 4, ok);
         sc.rowptr_d = (const float**) alloc(kLookupK * sizeof(void*), ok);
         {
             void* q = nullptr;
-            if (ok && cudaMallocHost(&q, kLookupK * 2 * 4) == cudaSuccess) { sc.pinned.push_back(q); sc.h_rowptr = (const float**) q; }
-            else ok = false;
+            constexpr size_t bytes = kLookupK * sizeof(void*);
+            if (ok && cudaMallocHost(&q, bytes) == cudaSuccess) {
+                sc.pinned.push_back(q);
+                sc.h_rowptr = (const float**) q;
+                sc.host_bytes += bytes;
+            } else ok = false;
         }
         // MMQ's row bounds {0, n} of a product of n rows, for every n of an attention step
         sc.bounds_tab = (int32_t*) alloc((size_t) 2 * (kAttRows + 1) * 4, ok);
@@ -315,7 +365,12 @@ public:
             cudaMemcpy(sc.bounds_tab, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
         }
         if (cudaHostAlloc(&sc.h_plan, sizeof(WindowPlan), cudaHostAllocPortable) != cudaSuccess) ok = false;
-        else sc.pinned.push_back(sc.h_plan);
+        else {
+            sc.pinned.push_back(sc.h_plan);
+            sc.host_bytes += sizeof(WindowPlan);
+        }
+        sc.device_bytes = device_bytes_ - before;
+        device_bytes_ = before;
         alloc_to_ = &bufs_;
         pin_to_ = &pinned_;
         if (!ok) {
@@ -346,25 +401,29 @@ public:
         static float counted[4];   // a stand-in address the count mode hands out (nothing reads it)
         auto f = [&](int64_t n) {
             void* p = nullptr;
+            const size_t bytes = std::max<size_t>((size_t) n * 4, 16);
             if (count) {
-                *count += (std::max<uint64_t>((uint64_t) n * 4, 16) + (2ull << 20) - 1) / (2ull << 20) * (2ull << 20);
+                *count += (bytes + (2ull << 20) - 1) / (2ull << 20) * (2ull << 20);
                 return counted;
             }
-            if (!ok || cudaMalloc(&p, std::max<size_t>((size_t) n * 4, 16)) != cudaSuccess) {
+            if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) {
                 ok = false;
                 return (float*) nullptr;
             }
             b.dev.push_back(p);
+            b.device_bytes += bytes;
             return (float*) p;
         };
         auto pin = [&](int64_t n) {
             void* p = nullptr;
             if (count) return counted;
-            if (!ok || cudaMallocHost(&p, (size_t) n * 4) != cudaSuccess) {
+            const size_t bytes = (size_t) n * 4;
+            if (!ok || cudaMallocHost(&p, bytes) != cudaSuccess) {
                 ok = false;
                 return (float*) nullptr;
             }
             b.host.push_back(p);
+            b.host_bytes += bytes;
             return (float*) p;
         };
         const int A = std::min(R, kAttRows);
@@ -397,17 +456,20 @@ public:
         b.pair_map = (int32_t*) f((int64_t) R * g_.n_used); b.pair_ident = (int32_t*) f((int64_t) R * g_.n_used);
         b.mmq_ident = (int32_t*) f(A);
         b.h_erows = pin((int64_t) A * g_.n_embd); b.h_e = pin((int64_t) R * E); b.h_evalid = pin(A);
+        const size_t mmq_bytes = std::max(basalt::prefill::mmq::q8_bytes(A, 16384),
+                                          basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim)));
         if (count) {
-            f((int64_t) (std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim))) + 3) / 4);
+            f((int64_t) (mmq_bytes + 3) / 4);
             b = Bufs();
             return true;
         }
         if (ok) {
             void* q = nullptr;
-            if (cudaMalloc(&q, std::max(basalt::prefill::mmq::q8_bytes(A, 16384), basalt::prefill::mmq::q8_bytes((int64_t) A * max_heads_, std::max(g_.kv_lora, g_.qk_dim)))) != cudaSuccess) ok = false;
+            if (cudaMalloc(&q, mmq_bytes) != cudaSuccess) ok = false;
             else {
                 b.dev.push_back(q);
                 b.mmq_xq = q;
+                b.mmq_bytes = mmq_bytes;
             }
         }
         if (!ok) {
@@ -1009,11 +1071,13 @@ public:
 private:
     void* alloc(size_t bytes, bool& ok) {
         void* p = nullptr;
-        if (!ok || cudaMalloc(&p, std::max<size_t>(bytes, 16)) != cudaSuccess) {
+        bytes = std::max<size_t>(bytes, 16);
+        if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) {
             ok = false;
             return nullptr;
         }
         alloc_to_->push_back(p);
+        device_bytes_ += bytes;
         return p;
     }
 
@@ -1596,6 +1660,8 @@ private:
             }
             pinned_.push_back(cpu_rows_);
             pinned_.push_back(cpu_x_);
+            cpu_prefill_bytes_ = ((size_t) kCpuMaxRows + kRingRows) * L * sizeof(float) +
+                                 (size_t) kRingRows * kernels::cpu::kNativeActBytes;
         }
         // the candidates, fewest rows first, and how many of them the priced times give the CPU
         std::vector<int> cand, cand_rows;
@@ -1959,11 +2025,14 @@ private:
         Hy4Model::SharedTier& shared = m_.shared_tier();
         constexpr unsigned kMapped = cudaHostAllocPortable | cudaHostAllocMapped;
         if (!shared.tier) {
-            if (cudaHostAlloc((void**) &shared.h_x, (size_t) kMaxWindow * g_.n_latent * 4, kMapped) != cudaSuccess ||
-                cudaHostAlloc((void**) &shared.h_rows, (size_t) kLookupK * g_.n_latent * 4, kMapped) != cudaSuccess) {
+            const size_t input_bytes = (size_t) kMaxWindow * g_.n_latent * sizeof(float);
+            const size_t output_bytes = (size_t) kLookupK * g_.n_latent * sizeof(float);
+            if (cudaHostAlloc((void**) &shared.h_x, input_bytes, kMapped) != cudaSuccess ||
+                cudaHostAlloc((void**) &shared.h_rows, output_bytes, kMapped) != cudaSuccess) {
                 err = "cannot allocate the pinned expert staging";
                 return false;
             }
+            shared.staging_bytes = input_bytes + output_bytes;
             auto t = std::make_shared<core::ExpertTier>(m_.tier_spec());
             core::ExpertTier::Reserve r;
             r.copies = kModuleRoom;
@@ -2899,6 +2968,7 @@ private:
             void* v = nullptr;
             if (cudaMalloc(&v, bytes) != cudaSuccess) { cudaGetLastError(); err = "out of device memory for a logit bias"; return false; }
             bufs_.push_back(v);
+            device_bytes_ += bytes;
             dev = (float*) v;
         }
         if (cudaMemcpyAsync(dev, host, bytes, cudaMemcpyHostToDevice, stream_) != cudaSuccess) { err = "the logit bias upload failed"; return false; }
@@ -2946,6 +3016,8 @@ private:
     std::vector<void*>* alloc_to_ = &bufs_;   // where alloc keeps what it gives: the session's, or the shared scratch's while that is built
     std::vector<void*>* pin_to_ = &pinned_;
     std::shared_ptr<Scratch> sc_;
+    size_t device_bytes_ = 0, kv_state_bytes_ = 0;
+    size_t host_bytes_ = 0, cpu_prefill_bytes_ = 0;
     float *X_ = nullptr, *Xn_ = nullptr, *coef_ = nullptr, *hcws_ = nullptr;
     float *e_ = nullptr, *cur_ = nullptr, *xn_ = nullptr, *attn_ = nullptr, *attn_raw_ = nullptr, *mlp_ = nullptr, *mlp2_ = nullptr, *fin_ = nullptr;
     float *qa_ = nullptr, *qan_ = nullptr, *q_ = nullptr, *kvraw_ = nullptr, *qabs_ = nullptr, *qcur_ = nullptr, *olat_ = nullptr, *vout_ = nullptr, *gate_ = nullptr;

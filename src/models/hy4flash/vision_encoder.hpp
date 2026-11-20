@@ -31,6 +31,7 @@ public:
     bool stage(const core::FileRange& section, int n_embd, std::string& err);
     bool staged() const { return enc_ != nullptr; }
     size_t weights_bytes() const;
+    size_t device_bytes() const { return enc_ ? enc_->device_bytes() : 0; }
     /// Whether `plan` needs a new device region (none open, or the open one is too small).
     bool needs_region(const ImagePlan& plan) const { return tokens_ < plan.n_merged(); }
     /// Opens a region for `plan` (and a typical picture or more, so a request's pictures share it); false with `err` when the

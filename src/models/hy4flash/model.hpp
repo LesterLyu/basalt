@@ -38,6 +38,7 @@ public:
     model::Result attach(const model::LoadRequest& req, std::vector<std::unique_ptr<model::ModelSession>>& sessions) override;
     const model::ModelDesc& desc() const override { return desc_; }
     int64_t context() const override { return ctx_; }
+    void memory_usage(core::MemoryUsage& usage) const override;
 
     const Pack& pack() const { return pack_; }
     const Geometry& geo() const { return pack_.geo; }
@@ -59,6 +60,7 @@ public:
         std::shared_ptr<core::ExpertTier> tier;
         float* h_x = nullptr;
         float* h_rows = nullptr;
+        size_t staging_bytes = 0;
     };
     SharedTier& shared_tier() const { return shared_tier_; }
     /// What every session's batch windows share (model/batch_driver.hpp).

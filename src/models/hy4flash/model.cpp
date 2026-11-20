@@ -45,6 +45,21 @@ constexpr float kLayerSlotWeights[41] = {1.380f, 1.420f, 1.410f, 1.310f, 1.195f,
 
 Hy4Model::Hy4Model() = default;
 
+void Hy4Model::memory_usage(core::MemoryUsage& usage) const {
+    uint64_t weights = 0;
+    for (const auto& [name, t] : dev_) weights += t.bytes;
+    usage.device(device_, "weights", weights);
+    if (shared_tier_.tier) shared_tier_.tier->memory_usage(usage);
+    if (dfly_) usage.device(device_, "dfly", dfly_->bytes());
+    if (vis_.staged()) {
+        usage.device(device_, "vision", vis_.device_bytes());
+        usage.host["vision_weights"] += vis_.weights_bytes();
+    }
+    usage.host["embedding_weights"] += embd_.capacity();
+    if (engram_) usage.host["engram_reader"] += engram_->allocated_bytes();
+    usage.host["expert_staging"] += shared_tier_.staging_bytes;
+}
+
 size_t Hy4Model::expert_stride() const {
     size_t blob = 0, unit = 16;
     for (const ExpertLayer& el : pack_.experts) {

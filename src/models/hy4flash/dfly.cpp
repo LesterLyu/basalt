@@ -204,6 +204,10 @@ void DflyTap::selection(int layer, int row, const int32_t* cells, int n, void* s
 
 int DflyTap::source_row(int64_t pos) const { return dfly_source_row(pos0_, hid_ok_, sel_ok_, layers_, pos); }
 
+size_t DflyTap::device_bytes() const {
+    return (size_t) kDflyTapRows * (E_ * sizeof(float) + (size_t) layers_ * cap_ * sizeof(int32_t));
+}
+
 // ---- the block pass -----------------------------------------------------------------------------------------------------
 
 struct DflyRunner::Impl {
@@ -212,6 +216,7 @@ struct DflyRunner::Impl {
     DflyDims d;
     std::vector<void*> bufs;
     std::vector<void*> pinned;
+    size_t device_bytes = 0, host_bytes = 0;
     float *X = nullptr, *X1 = nullptr, *xn = nullptr, *o = nullptr, *o2 = nullptr, *mlp = nullptr, *z = nullptr;
     float *qa = nullptr, *qan = nullptr, *q = nullptr, *kvraw = nullptr, *qabs = nullptr, *qcur = nullptr, *olat = nullptr,
           *vout = nullptr, *gate = nullptr, *g = nullptr, *u = nullptr, *h = nullptr;
@@ -238,20 +243,24 @@ struct DflyRunner::Impl {
     }
     float* dev(size_t floats, bool& ok) {
         void* p = nullptr;
-        if (!ok || cudaMalloc(&p, std::max<size_t>(floats * 4, 16)) != cudaSuccess) {
+        const size_t bytes = std::max<size_t>(floats * 4, 16);
+        if (!ok || cudaMalloc(&p, bytes) != cudaSuccess) {
             ok = false;
             return nullptr;
         }
         bufs.push_back(p);
+        device_bytes += bytes;
         return (float*) p;
     }
     float* host(size_t floats, bool& ok) {
         void* p = nullptr;
-        if (!ok || cudaMallocHost(&p, std::max<size_t>(floats * 4, 16)) != cudaSuccess) {
+        const size_t bytes = std::max<size_t>(floats * 4, 16);
+        if (!ok || cudaMallocHost(&p, bytes) != cudaSuccess) {
             ok = false;
             return nullptr;
         }
         pinned.push_back(p);
+        host_bytes += bytes;
         return (float*) p;
     }
 
@@ -313,6 +322,15 @@ std::unique_ptr<DflyRunner> DflyRunner::create(const Env& env, std::string& err)
 }
 
 DflyRunner::~DflyRunner() = default;
+
+size_t DflyRunner::device_bytes() const { return p_->device_bytes; }
+size_t DflyRunner::host_bytes() const { return p_->host_bytes + p_->mask.capacity() * sizeof(float); }
+
+void DflyHook::memory_usage(core::MemoryUsage& usage, int device) const {
+    if (!runner_) return;
+    usage.device(device, "dfly", tap_->device_bytes() + runner_->device_bytes());
+    usage.host["decode_workspace"] += runner_->host_bytes();
+}
 
 bool DflyRunner::begin(int32_t anchor, int64_t pos, int n, const DflyTap& tap, int row, const void* const* cache, void* stream,
                        std::string& err, int64_t rope_pos) {

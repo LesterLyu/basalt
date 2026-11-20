@@ -161,6 +161,7 @@ public:
     const float* hidden_row(int row) const { return hid_ + (size_t) row * E_; }
     const int32_t* cells(int slot, int row) const { return sel_ + ((size_t) slot * kDflyTapRows + row) * cap_; }
     int count(int slot, int row) const { return n_[row][slot]; }
+    size_t device_bytes() const;
 
 private:
     DflyTap() = default;
@@ -203,6 +204,8 @@ public:
                 const std::function<bool(const float*, int)>& need = nullptr);
     /// The block's outputs after the final norm, `rows` rows of E floats, to the host (for the tests against a reference).
     void copy_block(float* host, int rows, void* stream) const;
+    size_t device_bytes() const;
+    size_t host_bytes() const;
 
 private:
     DflyRunner() = default;
@@ -223,6 +226,7 @@ public:
     bool init(const DflyWeights* w, int sel_cap, int64_t ctx, std::function<bool(int32_t, float*)> embed,
               const std::string& dump, bool fp8, std::string& err);
     bool on() const { return runner_ != nullptr; }
+    void memory_usage(core::MemoryUsage& usage, int device) const;
     void begin_window(int64_t pos0) { if (tap_) tap_->begin_window(pos0); }
     void invalidate() { if (tap_) tap_->invalidate(); }
     void run(int row0) { row0_ = row0; }   ///< the next run of rows starts at this row of the window (-1: none is kept)
