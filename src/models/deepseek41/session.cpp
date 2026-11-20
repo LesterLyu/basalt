@@ -778,7 +778,9 @@ private:
             const uint64_t wanted = prefillp::chunk_bytes(d, cap, tokens) + margin;
             for (uint64_t extra = 0;; extra += 64ull << 20) {
                 std::string e;
-                if (tier && !tier->lend(wanted + extra)) { if (!e.empty()) err=e; break; }
+                if (!core::device_memory(-1, free_b, total_b, e)) { err = e; break; }
+                if (tier && free_b < wanted + extra &&
+                    !tier->lend(wanted + extra - tier->free_floor())) break;
                 prefill_ = make_prefill(m_, *ops_, stream_, cap, prefillp::use_ahead(d, cap, tokens), e);
                 const uint64_t after = margin + (d.reuse_stage ? 0 :
                     prefillp::chunk_bytes(d, cap, tokens) - prefillp::workspace_bytes(d, cap));

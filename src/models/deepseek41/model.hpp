@@ -17,16 +17,12 @@
 #include "models/deepseek41/pack.hpp"
 #include "models/deepseek41/prompt_host.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
-#include "models/deepseek41/expert_ram_pool.hpp"
-#include "models/deepseek41/expert_ram.hpp"
 
 #include <map>
 #include <algorithm>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace basalt::core {
@@ -71,23 +67,9 @@ public:
         kernels::NativeExpertLayout layout;
         kernels::cpu::NativeFmt cpu;
         uint64_t offset = 0;
-        mutable std::unique_ptr<ExpertRam> ram;
-        const uint8_t* host() const { return ram && ram->ready ? ram->data : nullptr; }
     };
     TierProfile& tier_profile() const { return tier_profile_; }
     bool has_overlay() const { return overlay_bytes_ != 0; }
-    uint64_t initial_overlay_ram_budget() const { return overlay_ram_budget_; }
-    bool read_initial_replacement(int layer, int expert, uint8_t* to, std::string& err) const;
-    uint8_t* prepare_replacement_ram(int layer, int expert) const;
-    void publish_replacement_ram(int layer, int expert) const;
-    void release_replacement_ram(int layer, int expert) const;
-    std::unique_ptr<ExpertRam> acquire_expert_ram(uint64_t bytes) const;
-    void recycle_expert_ram(std::unique_ptr<ExpertRam> ram) const;
-    uint64_t expert_ram_pool_bytes() const { std::lock_guard<std::mutex> lock(pool_mu_); return swap_pool_.bytes(); }
-    void trim_expert_ram_pool(uint64_t limit) const;
-    /// Keeps `blocks` free expert blocks of `bytes` in the pool, pinned by a thread of their own, so a promotion that
-    /// needs a RAM place takes one instead of pinning memory on the decode path.
-    void keep_expert_ram(size_t blocks, uint64_t bytes, int device) const;
     uint64_t overlay_max_bytes(int layer = -1) const {
         uint64_t bytes = 0;
         if (has_overlay())
@@ -97,7 +79,7 @@ public:
         return bytes;
     }
     const Replacement* replacement(int l, int e) const {
-        if (!has_overlay()) return nullptr;
+        if (!has_overlay() || e < 0 || e >= geo().n_expert) return nullptr;
         const auto& v = overlay_[(size_t) l * geo().n_expert + e];
         return v.layout.bytes ? &v : nullptr;
     }
@@ -115,12 +97,6 @@ public:
 
     void memory_usage(core::MemoryUsage& usage) const override {
         if (!usage.claim(this)) return;
-        for (const auto& v : overlay_) if (v.ram) {
-            usage.host["resident_experts"] += v.ram->allocated();
-            usage.host["pinned_experts"] += v.ram->registered();
-            usage.host["locked_experts"] += v.ram->pin.locked_bytes;
-        }
-        usage.host["expert_swap_workspace"] += expert_ram_pool_bytes();
         usage.host["expert_hotspots"] += hotspots_.bytes();
         if (engram_) usage.host["engram_reader"] += engram_->allocated_bytes();
         if (dense_) usage.device(device_, "weights", dense_->capacity());
@@ -194,16 +170,7 @@ private:
     CacheFormat cache_format_ = CacheFormat::Fp8;
     mutable TierProfile tier_profile_;
     std::vector<Replacement> overlay_;
-    mutable ExpertRamPool<ExpertRam> swap_pool_;
-    mutable std::mutex pool_mu_;              // the pool, shared with the refill thread
-    mutable std::condition_variable pool_cv_;
-    mutable std::thread pool_refill_;
-    mutable size_t pool_target_ = 0;          // blocks the refill thread keeps; 0 = none
-    mutable uint64_t pool_block_ = 0;
-    mutable bool pool_quit_ = false;
-    void refill_expert_ram(int device) const;
     size_t overlay_bytes_ = 0;
-    uint64_t overlay_ram_budget_ = 0;
     core::FileRange overlay_source_;
     Pack pack_;
     model::ModelDesc desc_;

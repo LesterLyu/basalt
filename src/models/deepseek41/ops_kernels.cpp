@@ -84,8 +84,8 @@ struct PeerArm {
 };
 
 struct PeerJoin {
-    ExpertTier* tier = nullptr;
-    ~PeerJoin() { if (tier) { std::string err; tier->finish_peer(err); } }
+    core::PeerExperts* peer = nullptr;
+    ~PeerJoin() { if (peer) { std::string err; peer->finish(nullptr, err); } }
 };
 
 // A window's plan: the distinct experts of its rows, each with the rows it computes.
@@ -431,9 +431,10 @@ public:
                 needed += el_kv_[(size_t) il]->growth(rows * kLatent * 2);
                 needed += el_ik_[(size_t) il]->growth(rows * kIdxDim * 2);
             }
-            if (needed && tier_ && !tier_->lend(needed + keep, e)) {
-                err = "deepseek41: cannot make room for compressed cache growth (" + e + ")";
-                return false;
+            if (needed && tier_) {
+                uint64_t free_b = 0, total_b = 0;
+                if (!core::device_memory(-1, free_b, total_b, e)) { err = e; return false; }
+                if (free_b < needed + keep) (void) tier_->lend(needed);
             }
             for (int il = 0; il < g_.n_layers && ok; ++il) {
                 if (!el_kv_[(size_t) il]) continue;
@@ -816,7 +817,7 @@ public:
         }
 
         // the second card's share first: its rows are the last of the two cards' to land
-        PeerJoin peer_join{peer && m_.has_overlay() ? tier_.get() : nullptr};
+        PeerJoin peer_join{peer && m_.has_overlay() ? peer : nullptr};
         if (peer && m_.has_overlay()) {
             int32_t kind[core::ExpertTier::kMaxK] = {};
             for (int r = 0; r < T * K; ++r) kind[r] = lk.peer[uidx[r]] ? 2 : 0;
@@ -825,7 +826,7 @@ public:
             const kernels::NativeExpertLayout* layouts[core::ExpertTier::kMaxK]{};
             for (int r = 0; r < T*K; ++r) if (const auto* v = m_.replacement(il,h_ids_[r])) layouts[r] = &v->layout;
             TierScope launch_profile(m_.tier_profile(),TierProfile::PeerLaunch);
-            if (!tier_->launch_peer(il, limited, h_x_, h_ids_, T, K, kind, err, layouts, peer_rows)) return false;
+            if (!peer->launch_window(il, limited, h_x_, h_ids_, T, K, kind, err, layouts, peer_rows)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds; the fetched ones in a second plan, once their copies landed
@@ -861,7 +862,6 @@ public:
         if (nhits) gpu_share(plan, ex_plan_, nhits, entries);
         if (m_.has_overlay()) run_overlay(il, T, K, h_ids_, lk, stream, false);
         if (n_fetched) {
-            tier_->submit_fetch();
             const int ng = make_plan(plan, true, entries);
             tier_->await_fetch(st);
             if (ng) gpu_share(plan, ex_plan2_, ng, entries);
@@ -896,6 +896,7 @@ public:
         if (peer) {
             TierScope finish_profile(m_.tier_profile(), TierProfile::PeerFinish);
             if (!peer->finish(nullptr, err)) return false;
+            peer_join.peer = nullptr;
         }
         // Let the sum run before a promotion makes a driver call that may wait on it.
         jw.raise();
@@ -982,7 +983,7 @@ public:
         }
 
         // the second card's share first: its rows are the last of the two cards' to land
-        PeerJoin peer_join{peer && m_.has_overlay() ? tier_.get() : nullptr};
+        PeerJoin peer_join{peer && m_.has_overlay() ? peer : nullptr};
         if (peer && m_.has_overlay()) {
             int32_t kind[core::ExpertTier::kMaxK] = {};
             for (int k = 0; k < K; ++k) kind[k] = lk.peer[k] ? 2 : 0;
@@ -991,7 +992,7 @@ public:
             const kernels::NativeExpertLayout* layouts[core::ExpertTier::kMaxK]{};
             for (int r = 0; r < K; ++r) if (const auto* v = m_.replacement(il,lk.experts[r])) layouts[r] = &v->layout;
             TierScope launch_profile(m_.tier_profile(),TierProfile::PeerLaunch);
-            if (!tier_->launch_peer(il, limited, h_x_, lk.experts, 1, K, kind, err, layouts, peer_rows)) return false;
+            if (!peer->launch_window(il, limited, h_x_, lk.experts, 1, K, kind, err, layouts, peer_rows)) return false;
         }
 
         // the GPU's share: the experts the VRAM tier holds, one group each, writing the row of their router index; the
@@ -1028,7 +1029,6 @@ public:
         }
         if (m_.has_overlay()) run_overlay(il, 1, K, lk.experts, lk, stream, false);
         if (n_fetched) {
-            tier_->submit_fetch();
             ExpertPlan plan2;
             const int ng = make_plan(plan2, true);
             tier_->await_fetch(st);
@@ -1068,6 +1068,7 @@ public:
         if (peer) {
             TierScope finish_profile(m_.tier_profile(), TierProfile::PeerFinish);
             if (!peer->finish(nullptr, err)) return false;
+            peer_join.peer = nullptr;
         }
         // Let the sum run before a promotion makes a driver call that may wait on it.
         jw.raise();

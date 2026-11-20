@@ -270,14 +270,14 @@ public:
                     cudaMemcpyAsync(dst, ring_ + (size_t) (seq % ring_pieces_) * slot_, L.bytes,
                                     cudaMemcpyHostToDevice, copy_);
                 } else if (src.peer) {
-                    if (!tier_->peer()->read_slot(src.peer, B.host + slot_ * (size_t) q, L.bytes,err)) return false;
+                    if (!tier_->peer_for(il)->read_slot(src.peer, B.host + slot_ * (size_t) q, L.bytes,err)) return false;
                     from_peer.push_back(q);
                 } else {
                     from_file.push_back(q);
                 }
             }
             if (!from_peer.empty()) {
-                if (!tier_->peer()->read_wait(err)) return false;
+                if (!tier_->peer_for(il)->read_wait(err)) return false;
                 for (int q : from_peer)
                     cudaMemcpyAsync(B.blobs + staged_stride(el)*(size_t)q, B.host + slot_*(size_t)q, L.bytes,
                                     cudaMemcpyHostToDevice, copy_);
@@ -373,8 +373,8 @@ public:
                             err = "deepseek41: waiting for replacement staging failed"; return false;
                         }
                         auto* stage = m_.prompt_host().replacement_stage;
-                        if (!tier_->peer()->read_slot(src.peer, stage, v->layout.bytes,err)) return false;
-                        if (!tier_->peer()->read_wait(err)) return false;
+                        if (!tier_->peer_for(il)->read_slot(src.peer, stage, v->layout.bytes,err)) return false;
+                        if (!tier_->peer_for(il)->read_wait(err)) return false;
                         host = stage;
                     }
                     if (!host) { err = "deepseek41: replacement has neither RAM nor GPU backing"; return false; }

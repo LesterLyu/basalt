@@ -110,8 +110,10 @@ int main(int argc, char** argv) try {
     Host stage(largest), readback(largest+64);
     for (int i=0;i<E;++i) {
         std::memcpy(stage.p,experts[i].bytes.data(),experts[i].bytes.size());
-        require(primary.fill_slot(i,(uint8_t*)stage.p,experts[i].bytes.size()),"primary fill");
-        require(peer.fill_slot(i,(uint8_t*)stage.p,experts[i].bytes.size()),"peer fill");
+        ck(cudaSetDevice(primary.device()));
+        ck(cudaMemcpy(primary.slot_ptr(i), stage.p, experts[i].bytes.size(), cudaMemcpyHostToDevice));
+        ck(cudaSetDevice(peer.device()));
+        ck(cudaMemcpy(peer.slot_ptr(i), stage.p, experts[i].bytes.size(), cudaMemcpyHostToDevice));
         primary.admit(0,i,i); peer.admit(0,i,i);
     }
     float *dx = nullptr, *dy = nullptr;

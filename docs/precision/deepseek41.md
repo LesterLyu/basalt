@@ -178,30 +178,11 @@ basalt-bench --model DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt --gpu 0,1 -t conv,
 `overlay.base-header`, a text `overlay.layout` starting with `BASALT_DS_EXPERTS_V1` and rows
 `layer expert gate_up_type down_type offset bytes`, and the contiguous `experts` section (gate, up, down).
 Only the listed target experts change. The router, shared experts and DSpark weights keep their original precision.
-Replacement RAM is allocated per expert and shared across slots; superseded base bytes are excluded from all tiers.
-Exclusive primary/helper homes release their host allocation only after the incoming copy finishes. Eviction
-allocates RAM above the floor, copies the outgoing weights from VRAM and publishes them after the fence; it never
-rereads replacement weights from the sidecar during inference. The primary's reclaimable cache also owns its weights
-without RAM copies. Startup plans both GPU arenas first and reads each ordinary expert directly into its final tier,
-omitting all replaced base bytes. Replacement metadata is read first; only CPU-owned weights receive persistent RAM,
-while GPU-owned replacements pass through one bounded upload buffer. There is no full host mirror or post-load arena
-rebuild. Before lending cache VRAM to prefill, KV or vision, the tier reserves host backing and copies the weights from
-VRAM; ownership changes only after the copy fence. If backing cannot fit above the RAM floor, the VRAM stays resident.
-Refilling the cache releases
-the returned host allocations again. The helper remains an exclusive owner through the same swap transitions.
-Reclaimable GPU arenas use physical segments at stable addresses, with slots interleaved across layers.
-A prompt borrows only its allocation deficit and counts every slot's existing workspace before cache refill.
-Phase-disjoint Engram, attention and expert temporaries share prompt storage.
-RAM misses compute from fenced GPU staging slots before repeat misses enter the cache through a device copy.
-Empty CUDA-registered RAM blocks are reused within a 1 GiB workspace budget without publishing expert mirrors.
-At request and loan boundaries, extra ordinary expert blocks move into vacant arena places and are freed,
-so repeated loans do not retain both empty arena capacity and separate returned weights.
-Initial placement keeps the normal routing rank. CPU jobs dispatch each expert's
-native format and activation quantizer. Primary replacement groups are submitted before joining CPU/helper work.
-Both GPU tiers accept either format; the normal miss split, LRU promotion and swaps apply. Slots follow the layer's
-size distribution and initial ranked experts, with a slot for its largest format. Admission selects a fitting slot;
-swap directions use their actual byte counts. A displaced base expert gets a RAM place subject to the RAM floor.
-No weights are requantized and neither pack is rewritten.
+The startup loader queues each replacement from the sidecar instead of loading the superseded bytes. CPU-owned
+experts and swap space share a compact RAM arena per layer. Permanent VRAM homes on either card hold their weight
+bytes exclusively. Reclaimable cache copies use the same backing rules as the base pack. Adaptive exchanges
+between permanent homes use compatible slot sizes. If RAM is tight, only unmodified experts can remain file-backed.
+The CPU and both GPUs use each replacement's own format. Neither pack is rewritten.
 
 Prompt reads stage each replacement once for all its rows and retain native row arithmetic. Helper-only weights
 pass through one bounded host staging buffer; a copy fence protects its reuse. Base experts use
@@ -209,7 +190,7 @@ the host read-ahead ring with the existing compute groups. `--prefill-chunk N` (
 sets a power-of-two ceiling from 256 through 16384; the default is 16384. Memory fit may halve it.
 Disk KV reuse must be disabled with an overlay; removing the overlay restores the base model.
 
-Validation on a real 903-expert sidecar covers its seven format pairs at 1, 2, 4 and 8 rows: mixed CPU batches
+Before the shared tier conversion, validation on a real 903-expert sidecar covers its seven format pairs at 1, 2, 4 and 8 rows: mixed CPU batches
 match serial CPU kernels bitwise; mixed GPU batches, the primary's row path and the helper match bitwise,
 including unequal-size swaps checked against the original bytes and buffer boundaries. The existing CPU
 pool suite passes 603 cases across nine formats. With replacements deliberately distributed across CPU and

@@ -363,6 +363,10 @@ private:
     void restore(bool ranked_too);
     uint64_t expert_bytes(int layer, int id) const;
     uint64_t ram_stride(int layer) const;
+    uint64_t slot_capacity(int32_t slot) const;
+    uint8_t* ram_place(int layer, int32_t place) const;
+    int32_t take_spare(int layer, uint64_t bytes);
+    void release_spare(int layer, int32_t place);
     const ExpertTierSpec::Replacement* replacement(int layer, int id) const;
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
     /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
@@ -377,9 +381,9 @@ private:
     int32_t claim(int layer, int e, const uint8_t* src, cudaStream_t stream, bool homes_too = false, bool whole = false,
                   bool later = false);
     /// The free slot of the layer's main card share that gives way first (the least recently used; with victim_half_life the
-    /// least looked up, skipping experts this very lookup uses), or -1; `best` gets its last use (the current tick when
+    /// least looked up, skipping experts this very lookup uses), or -1; `best` gets its last use after filtering by `bytes` (the current tick when
     /// every slot is in use by this lookup).
-    int32_t oldest_slot(int layer, bool homes_too, uint64_t& best) const;
+    int32_t oldest_slot(int layer, bool homes_too, uint64_t& best, uint64_t bytes = 0) const;
     /// Moves (layer, e) into the second card when the expert it replaces there was last used core::policy::kPeerMoveAge
     /// lookups before the main card's oldest.
     bool move_to_peer(int layer, int e, const uint8_t* src);
@@ -442,6 +446,9 @@ private:
     int64_t cap_per_layer_ = -1;            ///< --expert-cache or the diagnostic's slots per layer, -1 when neither
 
     std::vector<uint64_t> ram_stride_;
+    std::vector<uint8_t> mixed_file_;
+    std::vector<std::vector<uint64_t>> ram_offsets_;
+    std::vector<std::vector<int32_t>> ram_spares_;
     float* peer_decode_rows_ = nullptr;
     RamAllocation peer_workspace_backup_;
     std::vector<core::RamAllocation> ram_allocations_;

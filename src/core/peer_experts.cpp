@@ -321,11 +321,6 @@ bool PeerExperts::open_slots(const std::vector<int64_t>& slot_bytes, std::string
     return ck(cudaDeviceSynchronize(), "slots", err);
 }
 
-bool PeerExperts::fill_slot(int32_t slot, const uint8_t* src, uint64_t bytes) {
-    On on(device_);
-    return cudaMemcpy(cache_.device_slot(slot), src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
-}
-
 bool PeerExperts::read_slot(const uint8_t* blob, uint8_t* dst, uint64_t bytes, std::string& err) {
     On on(device_);
     return ck(cudaMemcpyAsync(dst,blob,bytes,cudaMemcpyDeviceToHost,refill_),"reading peer expert",err);
@@ -450,8 +445,8 @@ bool PeerExperts::launch_window(int64_t layer, const kernels::NativeExpertLayout
 
 bool PeerExperts::launch_rows(int64_t layer, const kernels::NativeExpertLayout& L, const float* x, const int32_t* ids, int64_t n,
                               float* out, std::string& err, const kernels::NativeExpertLayout* const* layouts) {
-    static_assert(kRowBatch == CAP, "a row batch fills a launch's entries");
-    if (n < 0 || n > CAP) { err = "peer experts: row batch too large"; return false; }
+    static_assert(kRowBatch <= CAP, "a row batch fits within a launch");
+    if (n < 0 || n > kRowBatch) { err = "peer experts: row batch too large"; return false; }
     int32_t kind[CAP];
     for (int64_t i = 0; i < n; ++i) kind[i] = 2;
     return launch_layout(layer, L, x, ids, n, 1, kind, err, out, layouts);
