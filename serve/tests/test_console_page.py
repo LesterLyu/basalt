@@ -92,6 +92,9 @@ vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8") + `
     slot: Object.values(slotSections(input.slot, [], input.reqs, "full")).join(""),
     card: slotCard(input.slot, [], input.reqs, 100, "full", { draft: true, hit: true, cols: "1fr" }),
     gpu: gpuDetail(input.gpu),
+    gpuAllocations: gpuAllocations(input.gpu.vram_breakdown),
+    ramAllocations: ramAllocations({ engine_allocations: { resident_experts: 2 ** 30, pinned_experts: 2 ** 29, vision_weights: 2 ** 28 },
+      processes: { engine: { rss: 2 ** 31 } } }),
     split: splitCells([["VRAM", "", 0.9, "t0"], ["CPU", "", 0.1, "t2"]], 10),
     empty: splitCells([["VRAM", "", null, "t0"], ["CPU", "", null, "t2"]], 4),
     down: slotsDown(2),
@@ -138,6 +141,15 @@ class MissingFieldsHide(unittest.TestCase):
         self.assertIn("Traffic in", out["gpu"])
         for gone in ("SM clock", "Memory clock", "Host → GPU", "Experts held", "Throttling"):
             self.assertNotIn(gone, out["gpu"])
+
+    def test_device_allocations_include_live_engine_details(self):
+        gpu = {**self.gpu, "vram_breakdown": {"components": {"weights": 2 ** 30, "dfly": 2 ** 29},
+                                               "unattributed": 0}}
+        out = self.draw(self.slot, gpu)
+        for shown in ("Model weights", "DFly", "512.0 MiB", "Unattributed"):
+            self.assertIn(shown, out["gpuAllocations"])
+        for shown in ("Resident experts", "CUDA-registered experts", "Vision weights", "768.0 MiB"):
+            self.assertIn(shown, out["ramAllocations"])
 
     def test_each_lights_up_when_its_field_arrives(self):
         slot = {**self.slot, "started": 1, "path": "/v1/messages", "prompt_ms": 310.0, "accept_pos": [0.9, 0.5],

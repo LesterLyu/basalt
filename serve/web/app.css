@@ -534,3 +534,26 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .support-alt { padding: 16px 24px 0; font: 400 13px/1.5 var(--font-sans); color: var(--fg-3); }
 .support-alt a { color: var(--fg-2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
 .support-alt a:hover { color: var(--accent); text-decoration-color: var(--accent-line); }
+#hardware .hw, #hardware .hw-s, #hardware .gpus.rich, #hardware .gpu.one, #hardware .gpu.two { height: auto; }
+.allocation-rows { margin: 0; display: grid; gap: 4px; font: 12px/1.35 var(--font-mono); }
+.allocation-rows div { display: flex; justify-content: space-between; gap: 12px; }
+.allocation-rows dt { color: var(--fg-2); }
+.allocation-rows dd { margin: 0; white-space: nowrap; }
+.allocation-subset { border-left: 2px solid var(--line); padding-left: 10px; }
+#p-hw .hint { font-size: 12px; color: var(--fg-3); }
+.expert-hotspots { margin: 16px 0 0; border: 1px solid var(--line); border-radius: 8px; }
+.expert-hotspots summary { display: flex; justify-content: space-between; gap: 12px; cursor: pointer; padding: 14px 16px; }
+.expert-hotspots summary span { color: var(--fg-2); font: 12px/1.5 var(--font-mono); }
+.hotspot-content { padding: 0 16px 14px; }
+.hotspot-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.hotspot-controls label { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--fg-2); }
+.hotspot-controls button, .hotspot-controls select, .hotspot-controls input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--fg); font: inherit; font-size: 12px; }
+.hotspot-controls button { cursor: pointer; }
+.hotspot-controls button:disabled { opacity: .45; cursor: default; }
+.hotspot-controls input { width: 170px; max-width: 100%; }
+.hotspot-controls #hotspot-custom-limit { width: 72px; }
+.hotspot-controls #hotspot-copy { min-width: 128px; }
+.hotspot-table { max-height: 330px; overflow: auto; margin-top: 10px; }
+.hotspot-table table { width: 100%; border-collapse: collapse; font: 12px/1.5 var(--font-mono); white-space: nowrap; }
+.hotspot-table th, .hotspot-table td { padding: 5px 9px; text-align: right; border-bottom: 1px solid var(--line); }
+.hotspot-table th { position: sticky; top: 0; background: var(--surface); color: var(--fg-2); }

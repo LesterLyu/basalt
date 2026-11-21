@@ -282,9 +282,9 @@ function drawWeights(eng) {
   drawSplit(tiers, `Each cell is 1/${SPLIT_CELLS} of the weights' bytes, coloured by where they sit.`);
 }
 
-/* ---- tabs: Requests | Slots | Hardware | Logs (keys 1-4 and L; #tab=req|slots|hw|logs opens one) ---- */
+/* ---- tabs: Requests | Slots | Devices | Logs (keys 1-4 and L; #tab=req|slots|hw|logs opens one) ---- */
 const TABS = ["req", "slots", "hw", "logs"];
-const fromHash = (/tab=(\w+)/.exec(location.hash) || [])[1];
+const fromHash = location.hash === "#devices" ? "hw" : (/tab=(\w+)/.exec(location.hash) || [])[1];
 let tab = (t => TABS.includes(t) ? t : "req")(fromHash || sessionStorage.getItem("basalt.tab3"));
 function setTab(t) {
   if (!TABS.includes(t)) return;
@@ -304,7 +304,7 @@ function drawTabs(live, reqs, slots, total, G) {
   // while a slot runs, busy over all; otherwise the slot count, in grey
   const T = [["req", "Requests", n ? `${n} queued` : reqs.length ? String(reqs.length) : "", n ? "hot" : ""],
     ["slots", "Slots", active ? `${active}/${total}` : `${total} slot${total === 1 ? "" : "s"}`, active ? "hot" : ""],
-    ["hw", "Hardware", G.length ? `${G.length} GPU${G.length === 1 ? "" : "s"}` : "", ""],
+    ["hw", "Devices", G.length ? `${G.length} GPU${G.length === 1 ? "" : "s"}` : "", ""],
     ["logs", "Logs", warnCount ? `${warnCount} warn` : logCount ? fmt(logCount) : "", warnCount ? "warn" : ""]];
   html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === tab}">`
     + `<span>${t[1]}</span>${t[2] ? `<em class="${t[3]}">${t[2]}</em>` : ""}</button>`).join(""));
@@ -559,7 +559,8 @@ const vramRow = g => `<div class="sb-met">${sbRow("VRAM", num(g.mem_used) ? `${g
 function sbGpu(g, h, name, short, foot) {
   return `<div class="gpu"><div class="gh" title="${esc(name)}"><span class="gn">${esc(short || name)}</span><span class="gm">${gpuMeta(g)}</span></div>`
     + vramRow(g) + `<div class="gch">${sbLoad(tail(h.util), g.util)}${sbPower(tail(h.power), g.power, g.power_limit)}${sbTemp(tail(h.temp), g.temp)}</div>`
-    + (foot ? `<div class="gfoot" title="SM clock · measured host-to-device bandwidth · experts held">${foot}</div>` : "") + `</div>`;
+    + (foot ? `<div class="gfoot" title="SM clock · measured host-to-device bandwidth · experts held">${foot}</div>` : "")
+    + gpuAllocations(g.vram_breakdown) + `</div>`;
 }
 function sbTable(G, H, names) {
   let h = `<div class="sb-tbl"><div class="h l">GPU</div><div class="h">Load</div><div class="h">VRAM GiB</div><div class="h">Power W</div><div class="h">°C</div><div class="h">Link</div>`;
@@ -598,6 +599,40 @@ const mb = v => num(v) ? v >= 1000 ? `${(v / 1000).toFixed(1)} GB/s` : `${Math.r
 // stat cells: label above value, in a grid; a cell whose field is missing is left out
 const cells = rows => `<dl class="cells">${rows.filter(Boolean).map(r => `<div${r[2] ? ` title="${esc(r[2])}"` : ""}><dt>${r[0]}</dt><dd>${r[1]}</dd></div>`).join("")}</dl>`;
 const when = (v, row) => v == null ? null : row;
+const VRAM_ALLOCATIONS = {weights: "Model weights", experts: "Expert cache", expert_helper: "Expert helper",
+  kv_state: "KV cache & state", scratch: "Scratch", mmq_buffers: "MMQ buffers", dense_prefill: "Dense prefill",
+  long_prefill: "Prefill workspace", dspark: "DSpark", mtp: "MTP", dfly: "DFly", vision: "Vision workspace",
+  sampler: "Sampler cache", system_reserved: "System reserved", other_apps: "Other apps"};
+const RAM_ALLOCATIONS = {resident_experts: "Resident experts", expert_homes: "Evicted / borrowed experts",
+  checkpoints: "Conversation checkpoints", expert_swap_workspace: "Expert swap workspace", expert_hotspots: "Expert hotspot counters",
+  expert_prefetch: "Expert prefetch ring", expert_staging: "Expert upload staging", prefill_activations: "Prefill activations",
+  embedding_weights: "Token embedding weights", embedding_workspace: "Token embedding staging", engram_workspace: "Engram buffers",
+  engram_reader: "Engram row cache & I/O", vision_weights: "Vision weights", vision_workspace: "Image buffers",
+  decode_workspace: "Decode CPU buffers"};
+const allocationRows = rows => `<dl class="allocation-rows">${rows.filter(([, n]) => num(n)).map(([label, n]) =>
+  `<div><dt>${esc(label)}</dt><dd>${n >= 1024 ** 3 ? `${gib(n)} GiB` : `${fmt(n / 1024 ** 2, 1)} MiB`}</dd></div>`).join("")}</dl>`;
+const namedAllocations = (labels, parts) => Object.entries(labels).map(([key, label]) => [label, parts[key]]);
+function gpuAllocations(b) {
+  if (!b) return "";
+  const rows = namedAllocations(VRAM_ALLOCATIONS, b.components || {});
+  rows.push(["Unattributed", b.unattributed]);
+  return `<section class="vb"><h4>VRAM breakdown</h4>${allocationRows(rows)}` +
+    (b.pending_engine ? `<p class="hint">Waiting for engine allocations.</p>` : "") + `</section>`;
+}
+function ramAllocations(b) {
+  const parts = b?.engine_allocations || {}, ps = b?.processes || {}, engine = ps.engine || {};
+  const rows = namedAllocations(RAM_ALLOCATIONS, parts).filter(([, n]) => num(n));
+  const total = rows.reduce((sum, [, n]) => sum + n, 0);
+  const outside = rows.length && num(engine.rss) ? Math.max(0, engine.rss - total) : null;
+  const detail = [["CUDA-registered experts", parts.pinned_experts], ["OS-locked experts", parts.locked_experts]];
+  const tracked = rows.length ? `<div class="blk"><h4>Engine allocations</h4>${allocationRows(rows)}` +
+    (detail.some(([, n]) => num(n)) ? `<div class="allocation-subset">${allocationRows(detail)}<p class="hint">Included in resident experts.</p></div>` : "") +
+    `</div>` : "";
+  const working = [["Inference engine", engine.rss], ["API server", ps.server?.rss], ["Vision process", ps.vision?.rss],
+    ["Engine peak working set", engine.peak_rss], ["Engine private commit", engine.private_commit],
+    ["Outside tracked allocations (estimate)", outside]];
+  return tracked + (working.some(([, n]) => num(n)) ? `<div class="blk"><h4>Process RAM</h4>${allocationRows(working)}</div>` : "");
+}
 function gpuDetail(g) {
   const sm = g.sm_clock, mem = g.mem_clock, h2d = g.h2d_gbps, held = g.expert_slots, thr = g.throttle;
   return cells([when(sm, ["SM clock", `${fmt(sm)} <span class="u">MHz</span>`]), when(mem, ["Memory clock", `${fmt(mem)} <span class="u">MHz</span>`]),
@@ -609,7 +644,8 @@ function gpuDetail(g) {
 function gpuRich(g, h, name, cls) {
   return `<div class="gpu ${cls}"><div class="gh"><span class="gn">${esc(name)}</span><span class="gm">${gpuMeta(g)}</span></div>`
     + `<div class="gch3">${sbLoad(tail(h.util), g.util)}${sbPower(tail(h.power), g.power, g.power_limit)}${sbTemp(tail(h.temp), g.temp)}</div>`
-    + `<section class="vb"><h4>VRAM <span>${gib(g.mem_used)} / ${gib(g.mem_total)} GiB</span></h4>${vramSplit(g, cls === "one" ? 960 : 455)}</section>${gpuDetail(g)}</div>`;
+    + `<section class="vb"><h4>VRAM <span>${gib(g.mem_used)} / ${gib(g.mem_total)} GiB</span></h4>${vramSplit(g, cls === "one" ? 960 : 455)}</section>`
+    + gpuAllocations(g.vram_breakdown) + gpuDetail(g) + `</div>`;
 }
 function gpuFoot(g) {
   const sm = g.sm_clock, h2d = g.h2d_gbps, held = g.expert_slots;
@@ -632,12 +668,12 @@ function drawHw(hw, st, hist, eng) {
   const held = num(eng.expert_slots) && num(eng.expert_total) && eng.expert_total > 0 ? `${fmt(eng.expert_slots)} <span class="u">of ${fmt(eng.expert_total)}</span>` : null;
   // four blocks spread over the column's height, so a block without its pending rows leaves no hole
   const sys = `<div class="blk"><h4 title="${esc(st.cpu_name || "")}">${esc(shortCpu(st.cpu_name) || "CPU")} <span>${num(hw.cpu) ? `${Math.round(hw.cpu)}%` : ""}</span></h4>${ccd}</div>`
-    + `<div class="blk"><h4>RAM <span>${gib(hw.ram_used)} / ${gib(hw.ram_total)} GiB</span></h4>${ram}</div>`
+    + `<div class="blk"><h4>RAM <span>${gib(hw.ram_used)} / ${gib(hw.ram_total)} GiB</span></h4>${ram}</div>` + ramAllocations(hw.ram_breakdown)
     + `<div class="blk"><div class="srow"><span>Read</span>${disk}<b>${num(hw.disk_read_mb) ? hw.disk_read_mb.toFixed(1) : "-"} <span class="u">MB/s</span></b></div></div>`
     + cells([when(bw, ["RAM bandwidth", `${bw} <span class="u">GB/s</span>`]), held ? ["Experts in VRAM", held, "Experts held in VRAM slots"] : null, ["Uptime", uptime()],
       ["Driver", st.driver ? `${esc(st.driver)} <span class="u">CUDA ${esc(st.cuda || "-")}</span>` : "-"],
       eng.version ? ["Basalt", `${esc(eng.version)}${commit ? ` <span class="u">${esc(commit)}</span>` : ""}`] : null]);
-  html($("#p-hw"), `<div class="hw"><div class="hw-g">${gpus}</div><div class="hw-s">${sys}</div></div>`);
+  html($("#hardware"), `<div class="hw"><div class="hw-g">${gpus}</div><div class="hw-s">${sys}</div></div>`);
 }
 
 /* ---- several models: the picker names the model and choosing an unloaded one loads it; Unload beside the name ---- */
@@ -837,6 +873,119 @@ function draw() {
   else if (tab === "hw") drawHw(M.hardware || {}, M.hardware_static || {}, hist, eng);
 }
 
+/* ---- opt-in route counters, independent of inference and the log feed ---- */
+let hotspot = null, hotspotBusy = false;
+const hotspotButtons = ["toggle", "reset", "copy", "csv", "md"];
+function hotspotLimit() {
+  const value = $("#hotspot-limit").value;
+  if (value === "all") return null;
+  const n = Number(value === "custom" ? $("#hotspot-custom-limit").value : value);
+  return clamp(Number.isFinite(n) ? Math.floor(n) : 100, 1, hotspot?.layers * hotspot?.experts || 100000);
+}
+try {
+  const saved = JSON.parse(localStorage.getItem("basalt.hotspot-view") || "null");
+  if (saved && ["25", "100", "500", "1000", "all", "custom"].includes(saved.limit)) {
+    $("#hotspot-limit").value = saved.limit;
+    if (Number.isInteger(saved.custom) && saved.custom > 0) $("#hotspot-custom-limit").value = saved.custom;
+  }
+} catch (_) { /* browser storage may be unavailable */ }
+$("#hotspot-custom-limit").hidden = $("#hotspot-limit").value !== "custom";
+function drawHotspots() {
+  const supported = !!hotspot?.supported;
+  text($("#hotspot-state"), supported ? hotspot.recording ? "Recording" : hotspot.decode.length ? "Paused" : "Off" : "Unavailable");
+  text($("#hotspot-toggle"), hotspot?.recording ? "Pause recording" : hotspot?.decode?.length ? "Resume recording" : "Start recording");
+  for (const id of hotspotButtons) $("#hotspot-" + id).disabled = !supported || hotspotBusy;
+  if (!supported) {
+    text($("#hotspot-note"), hotspot?.reason || "Load a supported engine to record hotspots.");
+    html($("#hotspot-table"), "");
+    return;
+  }
+  const rows = ExpertHotspotReport.rows(hotspot, $("#hotspot-phase").value);
+  const total = rows.reduce((a, r) => a + r.count, 0), active = rows.filter(r => r.count), shown = ExpertHotspotReport.selected(rows, hotspotLimit());
+  text($("#hotspot-note"), `${hotspot.model} · ${fmt(total)} evaluated routes · ${fmt(active.length)} active experts · showing ${fmt(shown.length)} of ${fmt(active.length)} · zero-based IDs`);
+  html($("#hotspot-table"), shown.length ? '<table><thead><tr><th>Rank</th><th>Layer</th><th>Expert</th><th>Count</th><th>Layer-relative</th><th>Gate/up · Down</th><th>Overlay</th></tr></thead><tbody>' +
+    shown.map(r => `<tr><td>${r.rank}</td><td>${r.layer}</td><td>${r.expert}</td><td>${fmt(r.count)}</td><td>${r.relative.toFixed(2)}×</td><td>${esc(r.gate_up)} · ${esc(r.down)}</td><td>${r.overlay ? "Yes" : ""}</td></tr>`).join("") + '</tbody></table>' : "");
+}
+async function hotspotRequest(action = "status") {
+  if (hotspotBusy) return null;
+  hotspotBusy = true;
+  for (const id of hotspotButtons) $("#hotspot-" + id).disabled = true;
+  try {
+    const model = M?.engine?.model;
+    let result;
+    if (action === "status") result = await get("api/expert-hotspots" + (model ? `?model=${encodeURIComponent(model)}` : ""));
+    else {
+      const r = await fetch("api/expert-hotspots", {method: "POST", headers: {"Content-Type": "application/json",
+        ...(apiKey ? {Authorization: `Bearer ${apiKey}`} : {})}, body: JSON.stringify({action, model})});
+      result = await r.json();
+      if (!r.ok) throw new Error(result.error?.message || `HTTP ${r.status}`);
+    }
+    hotspot = result;
+    return result;
+  } catch (e) {
+    hotspot = {supported: false, reason: e.message};
+    return null;
+  } finally { hotspotBusy = false; drawHotspots(); }
+}
+$("#expert-hotspots").addEventListener("toggle", () => { if ($("#expert-hotspots").open) hotspotRequest(); });
+$("#hotspot-toggle").onclick = () => hotspotRequest(hotspot?.recording ? "pause" : "start");
+$("#hotspot-reset").onclick = () => hotspotRequest("reset");
+$("#hotspot-phase").onchange = drawHotspots;
+function saveHotspotLimit() {
+  try { localStorage.setItem("basalt.hotspot-view", JSON.stringify({limit: $("#hotspot-limit").value,
+    custom: Number($("#hotspot-custom-limit").value)})); } catch (_) { /* keep the in-page choice */ }
+}
+function changeHotspotLimit() {
+  const custom = $("#hotspot-limit").value === "custom";
+  $("#hotspot-custom-limit").hidden = !custom;
+  if (custom) $("#hotspot-custom-limit").value = hotspotLimit();
+  saveHotspotLimit();
+  drawHotspots();
+}
+$("#hotspot-limit").onchange = changeHotspotLimit;
+$("#hotspot-custom-limit").onchange = changeHotspotLimit;
+$("#hotspot-custom-limit").oninput = () => {
+  if ($("#hotspot-custom-limit").value && $("#hotspot-custom-limit").validity.valid) {
+    saveHotspotLimit(); drawHotspots();
+  }
+};
+async function copyHotspots() {
+  if (!hotspot?.supported) return;
+  // Copy the visible snapshot without an intervening fetch, keeping the click's clipboard permission.
+  const s = hotspot, phase = $("#hotspot-phase").value, limit = hotspotLimit();
+  const body = ExpertHotspotReport.markdown(s, phase, $("#hotspot-label").value.trim(), limit);
+  const button = $("#hotspot-copy");
+  let copied = false;
+  try { await navigator.clipboard.writeText(body); copied = true; } catch (_) { /* plain HTTP or clipboard blocked */ }
+  if (!copied) {
+    const focus = document.activeElement, area = document.createElement("textarea");
+    area.value = body; area.readOnly = true; area.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.append(area); area.select();
+    try { copied = document.execCommand("copy"); } catch (_) { /* export remains available */ }
+    area.remove(); focus?.focus({preventScroll: true});
+  }
+  text(button, copied ? "Copied" : "Copy failed");
+  button.title = copied ? "Copied the selected view and row count as Markdown." : "Clipboard unavailable. Use Export Markdown.";
+  setTimeout(() => text(button, "Copy Markdown"), 2000);
+}
+$("#hotspot-copy").onclick = copyHotspots;
+async function exportHotspots(markdown) {
+  const s = await hotspotRequest();
+  if (!s?.supported) return;
+  const phase = $("#hotspot-phase").value, label = $("#hotspot-label").value.trim();
+  const body = markdown ? ExpertHotspotReport.markdown(s, phase, label, hotspotLimit()) : ExpertHotspotReport.csv(s, phase, label);
+  const url = URL.createObjectURL(new Blob([body], {type: markdown ? "text/markdown;charset=utf-8" : "text/csv;charset=utf-8"}));
+  const a = document.createElement("a"); a.href = url;
+  a.download = `expert-hotspots-${phase}-${new Date(s.captured_at * 1000).toISOString().replace(/[:.]/g, "-")}.${markdown ? "md" : "csv"}`;
+  document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+$("#hotspot-csv").onclick = () => exportHotspots(false);
+$("#hotspot-md").onclick = () => exportHotspots(true);
+async function pollHotspots() {
+  if (tab === "hw" && $("#expert-hotspots").open) await hotspotRequest();
+  setTimeout(pollHotspots, 2000);
+}
+
 /* ---- logs: a level class per line, a warning count, the footer ticker, a filter ---- */
 // the engine's long conversation cache lines, shortened for the panel (the log and the API keep the raw line)
 function shortLog(msg) {
@@ -1010,4 +1159,4 @@ async function resetTotals() {
 
 $("#host").textContent = location.host;
 fetch("health").then(r => r.json()).then(h => { $("#keyed").hidden = !h.api_key; }).catch(() => {});
-drawPanes(); pollMetrics(); pollLog();
+drawPanes(); pollMetrics(); pollLog(); pollHotspots();

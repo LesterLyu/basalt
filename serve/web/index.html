@@ -10,6 +10,7 @@
 <link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="web/app.css">
+<script defer src="web/hotspots.js"></script>
 <script defer src="web/app.js"></script>
 </head>
 <body>
@@ -70,7 +71,28 @@
     <div class="body">
       <section class="pane" id="p-req" role="tabpanel" hidden></section>
       <section class="pane" id="p-slots" role="tabpanel" hidden></section>
-      <section class="pane" id="p-hw" role="tabpanel" hidden></section>
+      <section class="pane" id="p-hw" role="tabpanel" hidden>
+        <div id="hardware"></div>
+    <details class="expert-hotspots" id="expert-hotspots">
+      <summary><b>Expert hotspots</b><span id="hotspot-state">Off by default</span></summary>
+      <div class="hotspot-content">
+        <div class="hotspot-controls">
+          <button type="button" id="hotspot-toggle" disabled>Start recording</button>
+          <button type="button" id="hotspot-reset" disabled>Clear</button>
+          <label>View <select id="hotspot-phase"><option value="decode">Decode / verify</option><option value="prefill">Prefill</option><option value="combined">Combined</option></select></label>
+          <label>Show <select id="hotspot-limit"><option value="25">Top 25</option><option value="100" selected>Top 100</option><option value="500">Top 500</option><option value="1000">Top 1000</option><option value="all">All active</option><option value="custom">Custom</option></select></label>
+          <input type="number" id="hotspot-custom-limit" aria-label="Custom expert limit" value="250" min="1" step="1" hidden>
+          <label>Label <input id="hotspot-label" maxlength="80" placeholder="e.g. geth-go-thinking"></label>
+          <button type="button" id="hotspot-copy" aria-live="polite" disabled>Copy Markdown</button>
+          <button type="button" id="hotspot-csv" disabled>Export CSV</button>
+          <button type="button" id="hotspot-md" disabled>Export Markdown</button>
+        </div>
+        <p class="hint" id="hotspot-note" role="status">Open this panel to connect. Recording stays off until started.</p>
+        <div class="hotspot-table" id="hotspot-table"></div>
+        <p class="hint">All slots are combined. Counts include target-model draft verification, including rejected rows; cached prompt rows and drafter experts are excluded. Layer-relative heat compares each expert with its layer's mean. Clear before a new workload. Counts are lost when the engine restarts.</p>
+      </div>
+    </details>
+      </section>
       <section class="pane logs" id="p-logs" role="tabpanel" hidden><div id="log" role="log" aria-live="off" tabindex="0"></div></section>
     </div>
   </section>
