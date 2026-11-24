@@ -114,7 +114,7 @@ int Runtime::run_requests() {
     for (;;) {
         report_memory();
         const Flow flow = dispatch();
-        if (flow != Flow::error) report_memory(!batch_on() && !windows_in_flight());
+        if (flow != Flow::error) report_memory(!batch_on());
         if (flow == Flow::error) {
             if (basalt::core::gpu_left_running().load()) {   // the teardown would wait for the stuck window forever
                 basalt::log::error("basalt serve", "the GPU did not finish a released window: ending without the CUDA teardown");
