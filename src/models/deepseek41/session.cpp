@@ -41,7 +41,7 @@
 
 namespace basalt::models::deepseek41 {
 namespace {
-constexpr int kLendTierTokens = 4096;   // a prompt this long reads without the VRAM tier, in larger chunks
+constexpr int kLendTierTokens = 4096;   // long prompts may give up the copy-only expert arena
 constexpr int kStepTailTokens = 256;     // a tail this short may read one decode step at a time when no workspaces fit
 
 #define DS_CUDA(call)                                                                                   \
@@ -309,14 +309,14 @@ public:
             {
                 if (plan_tokens > prefillp::kShortPrompt) release_short_prompt();
                 open_prompt_path(plan_tokens);
-                if (plan_tokens >= kLendTierTokens) {
+                if (plan_tokens >= kLendTierTokens && !m_.tiers().keep_main_expert_homes) {
                     std::string te;
                     if (core::ExpertTier* t = ops_->expert_tier(te)) t->lend_all();
                 }
                 // the caches take their memory before the prompt workspaces do
                 if (!ops_->ensure_positions(r.pos + r.n_tokens, err)) return prompt_failed(err);
                 if (!prefill_ && !make_prefill_fit(plan_tokens, err)) {
-                    // a long context's caches left no room: a short tail (< 16 tokens) takes the decode path, a longer read the tier's memory
+                    // A short tail takes the decode path; a longer read can release an indivisible copy arena.
                     if (r.n_tokens < kStepTailTokens) {
                         close_prompt_path();
                         for (int i = 0; i < r.n_tokens; ++i)
@@ -789,11 +789,11 @@ private:
                     core::MemoryUsage usage;
                     prefill_->memory_usage(usage);
                     if (tier) {
-                        if (!slabs) tier->grow();
+                        if ((!m_.tiers().keep_main_expert_homes || beside) && !slabs) tier->grow();
                         if (!beside && cudaMemGetInfo(&free_b,&total_b) == cudaSuccess)
-                            basalt::log::info("basalt deepseek41","prompt workspace: %d tokens, %.2f GiB buffers, %.2f GiB reclaimable experts, %.2f GiB free",cap,
+                            basalt::log::info("basalt deepseek41","prompt workspace: %d tokens, %.2f GiB buffers, %.2f GiB reclaimable experts, %.2f GiB free, %lld main expert slots retained",cap,
                                               usage.gpus[m_.device()]["long_prefill"]/1073741824.,
-                                              (tier->loanable_bytes())/1073741824.,free_b/1073741824.);
+                                              tier->loanable_bytes()/1073741824.,free_b/1073741824., (long long) tier->slots());
                         if (slabs) basalt::log::info("basalt deepseek41", "slab prompt workspace: %d tokens, %llu MiB estimated, %llu MiB extra",
                             cap, (unsigned long long) (wanted >> 20), (unsigned long long) (extra >> 20));
                     }

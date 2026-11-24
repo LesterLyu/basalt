@@ -76,6 +76,8 @@ struct ExpertTierSpec {
     int admit_uses = 0;
     int main_promote_misses = 0;
     bool gpu_single_miss = false;
+    bool keep_main_homes = false;   ///< place main GPU homes once, even when the full complement fits in RAM
+    bool exclusive_main_cache = false; ///< the extra main GPU slots also own their weights
     bool direct_peer_results = false;
     /// Copies (bus fetches and promotions) a window may claim per row; 0: 128 a window whatever its rows, the way the first
     /// model ran them. A window's rows route to mostly different experts, so a per-row budget keeps their admissions.
@@ -161,7 +163,7 @@ public:
     /// Gives the VRAM slots that the prompt path's workspaces occupy back to the driver (call before they are
     /// allocated); `grow` opens the planned slots beside the base arena again once they are free, with the experts a
     /// shrink or lend took off the card (most recently used first) and then the profile's ranked ones.
-    void shrink();
+    bool shrink();
     bool borrow_peer_workspace(uint64_t bytes, void*& storage, uint64_t& capacity, std::string& err);
     bool return_peer_workspace(std::string& err);
     void grow();
@@ -171,7 +173,7 @@ public:
     /// copied before it returns. Homes stay.
     void lend_all();
     bool reclaim(std::string& err, bool restore = false);
-    /// Whether lend() can give up part of the base arena (ExpertTierSpec::lend_segment, copies, a segmented arena).
+    /// The bytes of all copies. An indivisible base arena can only be released by lend_all().
     uint64_t loanable_bytes() const {
         return ext_.mapped_bytes() + (homes_.main == 0 ? cache_.mapped_bytes() : 0);
     }
@@ -179,8 +181,8 @@ public:
     bool partial_lend() const { return !live_.empty(); }
     /// Leaves `bytes` device bytes free above the floor by giving up the fewest slots: the ones beside the base arena,
     /// then each layer's last base slots in proportion to its share (the arena's tail holds every layer's last ones).
-    /// First the most recently used experts of each layer move into the slots it keeps. False, with nothing given up,
-    /// when all of them would not free that much (or without partial_lend). reclaim() maps them again (refilled with restore).
+    /// For a segmented base arena the most recently used experts move into the slots it keeps. False if the available
+    /// copies cannot cover the deficit. reclaim() maps base slots again and grow() restores the slots beside them.
     bool lend(uint64_t bytes);
     /// An explicit new --vram-reserve-mib (`mib` < 0: the start's): the one time the size is planned again after the
     /// start. The slots that fit above the new reserve are opened; the response reports them.
@@ -312,6 +314,9 @@ public:
 
 private:
     bool plan_ext(std::string& err);
+    bool open_ext(int64_t per_layer, std::string& err);
+    bool park_main_cache(std::string& err);
+    bool return_main_cache(double arena_ms, std::string& err);
     bool reopen_base(int64_t n, std::string& err);
     /// A slot's copy on its way. `out` >= 0: the home it replaces is on its way to RAM place `place`.
     struct Pending {
@@ -369,6 +374,9 @@ private:
     void release_spare(int layer, int32_t place);
     const ExpertTierSpec::Replacement* replacement(int layer, int id) const;
     bool pinned(int layer, int e) const { return ram_idx_[(size_t) layer * n_expert_ + e] >= 0; }
+    const uint8_t* parked_blob(int layer, int e) const {
+        return parked_blobs_.empty() ? nullptr : parked_blobs_[(size_t) layer * n_expert_ + e];
+    }
     /// Gives the file experts of `ids` the RAM places of the layer's least recently used pinned experts outside `ids`
     /// and starts reading them there; `reading[i]` marks those of `ids`.
     bool read_misses(int layer, const int32_t* ids, int k, bool* reading, std::string& err);
@@ -451,6 +459,10 @@ private:
     std::vector<std::vector<int32_t>> ram_spares_;
     float* peer_decode_rows_ = nullptr;
     RamAllocation peer_workspace_backup_;
+    RamAllocation parked_main_cache_;
+    RamPin parked_main_pin_;
+    std::vector<int32_t> parked_owners_;   ///< exact extra-slot owners to restore after the loan
+    std::vector<uint8_t*> parked_blobs_;   ///< addresses of the loaned weights by layer and expert
     std::vector<core::RamAllocation> ram_allocations_;
     std::vector<core::RamPin> ram_pins_;    ///< [layer] what each span's pin got
     std::vector<uint8_t*> ram_;             ///< [layer] cover_ + 1 pinned expert slots (the last starts as the spare)

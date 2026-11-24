@@ -149,6 +149,12 @@ int main() {
         CHECK(h.main == 22 && h.ram == 310 && h.file == 6);
         h = plan_homes(384, 22, 46, 338, 360);         // room for the second card's rest and the homes again: copies only
         CHECK(h.main == 0 && h.ram == 338 && h.file == 0);
+        h = plan_homes(384, 22, 46, 338, 360, /*keep_main_homes=*/true);
+        CHECK(h.main == 22 && h.peer == 46 && h.ram == 316 && h.file == 0);
+        CHECK(place_of_rank(h, 22, 21) == Place::Main && place_of_rank(h, 22, 22) == Place::Peer &&
+              place_of_rank(h, 22, 68) == Place::Ram);
+        h = plan_homes(384, 22, 46, 300, -1, /*keep_main_homes=*/true);
+        CHECK(h.main == 22 && h.peer == 46 && h.ram == 300 && h.file == 16);
         h = plan_homes(384, 22, 46, 330, 1000);        // other programs hold RAM now: a short tier, not homes
         CHECK(h.main == 0 && h.ram == 330 && h.file == 8);
         h = plan_homes(384, 34, 0, 384, 400);          // one card

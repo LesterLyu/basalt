@@ -226,6 +226,8 @@ core::ExpertTierSpec DsModel::tier_spec() const {
     const Geometry& g = pack_.geo;
     core::ExpertTierSpec s;
     s.gpu_single_miss = tiers_.gpu_single_miss;
+    s.keep_main_homes = tiers_.keep_main_expert_homes;
+    s.exclusive_main_cache = tiers_.exclusive_main_cache;
     s.direct_peer_results = true;
     s.main_promote_misses = tiers_.main_promote_misses;
     s.area = "basalt deepseek41";

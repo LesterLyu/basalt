@@ -65,14 +65,15 @@ struct Homes {
 /// The main card keeps its homes unless `ram_cap` takes what the second card does not and as many places again as the
 /// main card would have homed: copies-only decodes slower than homes, so it is picked only where RAM leaves no doubt.
 /// The choice reads `ram_cap` alone, so page-cache state and other readings of free memory never move it; `ram_slots`
-/// only sizes the tier. What RAM cannot take stays in the file, so a shortfall of N places puts N experts there.
-inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_slots, int ram_cap) {
+/// only sizes the tier. `keep_main_homes` skips that choice when the caller reserves prompt room beside the homes.
+/// What RAM cannot take stays in the file, so a shortfall of N places puts N experts there.
+inline Homes plan_homes(int n_expert, int main_slots, int peer_slots, int ram_slots, int ram_cap, bool keep_main_homes = false) {
     Homes h;
     h.peer = peer_slots < n_expert ? peer_slots : n_expert;
     const int left = n_expert - h.peer;
     const int homed = main_slots < left ? main_slots : left;
     const bool roomy = ram_cap < 0 ? ram_slots >= left : ram_cap >= left + homed;
-    if (!roomy) h.main = homed;
+    if (keep_main_homes || !roomy) h.main = homed;
     const int rest = left - h.main;
     h.ram = ram_slots < rest ? ram_slots : rest;
     h.file = rest - h.ram;

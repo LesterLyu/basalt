@@ -119,6 +119,8 @@ void usage() {
                  "  --expert-overlay FILE  target expert replacements, shared across slots\n"
                  "  --prefill-chunk N    prompt chunk ceiling, 256..16384 (power of two, default 16384); shrinks to fit\n"
                  "  --ds-gpu-single-miss  try the main GPU for a lone RAM expert miss (default: CPU)\n"
+                 "  --ds-keep-main-expert-homes  use main-GPU expert homes to save RAM and retain them during prefill\n"
+                 "  --ds-no-expert-ram-mirrors  keep loanable main-GPU experts in VRAM until borrowed (also keeps main expert homes)\n"
                  "  --ds-main-promote-misses N  DeepSeek main-GPU cache admission: 2 or 3 misses in 64 tokens (default 3)\n"
                  "  --relaxed-drafting [P]  sampled requests keep a draft the target gives probability >= P even when\n"
                  "                       the target's own draw differs: faster, but NOT the exact sampling distribution\n"

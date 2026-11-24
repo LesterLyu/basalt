@@ -109,6 +109,8 @@ struct CommonOptions {
     /// that take --suffix-draft; 0 = the drafter only.
     int suffix_draft = 3;
     bool gpu_single_miss = false;      ///< fetch a lone RAM expert for the main GPU
+    bool keep_main_expert_homes = false; ///< keep DeepSeek's main-GPU expert homes when RAM could hold copies
+    bool exclusive_main_cache = false; ///< return DeepSeek's loanable experts from the GPU only when their slots are borrowed
     int main_promote_misses = 3;       ///< --ds-main-promote-misses: misses needed to cache a main-GPU expert
     std::string spec_oracle;
     int draft_experts = 32;            ///< --draft-experts N: the drafter's routed experts each stage keeps (0: all)

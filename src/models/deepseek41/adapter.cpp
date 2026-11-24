@@ -90,6 +90,11 @@ public:
         else if (a == "--expert-overlay") o.expert_overlay = args.next("--expert-overlay");
         else if (a == "--prefill-chunk") o.prefill_chunk = std::atoi(args.next("--prefill-chunk"));
         else if (a == "--ds-gpu-single-miss") o.gpu_single_miss = true;
+        else if (a == "--ds-keep-main-expert-homes") o.keep_main_expert_homes = true;
+        else if (a == "--ds-no-expert-ram-mirrors") {
+            o.keep_main_expert_homes = true;
+            o.exclusive_main_cache = true;
+        }
         else if (a == "--ds-main-promote-misses") {
             const std::string_view value = args.next("--ds-main-promote-misses");
             if (value == "2" || value == "3") o.main_promote_misses = value.front() - '0';
