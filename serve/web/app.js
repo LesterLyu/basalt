@@ -282,15 +282,32 @@ function drawWeights(eng) {
   drawSplit(tiers, `Each cell is 1/${SPLIT_CELLS} of the weights' bytes, coloured by where they sit.`);
 }
 
-/* ---- tabs: Requests | Slots | Devices | Logs (keys 1-4 and L; #tab=req|slots|hw|logs opens one) ---- */
+/* ---- Overview and Devices; the Overview tabs are Requests, Slots and Logs ---- */
 const TABS = ["req", "slots", "hw", "logs"];
-const fromHash = location.hash === "#devices" ? "hw" : (/tab=(\w+)/.exec(location.hash) || [])[1];
-let tab = (t => TABS.includes(t) ? t : "req")(fromHash || sessionStorage.getItem("basalt.tab3"));
-function setTab(t) {
+const isOverviewTab = t => t !== "hw" && TABS.includes(t);
+const savedTab = sessionStorage.getItem("basalt.tab3");
+let overviewTab = sessionStorage.getItem("basalt.overviewTab");
+if (!isOverviewTab(overviewTab)) overviewTab = isOverviewTab(savedTab) ? savedTab : "req";
+function linkedTab() {
+  if (location.hash === "#devices") return "hw";
+  if (location.hash === "#overview") return overviewTab;
+  const t = (/^#tab=(\w+)$/.exec(location.hash) || [])[1];
+  return TABS.includes(t) ? t : null;
+}
+let tab = linkedTab() || (TABS.includes(savedTab) ? savedTab : overviewTab);
+if (isOverviewTab(tab)) overviewTab = tab;
+function setTab(t, updateHash = true) {
   if (!TABS.includes(t)) return;
-  tab = t; try { sessionStorage.setItem("basalt.tab3", tab); } catch (err) { /* private mode */ }
+  if (updateHash && (t === "hw") !== (tab === "hw")) location.hash = t === "hw" ? "#devices" : "#overview";
+  tab = t;
+  if (isOverviewTab(tab)) overviewTab = tab;
+  try {
+    sessionStorage.setItem("basalt.tab3", tab);
+    sessionStorage.setItem("basalt.overviewTab", overviewTab);
+  } catch (err) { /* private mode */ }
   draw(); drawPanes();
 }
+window.addEventListener("hashchange", () => setTab(linkedTab() || overviewTab, false));
 $("#tabs").addEventListener("click", e => { const b = e.target.closest("button[data-t]"); if (b) setTab(b.dataset.t); });
 document.addEventListener("keydown", e => {
   if (e.target.closest("input, textarea, .ms") || e.metaKey || e.ctrlKey || e.altKey) return;
@@ -299,18 +316,22 @@ document.addEventListener("keydown", e => {
   else if (k === "l") setTab("logs");
 });
 $("#ticker").addEventListener("click", () => setTab("logs"));
-function drawTabs(live, reqs, slots, total, G) {
+function drawTabs(live, reqs, slots, total) {
   const n = live.queued || 0, active = slots.filter(s => s.is_processing).length;
   // while a slot runs, busy over all; otherwise the slot count, in grey
   const T = [["req", "Requests", n ? `${n} queued` : reqs.length ? String(reqs.length) : "", n ? "hot" : ""],
     ["slots", "Slots", active ? `${active}/${total}` : `${total} slot${total === 1 ? "" : "s"}`, active ? "hot" : ""],
-    ["hw", "Devices", G.length ? `${G.length} GPU${G.length === 1 ? "" : "s"}` : "", ""],
     ["logs", "Logs", warnCount ? `${warnCount} warn` : logCount ? fmt(logCount) : "", warnCount ? "warn" : ""]];
   html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === tab}">`
     + `<span>${t[1]}</span>${t[2] ? `<em class="${t[3]}">${t[2]}</em>` : ""}</button>`).join(""));
   $("#tabs").lastElementChild.title = `${fmt(logCount)} lines${warnCount ? `, ${warnCount} warning${warnCount === 1 ? "" : "s"}` : ""}`;
 }
 function drawPanes() {
+  const devices = tab === "hw";
+  $(".hero").hidden = devices;
+  $(".panel").hidden = devices;
+  $("#overview-link").setAttribute("aria-current", devices ? "false" : "page");
+  $("#devices-link").setAttribute("aria-current", devices ? "page" : "false");
   TABS.forEach(t => { $(`#p-${t}`).hidden = t !== tab; });
   $("#lfilter").hidden = tab !== "logs"; if (tab !== "logs") $("#jump").hidden = true;
   if (tab === "logs" && follow) logEl.scrollTop = logEl.scrollHeight;   // a hidden log cannot scroll; catch up when shown
@@ -591,8 +612,14 @@ function labelledBar(parts, T, px) {
 const VP = [["experts", "Experts", "var(--t-vram)"], ["kv", "KV", "var(--t-peer)"], ["other", "Other", "var(--fg-2)"]];
 function vramSplit(g, px) {
   const v = g.vram_parts, T = g.mem_total || 1;
-  if (!v) return bar(g.mem_used / T);
-  const parts = VP.filter(p => v[p[0]] > 0).map(p => [p[1], p[2], v[p[0]]]).concat([["Free", "var(--basalt-800)", Math.max(0, T - g.mem_used)]]);
+  const b = g.vram_breakdown?.components || {};
+  const used = clamp(g.mem_used || 0, 0, T);
+  const liveExperts = num(b.experts) || num(b.expert_helper);
+  if (!v && !liveExperts && !num(b.kv_state)) return bar(used / T);
+  const experts = clamp(liveExperts ? (b.experts || 0) + (b.expert_helper || 0) : v?.experts || 0, 0, used);
+  const kv = clamp(b.kv_state ?? v?.kv ?? 0, 0, used - experts);
+  const bytes = {experts, kv, other: used - experts - kv};
+  const parts = VP.filter(p => bytes[p[0]] > 0).map(p => [p[1], p[2], bytes[p[0]]]).concat([["Free", "var(--basalt-800)", T - used]]);
   return labelledBar(parts, T, px);
 }
 const mb = v => num(v) ? v >= 1000 ? `${(v / 1000).toFixed(1)} GB/s` : `${Math.round(v)} MB/s` : "-";
@@ -866,7 +893,7 @@ function draw() {
   saver(none);
   drawHero(live, hist, reqs, M.best || {}, slots, total);
   if (!none) drawExperts(eng, reqs[0], Math.max(0, ((M.hardware || {}).gpus || []).length - 1));
-  drawTabs(live, reqs, slots, total, (M.hardware || {}).gpus || []);
+  drawTabs(live, reqs, slots, total);
   // only the open pane is drawn; the others are drawn when opened
   if (tab === "req") drawReq(live, reqs, total);
   else if (tab === "slots") drawSlots(slots, slots.map((_, k) => tail((hist.slot_tok_s || [])[k])), reqs, total);

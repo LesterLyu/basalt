@@ -51,6 +51,9 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .brand { display: flex; align-items: center; gap: 11px; flex: none; }
 .brand img { width: 28px; height: 28px; display: block; }
 .wordmark { font: 700 22px/1 var(--font-sans); letter-spacing: -.035em; }
+.dashboard-nav { display: flex; align-items: center; gap: 4px; flex: none; }
+.dashboard-nav a { padding: 7px 10px; border-radius: 6px; color: var(--fg-2); font-weight: 500; text-decoration: none; }
+.dashboard-nav a:hover, .dashboard-nav a[aria-current="page"] { color: var(--fg); background: var(--raised); }
 .crumb { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 0 1 auto; }
 
 .crumb-sep { color: var(--raised); font: 300 24px/1 var(--font-sans); flex: none; }
@@ -534,6 +537,7 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .support-alt { padding: 16px 24px 0; font: 400 13px/1.5 var(--font-sans); color: var(--fg-3); }
 .support-alt a { color: var(--fg-2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
 .support-alt a:hover { color: var(--accent); text-decoration-color: var(--accent-line); }
+.devices { flex: 1; min-height: 0; overflow: auto; padding: 24px 0 20px; }
 #hardware .hw, #hardware .hw-s, #hardware .gpus.rich, #hardware .gpu.one, #hardware .gpu.two { height: auto; }
 .allocation-rows { margin: 0; display: grid; gap: 4px; font: 12px/1.35 var(--font-mono); }
 .allocation-rows div { display: flex; justify-content: space-between; gap: 12px; }

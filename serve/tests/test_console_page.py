@@ -83,6 +83,7 @@ const el = () => new Proxy(function () {}, {
     : k === "querySelectorAll" ? () => [] : k === "querySelector" ? () => null : typeof k === "symbol" ? undefined : el(),
   set: () => true, apply: () => el() });
 const ctx = { document: { querySelector: () => el(), addEventListener() {}, createElement: () => el(), hidden: false },
+  window: { addEventListener() {} },
   sessionStorage: { getItem: () => null, setItem() {} }, location: { hash: "", host: "" }, fetch: () => new Promise(() => {}),
   ResizeObserver: class { observe() {} }, matchMedia: () => ({ matches: false }), requestAnimationFrame() {}, setTimeout() {},
   clearTimeout() {}, performance: { now: () => 0 }, devicePixelRatio: 1, console };
@@ -92,6 +93,7 @@ vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8") + `
     slot: Object.values(slotSections(input.slot, [], input.reqs, "full")).join(""),
     card: slotCard(input.slot, [], input.reqs, 100, "full", { draft: true, hit: true, cols: "1fr" }),
     gpu: gpuDetail(input.gpu),
+    vramSplit: vramSplit(input.gpu, 455),
     gpuAllocations: gpuAllocations(input.gpu.vram_breakdown),
     ramAllocations: ramAllocations({ engine_allocations: { resident_experts: 2 ** 30, pinned_experts: 2 ** 29, vision_weights: 2 ** 28 },
       processes: { engine: { rss: 2 ** 31 } } }),
@@ -141,6 +143,17 @@ class MissingFieldsHide(unittest.TestCase):
         self.assertIn("Traffic in", out["gpu"])
         for gone in ("SM clock", "Memory clock", "Host → GPU", "Experts held", "Throttling"):
             self.assertNotIn(gone, out["gpu"])
+
+    def test_vram_bar_uses_live_expert_allocation_after_a_loan(self):
+        GiB = 2 ** 30
+        gpu = {**self.gpu, "mem_used": 20 * GiB, "mem_total": 32 * GiB,
+               "vram_parts": {"experts": 19 * GiB, "other": GiB},
+               "vram_breakdown": {"components": {"experts": 0, "kv_state": GiB}}}
+        out = self.draw(self.slot, gpu)["vramSplit"]
+        self.assertNotIn("Experts", out)
+        self.assertIn('title="KV 1.0 GiB"', out)
+        self.assertIn('title="Other 19.0 GiB"', out)
+        self.assertIn('title="Free 12.0 GiB"', out)
 
     def test_device_allocations_include_live_engine_details(self):
         gpu = {**self.gpu, "vram_breakdown": {"components": {"weights": 2 ** 30, "dfly": 2 ** 29},
