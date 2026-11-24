@@ -538,6 +538,14 @@ table.mini td { padding: 4px 8px 4px 0; font-size: 12px; line-height: 16px; bord
 .support-alt a { color: var(--fg-2); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
 .support-alt a:hover { color: var(--accent); text-decoration-color: var(--accent-line); }
 .devices { flex: 1; min-height: 0; overflow: auto; padding: 24px 0 20px; }
+.devices-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(145px, 100%), 1fr)); gap: 1px;
+  margin-bottom: 16px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--line); }
+.devices-summary > div { min-width: 0; padding: 10px 14px; background: var(--surface); }
+.devices-summary .v { display: block; margin-top: 5px; font-size: 18px; letter-spacing: -.02em; }
+.devices-summary .v small { font-size: 11px; margin-left: 6px; }
+.devices-summary .active .v { color: var(--accent); }
+.devices-summary .sub { margin-top: 3px; min-height: 1.4em; }
+.devices-summary .engine-phase { display: block; margin-top: 6px; line-height: 1.35; overflow-wrap: anywhere; }
 #hardware .hw, #hardware .hw-s, #hardware .gpus.rich, #hardware .gpu.one, #hardware .gpu.two { height: auto; }
 .allocation-rows { margin: 0; display: grid; gap: 4px; font: 12px/1.35 var(--font-mono); }
 .allocation-rows div { display: flex; justify-content: space-between; gap: 12px; }

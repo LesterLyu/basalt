@@ -678,6 +678,25 @@ function gpuFoot(g) {
   const sm = g.sm_clock, h2d = g.h2d_gbps, held = g.expert_slots;
   return [num(sm) ? `${fmt(sm)} MHz` : "", num(h2d) ? `${h2d} GB/s` : "", num(held) ? big(held) : ""].filter(Boolean).join(" · ");
 }
+function devicesSummary(live, reqs, slots, eng, state, detail) {
+  const rd = reqs.find(r => num(r.decode_tok_s)), rp = reqs.find(realRead);
+  const decoding = slots.filter(s => s.is_processing && s.state === "generation" && num(s.tok_s) && s.tok_s > 0);
+  const decode = live.state === "generating" && live.tok_s > 0 ? live.tok_s :
+    decoding.length ? decoding.reduce((rate, s) => rate + s.tok_s, 0) : null;
+  const reading = live.state === "reading" || slots.some(s => s.is_processing && s.state === "prefill");
+  const prefill = reading && live.prefill_tok_s_mean > 0 ? live.prefill_tok_s_mean : null;
+  const accepted = rd?.drafts_offered > 0 && num(rd.drafts_accepted)
+    ? `Draft accept ${Math.round(100 * rd.drafts_accepted / rd.drafts_offered)}%` : "";
+  const full = !eng.spill && eng.expert_total > 0 && eng.expert_slots >= eng.expert_total;
+  const lookup = reqs.find(r => num(r.hit_rate)), hit = full ? 1 : lookup?.hit_rate;
+  const rate = (value, dp) => num(value) ? `${fmt(value, dp)}<small>tok/s</small>` : "-";
+  const metric = (label, value, note, active = false) => `<div class="${active ? "active" : ""}"><span class="k">${label}</span><b class="v">${value}</b><p class="sub">${note}</p></div>`;
+  return metric("Decode", rate(decode ?? rd?.decode_tok_s, 1), decode != null
+    ? ["Live", accepted && `last ${accepted.toLowerCase()}`].filter(Boolean).join(" · ") : accepted || (rd ? "Last request" : ""), decode != null)
+    + metric("Prefill", rate(prefill ?? (rp && readRate(rp))), prefill != null ? "Live" : rp ? "Last read" : "", prefill != null)
+    + metric("VRAM hit", num(hit) ? `${(hit * 100).toFixed(1)}%` : "-", full ? "All experts in VRAM" : lookup ? "Last request" : "")
+    + `<div><span class="k">Engine</span><b class="engine-phase" title="${esc(detail)}">${esc(state)}</b></div>`;
+}
 function drawHw(hw, st, hist, eng) {
   gid = 0;
   const G = hw.gpus || [], H = Object.fromEntries((hist.gpus || []).map(x => [x.index, x]));
@@ -897,7 +916,10 @@ function draw() {
   // only the open pane is drawn; the others are drawn when opened
   if (tab === "req") drawReq(live, reqs, total);
   else if (tab === "slots") drawSlots(slots, slots.map((_, k) => tail((hist.slot_tok_s || [])[k])), reqs, total);
-  else if (tab === "hw") drawHw(M.hardware || {}, M.hardware_static || {}, hist, eng);
+  else if (tab === "hw") {
+    html($("#devices-summary"), devicesSummary(live, reqs, slots, eng, $("#state").textContent, swTip));
+    drawHw(M.hardware || {}, M.hardware_static || {}, hist, eng);
+  }
 }
 
 /* ---- opt-in route counters, independent of inference and the log feed ---- */

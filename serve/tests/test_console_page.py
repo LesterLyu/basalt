@@ -97,6 +97,9 @@ vm.runInNewContext(fs.readFileSync(process.argv[2], "utf8") + `
     gpuAllocations: gpuAllocations(input.gpu.vram_breakdown),
     ramAllocations: ramAllocations({ engine_allocations: { resident_experts: 2 ** 30, pinned_experts: 2 ** 29, vision_weights: 2 ** 28 },
       processes: { engine: { rss: 2 ** 31 } } }),
+    devices: devicesSummary({ state: "reading", prefill_tok_s_mean: 1900 },
+      [{ decode_tok_s: 52.4, drafts_offered: 100, drafts_accepted: 67, hit_rate: .817 }],
+      [{ state: "generation", is_processing: true, tok_s: 61.5 }], {}, "Reading", ""),
     split: splitCells([["VRAM", "", 0.9, "t0"], ["CPU", "", 0.1, "t2"]], 10),
     empty: splitCells([["VRAM", "", null, "t0"], ["CPU", "", null, "t2"]], 4),
     down: slotsDown(2),
@@ -201,6 +204,11 @@ class MissingFieldsHide(unittest.TestCase):
         self.assertEqual(out["headline"], "d")                           # a follow-up that read 36 tokens has no read rate
         self.assertEqual(out["best"], "d")                               # no best from the server: the fastest real read listed
         self.assertEqual(out["serverBest"], "s")
+
+    def test_devices_shows_live_decode_and_prefill_together(self):
+        summary = self.draw(self.slot, self.gpu)["devices"]
+        for shown in ("Decode", "61.5", "last draft accept 67%", "Prefill", "1,900", "VRAM hit", "81.7%", "Engine", "Reading"):
+            self.assertIn(shown, summary)
 
 # app.js in node over the stub DOM, with fetch answering each post as `answer` says: the load and unload controls step by step
 CONTROLS = HARNESS.split("const input =")[0] + r"""
