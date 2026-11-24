@@ -957,13 +957,21 @@ def make_handler(target: Service | Router):
 
         def _responses_prepare(self, req):
             responses_api.check_request(req)
-            messages = responses_api.input_messages(req)
             tools, names, skipped = responses_api.request_tools(req)
             try:
                 tools, force = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
+            updates = ()
+            if req.get("tool_choice") != "none":
+                key = req.get("prompt_cache_key")
+                session = key if isinstance(key, str) and key else self._session_id(req)
+                declared = kw.get("_prompt_tools", tools)
+                header, updates = self.svc.response_tools.replay(session, req, declared)
+                if updates or header is not declared:
+                    kw["_prompt_tools"] = header
+            messages = responses_api.input_messages(req, updates)
             validator = None
             try:
                 fmt = responses_api.text_format(req)

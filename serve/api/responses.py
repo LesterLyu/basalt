@@ -16,9 +16,13 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
+import threading
 import time
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 
 from serve.api.logprobs import MAX_TOP as MAX_TOP_LOGPROBS, REQUEST_KEY as LOGPROBS_KEY
 from serve.api.structured import validated_json
@@ -149,23 +153,38 @@ def _leading_tool_items(items) -> list[int]:
     return leading
 
 
-def input_messages(req: dict) -> list[dict]:
+def _input_items(items):
+    return [{"type": "message", "role": "user", "content": items}] if isinstance(items, str) else items
+
+
+def _without_leading_tools(items, leading):
+    return [item for i, item in enumerate(items) if i not in leading] if leading else items
+
+
+def input_messages(req: dict, tool_updates=()) -> list[dict]:
     """`instructions` + `input` -> the chat template's messages."""
     messages = []
     instructions = req.get("instructions")
     if instructions not in (None, ""):
         messages.append({"role": "system", "content": _content(instructions, "instructions")
                          if not isinstance(instructions, str) else instructions})
-    items = req.get("input")
+    items = _input_items(req.get("input"))
     if items is None:
         raise ResponsesError("input is required: a string or an array of input items", "input", "missing_required_parameter")
-    if isinstance(items, str):
-        items = [{"type": "message", "role": "user", "content": items}]
     if not isinstance(items, list):
         raise ResponsesError("input must be a string or an array of input items", "input")
+    leading_tools = set(_leading_tool_items(items))
+    if tool_updates:
+        items = _without_leading_tools(items, leading_tools)
+        leading_tools.clear()
+        replay, start = [], 0
+        for position, item in tool_updates:
+            replay.extend(items[start:position])
+            replay.append(item)
+            start = position
+        items = replay + items[start:]
     thinking = []                                    # reasoning waiting for the assistant turn it belongs to
     open_turn = None                                 # the assistant message the next function_call joins
-    leading_tools = _leading_tool_items(items)
 
     def turn(content=""):
         nonlocal open_turn
@@ -241,10 +260,14 @@ def input_messages(req: dict) -> list[dict]:
             if i in leading_tools:
                 continue
             found = item.get("tools")
-            if isinstance(found, list) and found:
-                messages.append({"role": "user", "content":
-                                 "Additional callable tools (call namespaced tools as namespace.name):\n" +
-                                 json.dumps(found, ensure_ascii=False)})
+            retired = item.get("_retired_tools", ())
+            if isinstance(found, list) and (found or retired):
+                note = "Additional callable tools (call namespaced tools as namespace.name):"
+                if item.get("_catalog_update"):
+                    note += " Use these definitions in place of earlier declarations with the same name."
+                    if retired:
+                        note += " No longer available: " + json.dumps(retired, ensure_ascii=False) + "."
+                messages.append({"role": "user", "content": note + "\n" + json.dumps(found, ensure_ascii=False)})
                 open_turn = None
                 thinking.clear()
         elif kind == "item_reference":
@@ -431,6 +454,80 @@ def template_kwargs(req: dict) -> dict:
                 header.extend(found)
         kwargs["_prompt_tools"] = request_tools({"tools": header, "tool_choice": req.get("tool_choice")})[0]
     return kwargs
+
+
+@dataclass(frozen=True)
+class _ToolRevision:
+    header: list | None
+    tools: list | None
+    updates: tuple
+    size: int
+
+
+class ToolHistory:
+    """Keep a named Responses conversation's tool declarations where the client first supplied them."""
+
+    def __init__(self):
+        self._revisions = OrderedDict()
+        self._lock = threading.Lock()
+
+    def replay(self, session, req: dict, tools):
+        """Return the original header and changes anchored to prefixes of the client's message list."""
+        items = _input_items(req.get("input"))
+        if not isinstance(session, str) or not 0 < len(session) <= 4096 or not isinstance(items, list) or not items:
+            return tools, ()
+        # Codex can repeat its entire tool table before the first user item. It is part of the header, not the history.
+        items = _without_leading_tools(items, set(_leading_tool_items(items)))
+        if not items:
+            return tools, ()
+
+        def encoded(value):
+            return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+
+        digest = hashlib.sha256(encoded(req.get("instructions")))
+        with self._lock:
+            candidates = {k: v for k, v in self._revisions.items() if k[0] == session and k[1] <= len(items)}
+        revision, anchor, read = None, None, 0
+        for end in sorted({k[1] for k in candidates}):
+            for item in items[read:end]:
+                digest.update(b"\0")
+                digest.update(encoded(item))
+            read = end
+            key = (session, end, digest.digest())
+            if key in candidates:
+                revision, anchor = candidates[key], key
+
+        before = {tool["name"]: tool for tool in (revision.tools or [])} if revision else {}
+        current = {tool["name"]: tool for tool in tools or []}
+        if revision and before == current:
+            with self._lock:
+                if anchor in self._revisions:
+                    self._revisions.move_to_end(anchor)
+            return revision.header, revision.updates
+
+        header, updates = tools, ()
+        if revision:
+            header = revision.header
+            changed = [tool for name, tool in current.items() if before.get(name) != tool]
+            retired = [name for name in before if name not in current]
+            update = {"type": "additional_tools", "tools": changed, "_retired_tools": retired, "_catalog_update": True}
+            updates = revision.updates + ((len(items), update),)
+
+        size = len(encoded((header, tools, updates)))
+        if size > (1 << 20):
+            return tools, ()
+        for item in items[read:]:
+            digest.update(b"\0")
+            digest.update(encoded(item))
+        key = (session, len(items), digest.digest())
+        with self._lock:
+            self._revisions[key] = _ToolRevision(header, tools, updates, size)
+            self._revisions.move_to_end(key)
+            total = sum(entry.size for entry in self._revisions.values())
+            while len(self._revisions) > 64 or total > (8 << 20):
+                _, oldest = self._revisions.popitem(last=False)
+                total -= oldest.size
+        return header, updates
 
 
 # ------------------------------------------------------------------------------------------------ output

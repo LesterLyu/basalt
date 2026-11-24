@@ -3,7 +3,7 @@ import json
 import unittest
 from pathlib import Path
 
-from serve.api.responses import Assembler, ResponsesError, input_messages, request_tools, template_kwargs
+from serve.api.responses import Assembler, ResponsesError, ToolHistory, input_messages, request_tools, template_kwargs
 from serve.frontend import ChatTemplate, Event, ToolCall
 from serve.tests.test_responses import Server
 from serve.engine.mock import MockEngine
@@ -131,6 +131,64 @@ class ClientSearch(unittest.TestCase):
         self.assertIn("mcp__docs", messages[1]["content"])
         self.assertIn('"parameters"', messages[1]["content"])
         self.assertIn("mcp__docs.search", [tool["name"] for tool in request_tools(req)[0]])
+
+    def test_declaration_changes_stay_at_the_turn_that_introduced_them(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok"), tok, DeepseekTemplate(), dialect=DeepSeek41())
+        history = ToolHistory()
+        first = {"type": "function", "name": "inspect", "description": "First description."}
+        removed = {"type": "function", "name": "old_tool"}
+        added = {"type": "function", "name": "new_tool"}
+        prompt = [{"role": "user", "content": "First question."}]
+        answer = {"role": "assistant", "content": "First answer."}
+        next_turn = prompt + [answer, {"role": "user", "content": "Next question."}]
+        later = next_turn + [answer, {"role": "user", "content": "Third question."}]
+
+        def render(items, declarations, key="one"):
+            req = {"input": items, "tools": declarations}
+            tools = request_tools(req)[0]
+            header, updates = history.replay(key, req, tools)
+            return svc.render_text(input_messages(req, updates), tools, {"_prompt_tools": header})[0]
+
+        before = render(prompt, [first, removed])
+        updated = dict(first, description="Updated description.")
+        tools = [updated, added]
+        changed = render(next_turn, tools)
+        self.assertTrue(changed.startswith(before))
+        self.assertIn("First description.", changed[:len(before)])
+        self.assertNotIn("Updated description.", changed[:len(before)])
+        self.assertIn('No longer available: ["old_tool"]', changed[len(before):])
+        self.assertIn("Updated description.", changed[len(before):])
+        self.assertIn("new_tool", changed[len(before):])
+        continued = render(later, tools)
+        self.assertTrue(continued.startswith(changed))
+        self.assertEqual(continued.count("Updated description."), 1)
+        unrelated = render(next_turn, tools, "two")
+        self.assertNotIn("First description.", unrelated)
+        branch = render(prompt + [answer, {"role": "user", "content": "Another branch."}], [first, removed])
+        self.assertNotIn("Updated description.", branch)
+
+    def test_replacing_leading_declarations_preserves_the_same_conversation(self):
+        history = ToolHistory()
+        original = {"type": "function", "name": "inspect"}
+        updated = dict(original, description="Revised.")
+        user = {"role": "user", "content": "First question."}
+        first = {"input": [{"type": "additional_tools", "tools": [original]}, user]}
+        base = template_kwargs(first)["_prompt_tools"]
+        self.assertEqual(history.replay("one", first, base), (base, ()))
+
+        second = {"input": [{"type": "additional_tools", "tools": [updated]},
+                            {"type": "additional_tools", "tools": [FOUND]},
+                            user, {"role": "assistant", "content": "Answer."},
+                            {"role": "user", "content": "Next question."}]}
+        active = template_kwargs(second)["_prompt_tools"]
+        header, updates = history.replay("one", second, active)
+        self.assertEqual(header, base)
+        messages = input_messages(second, updates)
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user", "user"])
+        self.assertIn("Revised.", messages[-1]["content"])
+        self.assertIn("mcp__docs.search", messages[-1]["content"])
+        self.assertEqual(history.replay("one", second, active), (header, updates))
 
     def test_hosted_search_replay_is_rejected(self):
         for kind in ("tool_search_call", "tool_search_output"):

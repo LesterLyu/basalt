@@ -16,6 +16,7 @@ from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineSta
 from serve.engine.console import engine_facts, hardware_view
 from serve.engine.mock import Engine
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
+from serve.api.responses import ToolHistory
 from serve.frontend import ChatTemplate, Event, effort_kwargs, images_of, mark_think_literals, media_of, unmark_think_literals
 from serve.util import vram
 from serve.util.logbuf import LogBuffer
@@ -139,6 +140,7 @@ class Service:
         self.rate = collections.deque(maxlen=RATE_SAMPLES)   # (time, generated) samples
         # parallel mode: each running request's own status and rate window; self.status shows the newest
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
+        self.response_tools = ToolHistory()
         self.request_ctx = threading.local()            # .path, .model: the API path and model name of this request
         self.slot_last: dict[int, dict] = {}            # per slot: context held and draft counts of its last request
         self.waiting: dict[int, dict] = {}              # single stream: requests waiting for the turn
